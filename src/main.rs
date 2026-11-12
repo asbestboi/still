@@ -1,4 +1,4 @@
-//! Still — a quiet photo editor.
+//! Still: a quiet photo editor.
 
 // no console window behind the app on Windows (release builds)
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -13,7 +13,7 @@ mod ui_kit;
 /// Headless batch mode: `still --render <look> <input> <output>`
 fn render_cli(args: &[String]) -> Result<(), String> {
     let [look, input, output] = args else {
-        return Err("usage: still --render <look name | file.stilllook> <input> <output>".into());
+        return Err("usage: still --render <preset name | file.stillpreset> <input> <output>".into());
     };
     let look_path = std::path::Path::new(look);
     let params = if io::is_look_file(look_path) {
@@ -25,7 +25,7 @@ fn render_cli(args: &[String]) -> Result<(), String> {
             .into_iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(look))
             .map(|(_, p)| p)
-            .ok_or_else(|| format!("unknown look '{look}'"))?
+            .ok_or_else(|| format!("unknown preset '{look}'"))?
     };
     let doc = io::load(std::path::Path::new(input), 1800)?;
     let mut settings = io::ExportSettings::default();

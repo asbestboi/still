@@ -258,6 +258,8 @@ pub struct Params {
 
     /// Photos placed on the canvas, bottom to top.
     pub layers: Vec<crate::layers::Layer>,
+    /// Folders in the layer list.
+    pub layer_groups: Vec<crate::layers::LayerGroup>,
 }
 
 impl Default for Params {
@@ -326,6 +328,7 @@ impl Default for Params {
             seed: 1,
             masks: Vec::new(),
             layers: Vec::new(),
+            layer_groups: Vec::new(),
         }
     }
 }
@@ -344,7 +347,23 @@ impl Params {
         p.border_white = self.border_white;
         p.masks = self.masks.clone();
         p.layers = self.layers.clone();
+        p.layer_groups = self.layer_groups.clone();
         p
+    }
+
+    /// The layers as they render: members of a hidden group count as hidden.
+    pub fn shown_layers(&self) -> std::borrow::Cow<'_, [crate::layers::Layer]> {
+        let hidden: Vec<u32> = self.layer_groups.iter().filter(|g| !g.visible).map(|g| g.id).collect();
+        if hidden.is_empty() {
+            return std::borrow::Cow::Borrowed(&self.layers);
+        }
+        let mut v = self.layers.clone();
+        for l in &mut v {
+            if hidden.contains(&l.group) {
+                l.visible = false;
+            }
+        }
+        std::borrow::Cow::Owned(v)
     }
 }
 
@@ -727,7 +746,7 @@ fn upstream_key(p: &Params) -> Params {
         astig_angle: p.astig_angle,
         astig_rays: p.astig_rays,
         halation: p.halation,
-        layers: p.layers.iter().filter(|l| l.graded && l.visible).cloned().collect(),
+        layers: p.shown_layers().iter().filter(|l| l.graded && l.visible).cloned().collect(),
         ..Params::default()
     }
 }
@@ -761,7 +780,7 @@ fn base(src: &Img, p: &Params) -> (Img, crate::masks::Space) {
     let (mut img, space) = geometry(src, p);
     // layers that take on the look are part of the picture from here on
     if !p.layers.is_empty() {
-        crate::layers::composite(&mut img, &p.layers, true, &space);
+        crate::layers::composite(&mut img, &p.shown_layers(), true, &space);
     }
     let u = img.unit();
 
@@ -963,7 +982,7 @@ fn finish(mut img: Img, space: &crate::masks::Space, p: &Params, overlay: Option
 
     // --- Layers placed on top of the finished look ---------------------------
     if !p.layers.is_empty() {
-        crate::layers::composite(&mut img, &p.layers, false, &space);
+        crate::layers::composite(&mut img, &p.shown_layers(), false, &space);
     }
 
     // --- Frame -------------------------------------------------------------
@@ -1576,5 +1595,21 @@ mod tests {
             assert_eq!(a.px, b.px, "step {step}");
             assert_eq!(oa, ob, "step {step}");
         }
+    }
+
+    #[test]
+    fn hidden_group_hides_its_layers() {
+        let src = Arc::new(gradient(40, 30));
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255])));
+        crate::layers::register("test://group-red", &img);
+        let layer = crate::layers::Layer { path: "test://group-red".into(), scale: 1.5, group: 4, ..Default::default() };
+        let mut p = Params { layers: vec![layer], ..Params::default() };
+        p.layer_groups.push(crate::layers::LayerGroup { id: 4, ..Default::default() });
+        let shown = process(&src, &p);
+        p.layer_groups[0].visible = false;
+        let hidden = process(&src, &p);
+        let plain = process(&src, &Params::default());
+        assert!(shown.px != plain.px);
+        assert!(hidden.px == plain.px);
     }
 }

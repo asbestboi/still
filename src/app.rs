@@ -15,7 +15,8 @@ use std::time::Instant;
 
 enum Job {
     /// `overlay`: mask index and its wash colour. `draft`: render at half size (fast, while dragging).
-    Preview { src: Arc<Img>, params: Params, generation: u64, frame: Frame, overlay: Option<(usize, u32)>, draft: bool },
+    /// `logical_w`: width of the working preview, which the canvas lays out by.
+    Preview { src: Arc<Img>, logical_w: usize, params: Params, generation: u64, frame: Frame, overlay: Option<(usize, u32)>, draft: bool },
     Thumbs { src: Arc<Img>, looks: Vec<Params>, ver: u64 },
 }
 
@@ -34,8 +35,14 @@ enum Msg {
     LayerFiles(Vec<PathBuf>),
     SaveProjectTo(PathBuf),
     LayerReady(Result<(PathBuf, f32), String>),
+    /// A sharper source for zoomed-in viewing: photo, long edge, image.
+    DetailReady(PathBuf, u32, Arc<Img>),
 }
 
+/// Largest long edge used for the sharper zoomed-in preview.
+const DETAIL_MAX: u32 = 4000;
+/// How many recent files the start screen remembers.
+const RECENT_MAX: usize = 8;
 const OVERLAY_COLORS: [u32; 3] = [0xFF2D28, 0x30D158, 0x0A84FF];
 const CANVAS_COLORS: [Color32; 3] = [k::CANVAS, Color32::from_rgb(28, 28, 30), Color32::from_rgb(72, 72, 76)];
 
@@ -76,9 +83,9 @@ fn spawn_worker(ctx: egui::Context, jobs: Receiver<Job>, out: Sender<Msg>) {
             while let Ok(j) = jobs.try_recv() {
                 take(j);
             }
-            if let Some(Job::Preview { src, params, generation, frame, overlay, draft }) = preview {
+            if let Some(Job::Preview { src, logical_w, params, generation, frame, overlay, draft }) = preview {
                 let t = Instant::now();
-                let full_w = src.w as f32;
+                let full_w = logical_w as f32;
                 let src = if draft {
                     match &halves {
                         Some((full, h)) if Arc::ptr_eq(full, &src) => h.clone(),
@@ -125,7 +132,7 @@ enum Tab {
     Crop,
 }
 const TABS: [(Tab, &str); 7] = [
-    (Tab::Looks, "Looks"),
+    (Tab::Looks, "Presets"),
     (Tab::Adjust, "Adjust"),
     (Tab::Masks, "Masks"),
     (Tab::Layers, "Layers"),
@@ -329,8 +336,15 @@ pub struct App {
     hist: Histogram,
     generation: u64,
     shown_gen: u64,
-    /// What the last preview job rendered: params, overlay, draft.
-    last_sent: Option<(Params, Option<(usize, u32)>, bool)>,
+    /// What the last preview job rendered: params, overlay, draft, detail edge (0 none).
+    last_sent: Option<(Params, Option<(usize, u32)>, bool, u32)>,
+    /// Long edge the current zoom needs to look sharp, in source pixels.
+    detail_need: f32,
+    /// The sharper source for zooming in, and the edge being built.
+    detail_src: Option<(PathBuf, u32, Arc<Img>)>,
+    detail_req: Option<u32>,
+    /// Zoom level and when it last changed, so the sharper source waits for the zoom to settle.
+    detail_zoom: (f32, Instant),
     render_ms: f32,
     /// Duration of the last full-size render; slow ones get drafts while dragging.
     full_ms: f32,
@@ -366,6 +380,8 @@ pub struct App {
     list_drag: Option<usize>,
     /// Inline rename in the mask / layer list: target, text, focus on next frame.
     renaming: Option<(Rename, String, bool)>,
+    /// Recently opened photos and projects, newest first.
+    recent: Vec<PathBuf>,
     layers_loading: usize,
     crop_drag: Option<(Grip, [f32; 4], Pos2)>,
 
@@ -412,6 +428,10 @@ impl App {
             last_sent: None,
             render_ms: 0.0,
             full_ms: 0.0,
+            detail_need: 0.0,
+            detail_src: None,
+            detail_req: None,
+            detail_zoom: (1.0, Instant::now()),
             tex_scale: 1.0,
             sent_at: None,
             tex_frame: Frame::Output,
@@ -439,6 +459,7 @@ impl App {
             snap_lines: (None, None),
             list_drag: None,
             renaming: None,
+            recent: saved.recent.clone(),
             layers_loading: 0,
             crop_drag: None,
             builtin: pipeline::builtin_presets(),
@@ -474,6 +495,7 @@ impl App {
             guide_thirds: self.guide_thirds,
             guide_golden: self.guide_golden,
             prefs: self.prefs.clone(),
+            recent: self.recent.clone(),
         });
     }
 
@@ -507,10 +529,11 @@ impl App {
             Ok(()) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 self.toast = Some((format!("Saved {name}"), path.parent().map(|d| d.to_path_buf()), Instant::now()));
-                self.project = Some(path);
+                self.project = Some(path.clone());
                 self.saved_params = Some(self.params.clone());
+                self.remember_recent(path);
             }
-            Err(e) => self.toast = Some((format!("Couldn't save — {e}"), None, Instant::now())),
+            Err(e) => self.toast = Some((format!("Couldn't save: {e}"), None, Instant::now())),
         }
     }
 
@@ -549,14 +572,14 @@ impl App {
             return;
         }
         self.dialog_open = true;
-        let name = if looks.len() == 1 { io::look_file_name(&looks[0].0) } else { io::look_file_name("Still Looks") };
+        let name = if looks.len() == 1 { io::look_file_name(&looks[0].0) } else { io::look_file_name("Still Presets") };
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let dlg = rfd::FileDialog::new()
-                .set_title(if looks.len() == 1 { "Export Look" } else { "Export Looks" })
+                .set_title(if looks.len() == 1 { "Export Preset" } else { "Export Presets" })
                 .set_file_name(&name)
-                .add_filter("Still Look", &[io::LOOK_EXT]);
+                .add_filter("Still Preset", &[io::LOOK_EXT]);
             let msg = match dlg.save_file() {
                 Some(mut p) => {
                     if !io::is_look_file(&p) {
@@ -564,10 +587,10 @@ impl App {
                     }
                     match io::write_looks(&p, &looks) {
                         Ok(()) => {
-                            let what = if looks.len() == 1 { format!("“{}”", looks[0].0) } else { format!("{} looks", looks.len()) };
+                            let what = if looks.len() == 1 { format!("“{}”", looks[0].0) } else { format!("{} presets", looks.len()) };
                             Msg::Info(format!("Exported {what}"), p.parent().map(|d| d.to_path_buf()))
                         }
-                        Err(e) => Msg::Info(format!("Couldn't export — {e}"), None),
+                        Err(e) => Msg::Info(format!("Couldn't export: {e}"), None),
                     }
                 }
                 None => Msg::DialogClosed,
@@ -586,7 +609,7 @@ impl App {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let dlg = rfd::FileDialog::new().set_title("Import Looks").add_filter("Still Look", &io::dialog_exts(&[io::LOOK_EXT]));
+            let dlg = rfd::FileDialog::new().set_title("Import Presets").add_filter("Still Preset", &io::dialog_exts(io::LOOK_EXTS));
             match dlg.pick_files() {
                 Some(paths) => {
                     let (looks, errs) = read_look_files(&paths);
@@ -624,11 +647,11 @@ impl App {
             self.tab = 0;
         }
         let msg = match (n, errs.first()) {
-            (0, Some(e)) => format!("Couldn't import — {e}"),
+            (0, Some(e)) => format!("Couldn't import: {e}"),
             (0, None) => return,
-            (1, None) => "Imported 1 look".to_string(),
-            (n, None) => format!("Imported {n} looks"),
-            (n, Some(_)) => format!("Imported {n} looks, {} file{} skipped", errs.len(), if errs.len() == 1 { "" } else { "s" }),
+            (1, None) => "Imported 1 preset".to_string(),
+            (n, None) => format!("Imported {n} presets"),
+            (n, Some(_)) => format!("Imported {n} presets, {} file{} skipped", errs.len(), if errs.len() == 1 { "" } else { "s" }),
         };
         self.toast = Some((msg, None, Instant::now()));
     }
@@ -642,7 +665,7 @@ impl App {
                     return self.open_path(photo, ctx);
                 }
                 Err(e) => {
-                    self.toast = Some((format!("Couldn't open project — {e}"), None, Instant::now()));
+                    self.toast = Some((format!("Couldn't open project: {e}"), None, Instant::now()));
                     return;
                 }
             }
@@ -658,6 +681,15 @@ impl App {
         });
     }
 
+    /// Put a photo or project at the top of the Recent list on the start screen.
+    fn remember_recent(&mut self, p: PathBuf) {
+        let p = std::fs::canonicalize(&p).unwrap_or(p);
+        self.recent.retain(|r| *r != p);
+        self.recent.insert(0, p);
+        self.recent.truncate(RECENT_MAX);
+        self.persist();
+    }
+
     fn pick_file(&mut self, ctx: &egui::Context) {
         if self.dialog_open {
             return;
@@ -670,7 +702,8 @@ impl App {
             let mut dlg = rfd::FileDialog::new()
                 .set_title("Open Photo or Project")
                 .add_filter("Photos & Projects", &{
-                    let mut v = vec![io::PROJECT_EXT, "jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp", "gif", "tga", "exr", "hdr", "qoi", "pnm"];
+                    let mut v = vec![io::PROJECT_EXT];
+                    v.extend_from_slice(io::IMAGE_EXTS);
                     v.extend_from_slice(io::RAW_EXTS);
                     io::dialog_exts(&v)
                 })
@@ -720,7 +753,7 @@ impl App {
             path.set_extension(self.export.format.ext());
         }
         self.exporting = true;
-        // Doc isn't Clone (it owns big buffers) — share what the exporter needs.
+        // Doc isn't Clone (it owns big buffers), so share what the exporter needs.
         let job_doc = Doc {
             path: doc.path.clone(),
             name: doc.name.clone(),
@@ -804,6 +837,8 @@ impl App {
                     self.doc = Some(doc);
                     self.tex = None;
                     self.last_sent = None;
+                    self.detail_src = None;
+                    self.detail_req = None;
                     // keep the current look (handy for batches) unless asked not to; reset geometry
                     if !self.prefs.keep_look {
                         self.params = Params { seed: self.params.seed, ..Params::default() };
@@ -818,6 +853,7 @@ impl App {
                     // masks belong to a particular photo
                     self.params.masks.clear();
                     self.params.layers.clear();
+                    self.params.layer_groups.clear();
                     self.layer_sel = None;
                     self.mask_sel = None;
                     match self.pending_project.take() {
@@ -833,13 +869,16 @@ impl App {
                     self.committed = self.params.clone();
                     self.undo.clear();
                     self.redo.clear();
+                    if let Some(p) = self.project.clone().or_else(|| self.doc.as_ref().map(|d| d.path.clone())) {
+                        self.remember_recent(p);
+                    }
                     self.view = View { zoom: 1.0, pan: Vec2::ZERO, dragging: false };
                     self.request_thumbs();
                 }
                 Msg::Loaded(Err(e)) => {
                     self.loading = None;
                     self.pending_project = None;
-                    self.toast = Some((format!("Couldn't open photo — {e}"), None, Instant::now()));
+                    self.toast = Some((format!("Couldn't open photo: {e}"), None, Instant::now()));
                 }
                 Msg::Picked(p) => {
                     self.dialog_open = false;
@@ -863,10 +902,15 @@ impl App {
                     self.layers_loading = self.layers_loading.saturating_sub(1);
                     match r {
                         Ok((path, aspect)) => self.push_layer(path, aspect),
-                        Err(e) => self.toast = Some((format!("Couldn't add photo — {e}"), None, Instant::now())),
+                        Err(e) => self.toast = Some((format!("Couldn't add photo: {e}"), None, Instant::now())),
                     }
                 }
                 Msg::Info(text, dir) => self.toast = Some((text, dir, Instant::now())),
+                Msg::DetailReady(path, edge, img) => {
+                    if self.doc.as_ref().map(|d| d.path == path).unwrap_or(false) && self.detail_req == Some(edge) {
+                        self.detail_src = Some((path, edge, img));
+                    }
+                }
                 Msg::Repreviewed(path, img) => {
                     if let Some(doc) = &mut self.doc
                         && doc.path == path
@@ -884,7 +928,7 @@ impl App {
                             let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                             self.toast = Some((format!("Exported {name}"), p.parent().map(|d| d.to_path_buf()), Instant::now()));
                         }
-                        Err(e) => self.toast = Some((format!("Export failed — {e}"), None, Instant::now())),
+                        Err(e) => self.toast = Some((format!("Export failed: {e}"), None, Instant::now())),
                     }
                 }
             }
@@ -952,24 +996,72 @@ impl App {
             m.name.clear();
             m.color = 0;
         }
+        params.layers = params.shown_layers().into_owned();
+        params.layer_groups.clear();
         for l in &mut params.layers {
             l.name.clear();
             l.color = 0;
+            l.locked = false;
+            l.group = 0;
         }
         // While a slider or brush is held, slow renders are drafted at half size so
         // the preview keeps up; the full-size render follows on release.
         let interacting = ctx.input(|i| i.pointer.any_down()) && self.full_ms > 45.0;
-        if let Some((p, o, was_draft)) = &self.last_sent
+
+        // Zoomed in past the preview's resolution: render from a sharper source
+        // once it's ready (built in the background, then reused while zoomed).
+        let src_long = doc.preview.w.max(doc.preview.h) as f32;
+        let full_long = doc.full.width().max(doc.full.height()) as f32;
+        let want = (self.detail_need > src_long * 1.25 && full_long > src_long * 1.1).then(|| {
+            let e = ((self.detail_need / 800.0).ceil() * 800.0).min(full_long).min(DETAIL_MAX as f32);
+            e as u32
+        });
+        if (self.view.zoom - self.detail_zoom.0).abs() > 1e-4 {
+            self.detail_zoom = (self.view.zoom, Instant::now());
+        }
+        let settle = std::time::Duration::from_millis(250);
+        let zoom_settled = self.detail_zoom.1.elapsed() > settle;
+        if want.is_some() && !zoom_settled {
+            ctx.request_repaint_after(settle);
+        }
+        let mut detail = None;
+        match want {
+            Some(e) => match &self.detail_src {
+                Some((path, edge, img)) if *path == doc.path && *edge == e => detail = Some(img.clone()),
+                _ if self.detail_req != Some(e) && zoom_settled => {
+                    self.detail_req = Some(e);
+                    let (full, path, tx, ctx) = (doc.full.clone(), doc.path.clone(), self.tx.clone(), ctx.clone());
+                    std::thread::spawn(move || {
+                        let img = Arc::new(io::downsized(&full, e));
+                        let _ = tx.send(Msg::DetailReady(path, e, img));
+                        ctx.request_repaint();
+                    });
+                }
+                _ => {}
+            },
+            None => {
+                // zoomed back out: let the big source go
+                self.detail_src = None;
+                self.detail_req = None;
+            }
+        }
+        let detail = detail.filter(|_| !interacting);
+        let detail_edge = if detail.is_some() { want.unwrap_or(0) } else { 0 };
+
+        if let Some((p, o, was_draft, de)) = &self.last_sent
             && *p == params
             && *o == overlay
+            && *de == detail_edge
             && (!*was_draft || interacting)
         {
             return;
         }
         self.generation += 1;
-        self.last_sent = Some((params.clone(), overlay, interacting));
+        self.last_sent = Some((params.clone(), overlay, interacting, detail_edge));
         self.sent_at = Some(Instant::now());
-        let _ = self.jobs.send(Job::Preview { src: doc.preview.clone(), params, generation: self.generation, frame, overlay, draft: interacting });
+        let src = detail.unwrap_or_else(|| doc.preview.clone());
+        let logical_w = doc.preview.w;
+        let _ = self.jobs.send(Job::Preview { src, logical_w, params, generation: self.generation, frame, overlay, draft: interacting });
     }
 
     /// Snapshot the parameters into the undo stack once an interaction ends.
@@ -1043,6 +1135,7 @@ impl App {
             }
             if TABS[self.tab].0 == Tab::Layers
                 && let Some(i) = self.selected_layer()
+                && !self.params.layers[i].locked
                 && ctx.input(|inp| inp.key_pressed(Key::Delete) || inp.key_pressed(Key::Backspace))
             {
                 self.params.layers.remove(i);
@@ -1051,6 +1144,7 @@ impl App {
             // arrow keys nudge the selected layer by a screen pixel (Shift: ten)
             if TABS[self.tab].0 == Tab::Layers
                 && let Some(i) = self.selected_layer()
+                && !self.params.layers[i].locked
             {
                 let f = self.mask_map(self.last_img_rect).frame();
                 let step = if ctx.input(|inp| inp.modifiers.shift) { 10.0 } else { 1.0 };
@@ -1083,6 +1177,54 @@ impl App {
         }
     }
 
+    /// Ctrl+V: an image on the clipboard (a screenshot, an image copied in a
+    /// browser) or copied image files become layers; with no photo open, the
+    /// first pasted file opens.
+    fn handle_paste(&mut self, ctx: &egui::Context) {
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        let (images, texts): (Vec<Arc<egui::ColorImage>>, Vec<String>) = ctx.input(|i| {
+            let mut im = Vec::new();
+            let mut tx = Vec::new();
+            for e in &i.events {
+                match e {
+                    egui::Event::PasteImage(img) => im.push(img.clone()),
+                    egui::Event::Paste(t) => tx.push(t.clone()),
+                    _ => {}
+                }
+            }
+            (im, tx)
+        });
+        let files: Vec<PathBuf> = texts.iter().flat_map(|t| pasted_paths(t)).collect();
+        if !files.is_empty() {
+            if self.doc.is_some() {
+                self.load_layers(files, ctx);
+            } else if let Some(p) = files.into_iter().next() {
+                self.open_path(p, ctx);
+            }
+            return;
+        }
+        let Some(img) = images.into_iter().next() else { return };
+        // a layer is a file on disk so projects can find it again
+        let dir = io::config_dir().join("pasted");
+        let (tx, ctx2, has_doc) = (self.tx.clone(), ctx.clone(), self.doc.is_some());
+        std::thread::spawn(move || {
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+            let path = dir.join(format!("pasted-{stamp}.png"));
+            let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+            let r = std::fs::create_dir_all(&dir).map_err(|e| e.to_string()).and_then(|_| {
+                image::save_buffer(&path, &rgba, img.size[0] as u32, img.size[1] as u32, image::ExtendedColorType::Rgba8).map_err(|e| e.to_string())
+            });
+            let _ = match r {
+                Ok(()) if has_doc => tx.send(Msg::LayerFiles(vec![path])),
+                Ok(()) => tx.send(Msg::Picked(path)),
+                Err(e) => tx.send(Msg::Info(format!("Couldn't paste the image: {e}"), None)),
+            };
+            ctx2.request_repaint();
+        });
+    }
+
     fn handle_drop(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
@@ -1094,9 +1236,6 @@ impl App {
             self.open_path(proj, ctx);
         } else if self.doc.is_some() && !photos.is_empty() {
             // onto an open photo: place them on top as layers
-            if let Some(i) = TABS.iter().position(|t| t.0 == Tab::Layers) {
-                self.tab = i;
-            }
             self.load_layers(photos, ctx);
         } else if let Some(p) = photos.into_iter().next() {
             self.open_path(p, ctx);
@@ -1115,10 +1254,12 @@ impl eframe::App for App {
         self.poll(&ctx);
         self.shortcuts(&ctx);
         self.handle_drop(&ctx);
+        self.handle_paste(&ctx);
         // a rename only lives as long as its list is on screen
         let list_shown = match self.renaming {
             Some((Rename::Mask(i), ..)) => TABS[self.tab].0 == Tab::Masks && i < self.params.masks.len(),
             Some((Rename::Layer(i), ..)) => TABS[self.tab].0 == Tab::Layers && i < self.params.layers.len(),
+            Some((Rename::Group(id), ..)) => TABS[self.tab].0 == Tab::Layers && self.params.layer_groups.iter().any(|g| g.id == id),
             None => true,
         };
         if !list_shown || self.doc.is_none() {
@@ -1162,11 +1303,11 @@ impl App {
         // how far the buttons reach on each side, so the title can stay clear of them
         let (mut left_end, mut right_start) = (rect.left(), rect.right());
         ui.horizontal_centered(|ui| {
-            if k::button(ui, "Open", Btn::Secondary, true).on_hover_text("Ctrl+O — a photo or a .still project").clicked() {
+            if k::button(ui, "Open", Btn::Secondary, true).on_hover_text("Ctrl+O: a photo or a .still project").clicked() {
                 self.pick_file(&ctx);
             }
             let has_doc = self.doc.is_some();
-            if k::button(ui, "Save", Btn::Plain, has_doc).on_hover_text("Ctrl+S — save the edit as a .still project (Ctrl+Shift+S: Save As)").clicked() {
+            if k::button(ui, "Save", Btn::Plain, has_doc).on_hover_text("Ctrl+S: save the edit as a .still project (Ctrl+Shift+S: Save As)").clicked() {
                 self.save(false, &ctx);
             }
             ui.add_space(4.0);
@@ -1477,6 +1618,9 @@ impl App {
         let px = k::spring(&ctx, Id::unique("panx"), self.view.pan.x, 1.0, 0.45);
         let py = k::spring(&ctx, Id::unique("pany"), self.view.pan.y, 1.0, 0.45);
 
+        // how many source pixels the long edge needs at the zoom we're heading to
+        let src_long = self.doc.as_ref().map(|d| d.preview.w.max(d.preview.h) as f32).unwrap_or(0.0);
+        self.detail_need = if cropping || compare { 0.0 } else { src_long * fit * self.view.zoom * ctx.pixels_per_point() };
         let size = tsize * fit * zoom;
         let img_rect = Rect::from_center_size(rect.center() + vec2(px, py), size);
         painter.image(tex_id, img_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
@@ -1888,6 +2032,10 @@ impl App {
             painter.text(c, Align2::CENTER_CENTER, format!("Opening {name}…"), k::font(14.0), k::LABEL2);
             return;
         }
+        let recent: Vec<PathBuf> = self.recent.iter().filter(|p| p.exists()).take(6).cloned().collect();
+        // with a Recent list below, the card moves up to make room
+        let list_h = if recent.is_empty() { 0.0 } else { 34.0 + recent.len() as f32 * 34.0 };
+        let c = c - vec2(0.0, list_h / 2.0);
         let lift = k::spring(&ctx, Id::unique("drop_lift"), if hovering { 1.0 } else { 0.0 }, 1.0, 0.3);
         let card = Rect::from_center_size(c, vec2(380.0, 230.0) * (1.0 + lift * 0.03));
         painter.rect_stroke(
@@ -1916,7 +2064,61 @@ impl App {
             k::font(11.0),
             k::LABEL3,
         );
+        if !recent.is_empty() {
+            self.recent_list(ui, &recent, pos2(c.x, card.bottom() + 18.0));
+        }
         self.toast_view(ui, rect);
+    }
+
+    /// Recently opened files under the start card; click to open again.
+    fn recent_list(&mut self, ui: &mut Ui, recent: &[PathBuf], top: Pos2) {
+        let ctx = ui.ctx().clone();
+        let w = 380.0;
+        let painter = ui.painter().clone();
+        let head = Rect::from_min_size(pos2(top.x - w / 2.0, top.y), vec2(w, 26.0));
+        painter.text(pos2(head.left() + 12.0, head.center().y), Align2::LEFT_CENTER, "RECENT", k::font_semibold(11.0), k::LABEL3);
+        let clear_r = Rect::from_min_max(pos2(head.right() - 60.0, head.top()), head.max);
+        let clear = ui.interact(clear_r, Id::unique("recent_clear"), Sense::click());
+        painter.text(pos2(head.right() - 12.0, head.center().y), Align2::RIGHT_CENTER, "Clear", k::font(11.0), if clear.hovered() { k::LABEL } else { k::LABEL3 });
+        let mut open = None;
+        let mut forget = None;
+        for (n, p) in recent.iter().enumerate() {
+            let r = Rect::from_min_size(pos2(head.left(), head.bottom() + 4.0 + n as f32 * 34.0), vec2(w, 32.0));
+            let resp = ui.interact(r, Id::unique("recent_row").with(n), Sense::click());
+            let bg = if resp.is_pointer_button_down_on() { k::FILL_HI } else if resp.hovered() { k::FILL } else { Color32::TRANSPARENT };
+            painter.rect_filled(r, CornerRadius::same(8), bg);
+            let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+            let kind = if io::is_project_file(p) { "Project" } else { "Photo" };
+            let tag = painter.layout_no_wrap(kind.to_string(), k::font(11.0), k::LABEL3);
+            let tag_x = r.right() - 12.0 - tag.size().x;
+            painter.galley(pos2(tag_x, r.center().y - tag.size().y / 2.0), tag, k::LABEL3);
+            let name_g = elided(ui, &name, k::font(13.0), k::LABEL, (tag_x - r.left() - 24.0) * 0.6);
+            let name_w = name_g.size().x;
+            painter.galley(pos2(r.left() + 12.0, r.center().y - name_g.size().y / 2.0), name_g, k::LABEL);
+            let dir_g = elided(ui, &dir, k::font(11.0), k::LABEL3, tag_x - r.left() - 32.0 - name_w);
+            painter.galley(pos2(r.left() + 20.0 + name_w, r.center().y - dir_g.size().y / 2.0), dir_g, k::LABEL3);
+            let resp = resp.on_hover_text(p.to_string_lossy());
+            if resp.clicked() {
+                open = Some(p.clone());
+            }
+            resp.context_menu(|ui| {
+                if ui.button("Remove from Recent").clicked() {
+                    forget = Some(p.clone());
+                }
+            });
+        }
+        if let Some(p) = open {
+            self.open_path(p, &ctx);
+        }
+        if let Some(p) = forget {
+            self.recent.retain(|r| *r != p);
+            self.persist();
+        }
+        if clear.clicked() {
+            self.recent.clear();
+            self.persist();
+        }
     }
 
     fn drop_hint(&self, ui: &Ui, rect: Rect) {
@@ -1998,7 +2200,7 @@ impl App {
             ui.multiply_opacity(fade);
             ui.add_space((1.0 - fade) * 8.0);
             if !has_doc && TABS[self.tab].0 == Tab::Looks {
-                k::caption(ui, "Open a photo to preview looks.");
+                k::caption(ui, "Open a photo to preview presets.");
             }
             match TABS[self.tab].0 {
                 Tab::Looks => self.tab_looks(ui),
@@ -2115,11 +2317,11 @@ impl App {
                             ui.close();
                         }
                         if *user {
-                            if ui.button("Update with Current Look").clicked() {
+                            if ui.button("Update with Current Edit").clicked() {
                                 overwrite = Some(idx - builtin_n);
                                 ui.close();
                             }
-                            if ui.button("Delete Look").clicked() {
+                            if ui.button("Delete Preset").clicked() {
                                 delete = Some(idx - builtin_n);
                                 ui.close();
                             }
@@ -2144,7 +2346,7 @@ impl App {
         }
 
         ui.add_space(8.0);
-        k::section(ui, "Save Look", false, |ui| {
+        k::section(ui, "Save Preset", false, |ui| {
             k::caption(ui, "Saves every adjustment except crop, border, masks and layers.");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -2162,26 +2364,26 @@ impl App {
                 }
             });
             if !self.user_presets.is_empty() {
-                k::caption(ui, "Right-click a saved look to update, export or delete it.");
+                k::caption(ui, "Right-click a saved preset to update, export or delete it.");
             }
         });
 
         let ctx = ui.ctx().clone();
         let mut import = false;
         let mut export_all = false;
-        k::section(ui, "Share Looks", false, |ui| {
-            k::caption(ui, "Looks are saved as small .stilllook files. Send one to a friend; they can import it here or drop it onto the window.");
+        k::section(ui, "Share Presets", false, |ui| {
+            k::caption(ui, "Presets are saved as small .stillpreset files. Send one to a friend; they can import it here or drop it onto the window.");
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if k::button(ui, "Import…", Btn::Secondary, true).clicked() {
                     import = true;
                 }
-                if k::button(ui, "Export My Looks…", Btn::Secondary, !self.user_presets.is_empty()).clicked() {
+                if k::button(ui, "Export My Presets…", Btn::Secondary, !self.user_presets.is_empty()).clicked() {
                     export_all = true;
                 }
             });
             ui.add_space(2.0);
-            k::caption(ui, "Only the look is shared — never your photo, crop or masks.");
+            k::caption(ui, "Only the preset is shared, never your photo, crop or masks.");
         });
         if import {
             self.pick_looks_to_import(&ctx);
@@ -2304,7 +2506,7 @@ impl App {
 
     fn tab_glitch(&mut self, ui: &mut Ui) {
         let p = &mut self.params;
-        k::caption(ui, "Glitches are placed by a seed — shuffle for a new arrangement.");
+        k::caption(ui, "Glitches are placed by a seed. Shuffle for a new arrangement.");
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if k::button(ui, "Shuffle", Btn::Secondary, true).clicked() {
@@ -2369,7 +2571,7 @@ impl App {
         let dir = self.doc.as_ref().and_then(|d| d.path.parent().map(|p| p.to_path_buf()));
         std::thread::spawn(move || {
             let mut dlg = rfd::FileDialog::new().set_title("Add Photos as Layers").add_filter("Images", &{
-                let mut v = vec!["jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp", "gif", "tga", "exr", "hdr", "qoi"];
+                let mut v = io::IMAGE_EXTS.to_vec();
                 v.extend_from_slice(io::RAW_EXTS);
                 io::dialog_exts(&v)
             });
@@ -2387,6 +2589,12 @@ impl App {
 
     /// Decode photos off the UI thread and add each as a layer when ready.
     fn load_layers(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        // show where they land
+        if !paths.is_empty()
+            && let Some(i) = TABS.iter().position(|t| t.0 == Tab::Layers)
+        {
+            self.tab = i;
+        }
         for path in paths {
             self.layers_loading += 1;
             let tx = self.tx.clone();
@@ -2455,7 +2663,7 @@ impl App {
     fn layer_begin(&mut self, o: Pos2, ctx: &egui::Context) {
         let map = self.mask_map(self.last_img_rect);
         // grab a handle of the selected layer first
-        if let Some(i) = self.selected_layer() {
+        if let Some(i) = self.selected_layer().filter(|&i| !self.params.layers[i].locked) {
             let l = &self.params.layers[i];
             let (_, corners, knob) = layer_frame(l, &map);
             let edge = layer_edges(l, &map).into_iter().find(|(_, p)| p.distance(o) < 12.0).map(|e| e.0);
@@ -2476,10 +2684,7 @@ impl App {
             }
         }
         // otherwise pick the topmost visible layer under the pointer and move it
-        if let Some(i) = (0..self.params.layers.len()).rev().find(|&i| {
-            let l = &self.params.layers[i];
-            l.visible && layer_contains(l, &map, o)
-        }) {
+        if let Some(i) = (0..self.params.layers.len()).rev().find(|&i| self.layer_pickable(i) && layer_contains(&self.params.layers[i], &map, o)) {
             self.layer_sel = Some(i);
             self.layer_drag = Some(LayerDrag { kind: 0, start: self.params.layers[i].clone(), origin: o });
         }
@@ -2488,11 +2693,15 @@ impl App {
 
     fn layer_click(&mut self, o: Pos2) {
         let map = self.mask_map(self.last_img_rect);
-        let hit = (0..self.params.layers.len()).rev().find(|&i| {
-            let l = &self.params.layers[i];
-            l.visible && layer_contains(l, &map, o)
-        });
+        let hit = (0..self.params.layers.len()).rev().find(|&i| self.layer_pickable(i) && layer_contains(&self.params.layers[i], &map, o));
         self.layer_sel = hit;
+    }
+
+    /// Can the layer be picked on the canvas? Not when hidden (itself or its group) or locked.
+    fn layer_pickable(&self, i: usize) -> bool {
+        let l = &self.params.layers[i];
+        let group_shown = self.params.layer_groups.iter().find(|g| g.id == l.group).map(|g| g.visible).unwrap_or(true);
+        l.visible && !l.locked && group_shown
     }
 
     /// Outline + handles for the selected layer, and live dragging.
@@ -2595,6 +2804,11 @@ impl App {
         let shadow = Color32::from_black_alpha(110);
         let mut outline = corners.to_vec();
         outline.push(corners[0]);
+        if l.locked {
+            // a locked layer only shows where it is, without handles
+            painter.add(egui::Shape::dashed_line(&outline, Stroke::new(1.2, Color32::from_white_alpha(170)), 6.0, 4.0));
+            return;
+        }
         painter.add(egui::Shape::line(outline.clone(), Stroke::new(3.0, Color32::from_black_alpha(70))));
         painter.add(egui::Shape::line(outline, Stroke::new(1.2, Color32::WHITE)));
         let top_mid = corners[0] + (corners[1] - corners[0]) * 0.5;
@@ -2670,7 +2884,7 @@ impl App {
             return;
         }
         let ctx = ui.ctx().clone();
-        k::caption(ui, "Place other photos on the canvas. Drag to move, corners to scale, side handles to stretch, the blue knob to rotate. Edges snap to the canvas (hold Ctrl to place freely); arrow keys nudge. You can also drop photos onto the canvas. Double-click a layer to rename it.");
+        k::caption(ui, "Place other photos on the canvas. Drag to move, corners to scale, side handles to stretch, the blue knob to rotate. Edges snap to the canvas (hold Ctrl to place freely); arrow keys nudge. You can also drop photos onto the canvas or paste an image with Ctrl+V. Double-click a layer to rename it.");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if k::button(ui, "Add Photo…", Btn::Secondary, true).clicked() {
@@ -2682,6 +2896,12 @@ impl App {
         });
         ui.add_space(10.0);
 
+        // keep each group's layers together, and the selection on the same layer
+        let order = crate::layers::normalize_groups(&mut self.params.layers, &mut self.params.layer_groups);
+        if let Some(s) = self.layer_sel {
+            self.layer_sel = order.iter().position(|&o| o == s);
+        }
+
         enum Act {
             Select(usize),
             Toggle(usize),
@@ -2689,107 +2909,238 @@ impl App {
             Up(usize),
             Down(usize),
             Delete(usize),
-            Move(usize, usize),
+            /// layer, insert above this layer (None: bottom), group it lands in
+            Move(usize, Option<usize>, u32),
             Rename(usize),
             Color(usize, u8),
+            Lock(usize),
+            NewGroup(usize),
+            JoinGroup(usize, u32),
+            GroupToggle(u32),
+            GroupCollapse(u32),
+            GroupRename(u32),
+            GroupColor(u32, u8),
+            Ungroup(u32),
+            GroupDelete(u32),
+        }
+        /// A row of the list, top of the stack first.
+        enum Entry {
+            Group(usize),
+            Layer(usize, bool),
         }
         let mut act = None;
-        let mut renamed = None;
+        let mut renamed: Option<(Rename, Option<String>)> = None;
         let sel = self.selected_layer();
         let n = self.params.layers.len();
-        let mut rows: Vec<(usize, Rect)> = Vec::new();
+        let groups = self.params.layer_groups.clone();
+        let mut entries = Vec::new();
+        let mut seen: Vec<u32> = Vec::new();
+        for i in (0..n).rev() {
+            let g = self.params.layers[i].group;
+            if g == 0 {
+                entries.push(Entry::Layer(i, false));
+                continue;
+            }
+            if seen.contains(&g) {
+                continue;
+            }
+            seen.push(g);
+            let Some(gi) = groups.iter().position(|x| x.id == g) else { continue };
+            entries.push(Entry::Group(gi));
+            if !groups[gi].collapsed {
+                entries.extend((0..n).rev().filter(|&j| self.params.layers[j].group == g).map(|j| Entry::Layer(j, true)));
+            }
+        }
+        // where each row sits, for dragging: (rect, layer, group the row belongs to, top member if a header)
+        let mut rows: Vec<(Rect, Option<usize>, u32, Option<usize>)> = Vec::new();
         egui::Frame::NONE.fill(k::CARD).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            // top of the stack first, like any layers panel
-            for i in (0..n).rev() {
-                let l = &self.params.layers[i];
-                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click_and_drag());
-                rows.push((i, r));
-                if resp.drag_started() && self.renaming.is_none() {
-                    self.list_drag = Some(i);
-                }
-                let bg = if self.list_drag == Some(i) {
-                    k::FILL_HI
-                } else if sel == Some(i) {
-                    Color32::from_rgba_unmultiplied(10, 132, 255, 70)
-                } else if resp.is_pointer_button_down_on() {
-                    k::FILL_HI
-                } else if resp.hovered() {
-                    k::FILL
-                } else {
-                    Color32::TRANSPARENT
-                };
-                ui.painter().rect_filled(r, CornerRadius::same(8), bg);
-                let dot = pos2(r.left() + 16.0, r.center().y);
-                let dresp = ui.interact(Rect::from_center_size(dot, vec2(24.0, 24.0)), ui.scope_id().with(("layer_dot", i)), Sense::click());
-                if l.visible {
-                    ui.painter().circle_filled(dot, 5.0, label_color(l.color).unwrap_or(k::ACCENT));
-                } else {
-                    ui.painter().circle_stroke(dot, 5.0, Stroke::new(1.5, label_color(l.color).unwrap_or(k::LABEL3)));
-                }
-                let col = if l.visible { k::LABEL } else { k::LABEL3 };
-                match &mut self.renaming {
-                    Some((Rename::Layer(j), buf, focus)) if *j == i => match rename_field(ui, r, buf, focus) {
-                        RenameOutcome::Editing => {}
-                        RenameOutcome::Commit(name) => renamed = Some((i, Some(name))),
-                        RenameOutcome::Cancel => renamed = Some((i, None)),
-                    },
-                    _ => {
-                        let tag = format!("{}{}", l.blend.label(), if l.opacity < 0.999 { format!(" · {:.0}%", l.opacity * 100.0) } else { String::new() });
-                        let tag = ui.painter().layout_no_wrap(tag, k::font(11.0), k::LABEL3);
-                        let tag_x = r.right() - 10.0 - tag.size().x;
-                        ui.painter().galley(pos2(tag_x, r.center().y - tag.size().y / 2.0), tag, k::LABEL3);
-                        let name = elided(ui, &l.name, k::font(13.0), col, tag_x - 10.0 - (r.left() + 32.0));
-                        let full = name.elided;
-                        ui.painter().galley(pos2(r.left() + 32.0, r.center().y - name.size().y / 2.0), name, col);
-                        let resp = if full && self.list_drag.is_none() { resp.clone().on_hover_text(&l.name) } else { resp.clone() };
-                        if resp.double_clicked() && !dresp.hovered() {
-                            act = Some(Act::Rename(i));
+            for e in &entries {
+                match *e {
+                    Entry::Group(gi) => {
+                        let g = &groups[gi];
+                        let members = self.params.layers.iter().filter(|l| l.group == g.id).count();
+                        let top = (0..n).rev().find(|&j| self.params.layers[j].group == g.id);
+                        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+                        rows.push((r, None, 0, top));
+                        let bg = if resp.is_pointer_button_down_on() { k::FILL_HI } else if resp.hovered() { k::FILL } else { Color32::TRANSPARENT };
+                        ui.painter().rect_filled(r, CornerRadius::same(8), bg);
+                        // disclosure triangle
+                        let t = pos2(r.left() + 11.0, r.center().y);
+                        let tri = if g.collapsed {
+                            vec![t + vec2(-3.0, -5.0), t + vec2(4.0, 0.0), t + vec2(-3.0, 5.0)]
+                        } else {
+                            vec![t + vec2(-5.0, -3.0), t + vec2(5.0, -3.0), t + vec2(0.0, 4.0)]
+                        };
+                        ui.painter().add(egui::Shape::convex_polygon(tri, k::LABEL2, Stroke::NONE));
+                        let dot = pos2(r.left() + 30.0, r.center().y);
+                        let dresp = ui.interact(Rect::from_center_size(dot, vec2(22.0, 22.0)), ui.scope_id().with(("group_dot", g.id)), Sense::click());
+                        let gc = label_color(g.color);
+                        if g.visible {
+                            ui.painter().circle_filled(dot, 5.0, gc.unwrap_or(k::LABEL2));
+                        } else {
+                            ui.painter().circle_stroke(dot, 5.0, Stroke::new(1.5, gc.unwrap_or(k::LABEL3)));
                         }
+                        let dresp = dresp.on_hover_text(if g.visible { "Hide group" } else { "Show group" });
+                        let col = if g.visible { k::LABEL } else { k::LABEL3 };
+                        let name_r = Rect::from_min_max(pos2(r.left() + 18.0, r.top()), r.max);
+                        match &mut self.renaming {
+                            Some((Rename::Group(id), buf, focus)) if *id == g.id => match rename_field(ui, name_r, buf, focus) {
+                                RenameOutcome::Editing => {}
+                                RenameOutcome::Commit(s) => renamed = Some((Rename::Group(g.id), Some(s))),
+                                RenameOutcome::Cancel => renamed = Some((Rename::Group(g.id), None)),
+                            },
+                            _ => {
+                                let tag = ui.painter().layout_no_wrap(format!("{members} layer{}", if members == 1 { "" } else { "s" }), k::font(11.0), k::LABEL3);
+                                let tag_x = r.right() - 10.0 - tag.size().x;
+                                ui.painter().galley(pos2(tag_x, r.center().y - tag.size().y / 2.0), tag, k::LABEL3);
+                                let name = elided(ui, &g.name, k::font_semibold(13.0), col, tag_x - 10.0 - (r.left() + 44.0));
+                                ui.painter().galley(pos2(r.left() + 44.0, r.center().y - name.size().y / 2.0), name, col);
+                                if resp.double_clicked() && !dresp.hovered() {
+                                    act = Some(Act::GroupRename(g.id));
+                                }
+                            }
+                        }
+                        if dresp.clicked() {
+                            act = Some(Act::GroupToggle(g.id));
+                        } else if resp.clicked() && act.is_none() {
+                            act = Some(Act::GroupCollapse(g.id));
+                        }
+                        resp.context_menu(|ui| {
+                            if ui.button("Rename").clicked() {
+                                act = Some(Act::GroupRename(g.id));
+                            }
+                            if let Some(c) = color_menu(ui, g.color) {
+                                act = Some(Act::GroupColor(g.id, c));
+                            }
+                            ui.separator();
+                            if ui.button("Ungroup").clicked() {
+                                act = Some(Act::Ungroup(g.id));
+                            }
+                            if ui.button("Delete Group and Layers").clicked() {
+                                act = Some(Act::GroupDelete(g.id));
+                            }
+                        });
+                    }
+                    Entry::Layer(i, indented) => {
+                        let l = &self.params.layers[i];
+                        let ind = if indented { 16.0 } else { 0.0 };
+                        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click_and_drag());
+                        rows.push((r, Some(i), l.group, None));
+                        if resp.drag_started() && self.renaming.is_none() {
+                            self.list_drag = Some(i);
+                        }
+                        let bg = if self.list_drag == Some(i) {
+                            k::FILL_HI
+                        } else if sel == Some(i) {
+                            Color32::from_rgba_unmultiplied(10, 132, 255, 70)
+                        } else if resp.is_pointer_button_down_on() {
+                            k::FILL_HI
+                        } else if resp.hovered() {
+                            k::FILL
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let rr = Rect::from_min_max(pos2(r.left() + ind, r.top()), r.max);
+                        ui.painter().rect_filled(rr, CornerRadius::same(8), bg);
+                        let dot = pos2(rr.left() + 16.0, r.center().y);
+                        let dresp = ui.interact(Rect::from_center_size(dot, vec2(24.0, 24.0)), ui.scope_id().with(("layer_dot", i)), Sense::click());
+                        if l.visible {
+                            ui.painter().circle_filled(dot, 5.0, label_color(l.color).unwrap_or(k::ACCENT));
+                        } else {
+                            ui.painter().circle_stroke(dot, 5.0, Stroke::new(1.5, label_color(l.color).unwrap_or(k::LABEL3)));
+                        }
+                        let col = if l.visible { k::LABEL } else { k::LABEL3 };
+                        match &mut self.renaming {
+                            Some((Rename::Layer(j), buf, focus)) if *j == i => match rename_field(ui, rr, buf, focus) {
+                                RenameOutcome::Editing => {}
+                                RenameOutcome::Commit(name) => renamed = Some((Rename::Layer(i), Some(name))),
+                                RenameOutcome::Cancel => renamed = Some((Rename::Layer(i), None)),
+                            },
+                            _ => {
+                                let tag = format!(
+                                    "{}{}{}",
+                                    if l.locked { "Locked · " } else { "" },
+                                    l.blend.label(),
+                                    if l.opacity < 0.999 { format!(" · {:.0}%", l.opacity * 100.0) } else { String::new() }
+                                );
+                                let tag = ui.painter().layout_no_wrap(tag, k::font(11.0), k::LABEL3);
+                                let tag_x = r.right() - 10.0 - tag.size().x;
+                                ui.painter().galley(pos2(tag_x, r.center().y - tag.size().y / 2.0), tag, k::LABEL3);
+                                let name = elided(ui, &l.name, k::font(13.0), col, tag_x - 10.0 - (rr.left() + 32.0));
+                                let full = name.elided;
+                                ui.painter().galley(pos2(rr.left() + 32.0, r.center().y - name.size().y / 2.0), name, col);
+                                let resp = if full && self.list_drag.is_none() { resp.clone().on_hover_text(&l.name) } else { resp.clone() };
+                                if resp.double_clicked() && !dresp.hovered() {
+                                    act = Some(Act::Rename(i));
+                                }
+                            }
+                        }
+                        if dresp.clicked() {
+                            act = Some(Act::Toggle(i));
+                        } else if resp.clicked() && act.is_none() {
+                            act = Some(Act::Select(i));
+                        }
+                        resp.context_menu(|ui| {
+                            if ui.button("Rename").clicked() {
+                                act = Some(Act::Rename(i));
+                            }
+                            if let Some(c) = color_menu(ui, l.color) {
+                                act = Some(Act::Color(i, c));
+                            }
+                            if ui.button(if l.locked { "Unlock" } else { "Lock" }).clicked() {
+                                act = Some(Act::Lock(i));
+                            }
+                            ui.menu_button("Group", |ui| {
+                                if ui.button("New Group").clicked() {
+                                    act = Some(Act::NewGroup(i));
+                                    ui.close();
+                                }
+                                for g in groups.iter().filter(|g| g.id != l.group) {
+                                    if ui.button(format!("Move to {}", g.name)).clicked() {
+                                        act = Some(Act::JoinGroup(i, g.id));
+                                        ui.close();
+                                    }
+                                }
+                                if l.group != 0 && ui.button("Remove from Group").clicked() {
+                                    act = Some(Act::JoinGroup(i, 0));
+                                    ui.close();
+                                }
+                            });
+                            ui.separator();
+                            if ui.button("Duplicate").clicked() {
+                                act = Some(Act::Duplicate(i));
+                            }
+                            if i + 1 < n && ui.button("Bring Forward").clicked() {
+                                act = Some(Act::Up(i));
+                            }
+                            if i > 0 && ui.button("Send Backward").clicked() {
+                                act = Some(Act::Down(i));
+                            }
+                            if ui.button("Delete").clicked() {
+                                act = Some(Act::Delete(i));
+                            }
+                        });
                     }
                 }
-                if dresp.clicked() {
-                    act = Some(Act::Toggle(i));
-                } else if resp.clicked() && act.is_none() {
-                    act = Some(Act::Select(i));
-                }
-                resp.context_menu(|ui| {
-                    if ui.button("Rename").clicked() {
-                        act = Some(Act::Rename(i));
-                    }
-                    if let Some(c) = color_menu(ui, l.color) {
-                        act = Some(Act::Color(i, c));
-                    }
-                    ui.separator();
-                    if ui.button("Duplicate").clicked() {
-                        act = Some(Act::Duplicate(i));
-                    }
-                    if i + 1 < n && ui.button("Bring Forward").clicked() {
-                        act = Some(Act::Up(i));
-                    }
-                    if i > 0 && ui.button("Send Backward").clicked() {
-                        act = Some(Act::Down(i));
-                    }
-                    if ui.button("Delete").clicked() {
-                        act = Some(Act::Delete(i));
-                    }
-                });
             }
             // drag a row up or down to restack; an accent line shows where it lands
             if let Some(from) = self.list_drag {
                 let y = ui.ctx().input(|inp| inp.pointer.latest_pos()).map(|p| p.y).unwrap_or(0.0);
-                // rows are listed top-of-stack first; find the slot under the pointer
-                let slot = rows.iter().position(|(_, r)| y < r.center().y).unwrap_or(rows.len());
-                if let Some(line_y) = rows.get(slot).map(|(_, r)| r.top() - 1.0).or_else(|| rows.last().map(|(_, r)| r.bottom() + 1.0)) {
-                    let (l, rr) = (rows[0].1.left() + 6.0, rows[0].1.right() - 6.0);
+                let slot = rows.iter().position(|row| y < row.0.center().y).unwrap_or(rows.len());
+                if let Some(line_y) = rows.get(slot).map(|row| row.0.top() - 1.0).or_else(|| rows.last().map(|row| row.0.bottom() + 1.0)) {
+                    let (l, rr) = (rows[0].0.left() + 6.0, rows[0].0.right() - 6.0);
                     ui.painter().line_segment([pos2(l, line_y), pos2(rr, line_y)], Stroke::new(2.0, k::ACCENT));
                 }
                 if !ui.ctx().input(|inp| inp.pointer.any_down()) {
-                    // slot counts from the top of the stack; convert to a stack index
-                    let to = n - slot.min(n);
-                    let to = if to > from { to - 1 } else { to };
-                    if to != from {
-                        act = Some(Act::Move(from, to.min(n - 1)));
+                    // above a layer: join its group; above a group header: sit just above that group
+                    let (above, group) = match rows.get(slot) {
+                        Some((_, Some(j), g, _)) => (Some(*j), *g),
+                        Some((_, None, _, top)) => (*top, 0),
+                        None => (None, 0),
+                    };
+                    if above != Some(from) {
+                        act = Some(Act::Move(from, above, group));
                     }
                     self.list_drag = None;
                 }
@@ -2799,7 +3150,9 @@ impl App {
             ui.painter().text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, "Photo", k::font(13.0), k::LABEL3);
             ui.painter().text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, "Background", k::font(11.0), k::LABEL3);
         });
+        let next_id = self.params.layer_groups.iter().map(|g| g.id).max().unwrap_or(0) + 1;
         let layers = &mut self.params.layers;
+        let lgroups = &mut self.params.layer_groups;
         match act {
             Some(Act::Select(i)) => self.layer_sel = Some(i),
             Some(Act::Toggle(i)) => layers[i].visible = !layers[i].visible,
@@ -2823,25 +3176,80 @@ impl App {
                 layers.remove(i);
                 self.layer_sel = None;
             }
-            Some(Act::Move(from, to)) => {
-                let l = layers.remove(from);
-                layers.insert(to, l);
-                self.layer_sel = Some(to);
+            Some(Act::Move(from, above, group)) => {
+                let mut l = layers.remove(from);
+                l.group = group;
+                let mut at = above.map(|a| a + 1).unwrap_or(0);
+                if at > from {
+                    at -= 1;
+                }
+                let at = at.min(layers.len());
+                layers.insert(at, l);
+                self.layer_sel = Some(at);
             }
             Some(Act::Rename(i)) => self.renaming = Some((Rename::Layer(i), layers[i].name.clone(), true)),
             Some(Act::Color(i, c)) => layers[i].color = c,
+            Some(Act::Lock(i)) => layers[i].locked = !layers[i].locked,
+            Some(Act::NewGroup(i)) => {
+                lgroups.push(crate::layers::LayerGroup { id: next_id, name: format!("Group {}", lgroups.len() + 1), ..Default::default() });
+                layers[i].group = next_id;
+                self.renaming = Some((Rename::Group(next_id), format!("Group {}", lgroups.len()), true));
+            }
+            Some(Act::JoinGroup(i, g)) => layers[i].group = g,
+            Some(Act::GroupToggle(id)) => {
+                if let Some(g) = lgroups.iter_mut().find(|g| g.id == id) {
+                    g.visible = !g.visible;
+                }
+            }
+            Some(Act::GroupCollapse(id)) => {
+                if let Some(g) = lgroups.iter_mut().find(|g| g.id == id) {
+                    g.collapsed = !g.collapsed;
+                }
+            }
+            Some(Act::GroupRename(id)) => {
+                let name = lgroups.iter().find(|g| g.id == id).map(|g| g.name.clone()).unwrap_or_default();
+                self.renaming = Some((Rename::Group(id), name, true));
+            }
+            Some(Act::GroupColor(id, c)) => {
+                if let Some(g) = lgroups.iter_mut().find(|g| g.id == id) {
+                    g.color = c;
+                }
+            }
+            Some(Act::Ungroup(id)) => {
+                for l in layers.iter_mut().filter(|l| l.group == id) {
+                    l.group = 0;
+                }
+            }
+            Some(Act::GroupDelete(id)) => {
+                layers.retain(|l| l.group != id);
+                self.layer_sel = None;
+            }
             None => {}
         }
-        if let Some((i, name)) = renamed {
-            if let Some(name) = name.filter(|n| !n.is_empty())
-                && let Some(l) = self.params.layers.get_mut(i)
-            {
-                l.name = name;
+        if let Some((target, name)) = renamed {
+            if let Some(name) = name.filter(|n| !n.is_empty()) {
+                match target {
+                    Rename::Layer(i) => {
+                        if let Some(l) = self.params.layers.get_mut(i) {
+                            l.name = name;
+                        }
+                    }
+                    Rename::Group(id) => {
+                        if let Some(g) = self.params.layer_groups.iter_mut().find(|g| g.id == id) {
+                            g.name = name;
+                        }
+                    }
+                    Rename::Mask(_) => {}
+                }
             }
             self.renaming = None;
         }
+        let order = crate::layers::normalize_groups(&mut self.params.layers, &mut self.params.layer_groups);
+        if let Some(s) = self.layer_sel {
+            self.layer_sel = order.iter().position(|&o| o == s);
+        }
         if n > 0 {
-            k::caption(ui, "Drag layers in the list to restack them. Right-click for more.");
+            k::caption(ui, "Drag layers in the list to restack them. Right-click a layer to lock it or put it in a group.");
         }
         ui.add_space(10.0);
 
@@ -2851,6 +3259,14 @@ impl App {
             }
             return;
         };
+        if self.params.layers[i].locked {
+            k::caption(ui, "This layer is locked, so it can't be moved or changed.");
+            ui.add_space(4.0);
+            if k::button(ui, "Unlock", Btn::Secondary, true).clicked() {
+                self.params.layers[i].locked = false;
+            }
+            return;
+        }
         let mut fit = None;
         let mut stretch_full = false;
         let l = &mut self.params.layers[i];
@@ -2872,8 +3288,8 @@ impl App {
                 ui.add_space(2.0);
             }
             ui.add_space(2.0);
-            k::switch_row(ui, "Apply Look to Layer", &mut l.graded);
-            k::caption(ui, "On: the layer is graded with the photo. Off: it sits on top of the finished look, good for light leaks and textures (try Screen).");
+            k::switch_row(ui, "Apply Preset to Layer", &mut l.graded);
+            k::caption(ui, "On: the layer is graded with the photo. Off: it sits on top of the finished edit, good for light leaks and textures (try Screen).");
             ui.add_space(4.0);
         }) {
             l.opacity = d.opacity;
@@ -3673,8 +4089,8 @@ impl App {
                             ui.add_space(12.0);
 
                             group(ui, "Workflow");
-                            k::switch_row(ui, "Keep Look When Opening a Photo", &mut self.prefs.keep_look);
-                            k::caption(ui, "On: the next photo opens with your current look, handy for a series. Off: every photo starts clean.");
+                            k::switch_row(ui, "Keep Preset When Opening a Photo", &mut self.prefs.keep_look);
+                            k::caption(ui, "On: the next photo opens with your current preset and adjustments, handy for a series. Off: every photo starts clean.");
                             ui.add_space(12.0);
 
                             if cfg!(target_os = "linux") {
@@ -3684,12 +4100,12 @@ impl App {
                                 ui.add_space(12.0);
                             }
 
-                            group(ui, "Looks");
+                            group(ui, "Presets");
                             ui.horizontal(|ui| {
-                                if k::button(ui, "Import Looks…", Btn::Secondary, true).clicked() {
+                                if k::button(ui, "Import Presets…", Btn::Secondary, true).clicked() {
                                     import = true;
                                 }
-                                if k::button(ui, "Export My Looks…", Btn::Secondary, !self.user_presets.is_empty()).clicked() {
+                                if k::button(ui, "Export My Presets…", Btn::Secondary, !self.user_presets.is_empty()).clicked() {
                                     export_all = true;
                                 }
                             });
@@ -3728,6 +4144,46 @@ impl App {
             self.persist();
         }
     }
+}
+
+/// Image files named by pasted text: plain paths or `file://` URIs, one per line.
+fn pasted_paths(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let p = match l.strip_prefix("file://") {
+                // file:///home/… on Unix, file:///C:/… on Windows
+                Some(rest) => {
+                    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+                    let decoded = percent_decode(rest);
+                    if cfg!(windows) { decoded.trim_start_matches('/').to_string() } else { decoded }
+                }
+                None => l.to_string(),
+            };
+            let p = PathBuf::from(p);
+            (p.is_file() && io::is_openable(&p)).then_some(p)
+        })
+        .collect()
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16)
+        {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Label colours for masks and layers; index 0 means no colour.
@@ -3789,6 +4245,7 @@ fn color_menu(ui: &mut Ui, current: u8) -> Option<u8> {
 enum Rename {
     Mask(usize),
     Layer(usize),
+    Group(u32),
 }
 
 /// What happened to an inline rename this frame.
@@ -4111,5 +4568,75 @@ mod tests {
         h.step();
         h.step();
         assert_eq!(h.state().generation, generation, "names and colours must not re-render the photo");
+    }
+
+    #[test]
+    fn pasted_text_finds_image_files() {
+        let dir = temp_dir("paste-text");
+        let photo = test_photo(&dir);
+        let spaced = dir.join("my photo.png");
+        std::fs::copy(&photo, &spaced).unwrap();
+        let text = format!("file://{}\n{}\nnot a file\nfile://{}", photo.display(), dir.join("missing.png").display(), spaced.display().to_string().replace(' ', "%20"));
+        let found = pasted_paths(&text);
+        if !cfg!(windows) {
+            assert_eq!(found, vec![photo, spaced]);
+        }
+    }
+
+    #[test]
+    fn e2e_paste_image_lock_and_group() {
+        let mut h = open_with_layer("paste");
+        h.state_mut().tab = 1;
+        let img = egui::ColorImage::new([40, 30], vec![Color32::from_rgb(10, 200, 30); 1200]);
+        h.event(egui::Event::PasteImage(Arc::new(img)));
+        settle(&mut h, |a| a.params.layers.len() == 2);
+        assert!(TABS[h.state().tab].0 == Tab::Layers);
+        assert!(std::path::Path::new(&h.state().params.layers[1].path).is_file(), "pasted image is kept on disk");
+        let _ = std::fs::remove_file(&h.state().params.layers[1].path);
+
+        // a locked layer can't be picked on the canvas; clicks fall through to the one below
+        settle(&mut h, rendered);
+        let map = h.state().mask_map(h.state().last_img_rect);
+        for l in &mut h.state_mut().params.layers {
+            l.x = 0.5;
+            l.y = 0.5;
+        }
+        h.state_mut().params.layers[1].locked = true;
+        h.state_mut().layer_click(map.n2s([0.5, 0.5]));
+        assert_eq!(h.state().layer_sel, Some(0));
+
+        // groups: a hidden group's layers can't be picked either
+        h.state_mut().params.layer_groups.push(crate::layers::LayerGroup { id: 7, visible: false, ..Default::default() });
+        h.state_mut().params.layers[0].group = 7;
+        h.state_mut().layer_click(map.n2s([0.5, 0.5]));
+        assert_eq!(h.state().layer_sel, None);
+        h.step();
+        h.step();
+    }
+
+    #[test]
+    fn e2e_recent_files_and_sharper_zoom() {
+        let dir = temp_dir("detail");
+        let big = image::RgbImage::from_fn(3000, 2000, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 90]));
+        let path = dir.join("big.png");
+        big.save(&path).unwrap();
+        let p2 = path.clone();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_eframe(move |cc| App::new(cc, Some(p2)));
+        settle(&mut h, |a| a.doc.is_some());
+        assert_eq!(h.state().recent.first(), Some(&std::fs::canonicalize(&path).unwrap()));
+        settle(&mut h, rendered);
+        let preview_w = h.state().doc.as_ref().unwrap().preview.w;
+        let shown = |a: &App| a.tex.as_ref().map(|t| t.size()[0]).unwrap_or(0);
+        assert_eq!(shown(h.state()), preview_w);
+        // zoom in far: once settled, the texture comes from a sharper source but lays out the same
+        h.state_mut().view.zoom = 6.0;
+        let r0 = h.state().last_img_rect;
+        settle(&mut h, |a| shown(a) > preview_w && rendered(a));
+        assert!(h.state().tex_scale < 1.0);
+        let _ = r0;
+        // and back out: the normal preview returns
+        h.state_mut().view.zoom = 1.0;
+        settle(&mut h, |a| shown(a) == preview_w && rendered(a));
+        assert!(h.state().detail_src.is_none());
     }
 }

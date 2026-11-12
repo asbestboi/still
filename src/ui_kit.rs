@@ -13,7 +13,7 @@ use egui::{
 };
 
 // ---------------------------------------------------------------------------
-// Palette — Apple dark-mode system colours
+// Palette: Apple dark-mode system colours
 // ---------------------------------------------------------------------------
 
 pub const CANVAS: Color32 = Color32::from_rgb(10, 10, 11);
@@ -286,7 +286,7 @@ pub fn slider(
         painter.line_segment([pos2(x, track.top() - 3.0), pos2(x, track.bottom() + 3.0)], Stroke::new(1.0, LABEL3));
     }
 
-    // knob — grows on press (feedback on pointer down), springs back
+    // knob: grows on press (feedback on pointer down), springs back
     let grow = spring(&ctx, id.with("k"), if active { 1.0 } else { 0.0 }, 1.0, 0.25);
     let hover = resp.hovered() as i32 as f32;
     let radius = 6.5 + grow * 2.0 + hover * 0.5;

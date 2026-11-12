@@ -101,6 +101,57 @@ pub struct Layer {
     pub blend: Blend,
     /// Placed under the look (graded with the photo) or on top of it.
     pub graded: bool,
+    /// Locked layers can't be picked, moved or changed on the canvas.
+    pub locked: bool,
+    /// The group (folder) it belongs to, 0 for none.
+    pub group: u32,
+}
+
+/// A folder of layers in the list. Its members always sit together in the stack.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayerGroup {
+    pub id: u32,
+    pub name: String,
+    pub color: u8,
+    pub visible: bool,
+    pub collapsed: bool,
+}
+
+impl Default for LayerGroup {
+    fn default() -> Self {
+        LayerGroup { id: 1, name: String::new(), color: 0, visible: true, collapsed: false }
+    }
+}
+
+/// Tidy groups after the stack changed: forget unknown or empty groups and
+/// gather each group's layers at the position of its topmost member.
+/// Returns the new order as old indices (`order[new] == old`).
+pub fn normalize_groups(layers: &mut Vec<Layer>, groups: &mut Vec<LayerGroup>) -> Vec<usize> {
+    for l in layers.iter_mut() {
+        if l.group != 0 && !groups.iter().any(|g| g.id == l.group) {
+            l.group = 0;
+        }
+    }
+    groups.retain(|g| layers.iter().any(|l| l.group == g.id));
+    let n = layers.len();
+    let mut top_first = Vec::with_capacity(n);
+    let mut done = Vec::new();
+    for i in (0..n).rev() {
+        let g = layers[i].group;
+        if g == 0 {
+            top_first.push(i);
+        } else if !done.contains(&g) {
+            done.push(g);
+            top_first.extend((0..n).rev().filter(|&j| layers[j].group == g));
+        }
+    }
+    let order: Vec<usize> = top_first.into_iter().rev().collect();
+    if order.iter().enumerate().any(|(k, &i)| k != i) {
+        let old = std::mem::take(layers);
+        *layers = order.iter().map(|&i| old[i].clone()).collect();
+    }
+    order
 }
 
 impl Default for Layer {
@@ -120,6 +171,8 @@ impl Default for Layer {
             opacity: 1.0,
             blend: Blend::Normal,
             graded: true,
+            locked: false,
+            group: 0,
         }
     }
 }
@@ -346,5 +399,21 @@ mod tests {
         let l = Layer { aspect: 2.0, scale: 0.5, stretch: 3.0, ..Layer::default() };
         let (w, h) = l.size(100.0);
         assert_eq!((w, h), (50.0, 75.0));
+    }
+
+    #[test]
+    fn groups_gather_at_their_top_member_and_empty_ones_go() {
+        let mk = |name: &str, group: u32| Layer { name: name.into(), group, ..Layer::default() };
+        // bottom to top: a(g1) b c(g1) d(g9: unknown)
+        let mut layers = vec![mk("a", 1), mk("b", 0), mk("c", 1), mk("d", 9)];
+        let mut groups = vec![LayerGroup { id: 1, ..Default::default() }, LayerGroup { id: 2, ..Default::default() }];
+        let order = normalize_groups(&mut layers, &mut groups);
+        let names: Vec<&str> = layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["b", "a", "c", "d"]);
+        assert_eq!(order, [1, 0, 2, 3]);
+        assert_eq!(layers[3].group, 0, "unknown group is dropped");
+        assert_eq!(groups.len(), 1, "empty group 2 is removed");
+        // already tidy: unchanged
+        assert_eq!(normalize_groups(&mut layers, &mut groups), [0, 1, 2, 3]);
     }
 }

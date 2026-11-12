@@ -3,7 +3,7 @@
 Type=Application
 Name=Still
 GenericName=Photo Editor
-Comment=A quiet photo editor — tone, texture and restrained glitch
+Comment=A quiet photo editor: tone, texture and restrained glitch
 Exec=still %f
 Icon=still
 Terminal=false

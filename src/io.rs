@@ -32,6 +32,15 @@ pub fn dialog_exts(exts: &[&str]) -> Vec<String> {
     exts.iter().flat_map(|e| [e.to_lowercase(), e.to_uppercase()]).collect()
 }
 
+/// Ordinary image formats Still opens (RAW formats are in `RAW_EXTS`).
+pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp", "gif", "tga", "exr", "hdr", "qoi", "pnm"];
+
+/// A photo Still can open, judging by its extension (RAW included).
+pub fn is_openable(path: &Path) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    IMAGE_EXTS.contains(&ext.as_str()) || RAW_EXTS.contains(&ext.as_str())
+}
+
 fn is_raw(path: &Path) -> bool {
     path.extension()
         .map(|e| RAW_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
@@ -426,9 +435,15 @@ pub struct Saved {
     pub guide_golden: bool,
     #[serde(default)]
     pub prefs: Prefs,
+    /// Recently opened photos and projects, newest first.
+    #[serde(default)]
+    pub recent: Vec<PathBuf>,
 }
 
 pub fn load_saved() -> Saved {
+    if cfg!(test) {
+        return Saved::default();
+    }
     std::fs::read_to_string(config_dir().join("settings.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -436,6 +451,10 @@ pub fn load_saved() -> Saved {
 }
 
 pub fn store_saved(s: &Saved) {
+    // tests never touch the real settings
+    if cfg!(test) {
+        return;
+    }
     let dir = config_dir();
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(json) = serde_json::to_string_pretty(s) {
@@ -447,12 +466,17 @@ pub fn store_saved(s: &Saved) {
 }
 
 // ---------------------------------------------------------------------------
-// Sharing looks
+// Sharing presets
 // ---------------------------------------------------------------------------
 
-/// File extension for shared looks. The file is plain JSON, so it survives
+/// File extension for shared presets. The file is plain JSON, so it survives
 /// email, chat apps and cloud drives, and stays readable.
-pub const LOOK_EXT: &str = "stilllook";
+pub const LOOK_EXT: &str = "stillpreset";
+/// What presets were called before 0.2 (still opened).
+pub const OLD_LOOK_EXT: &str = "stilllook";
+/// Every extension a preset file may have.
+pub const LOOK_EXTS: &[&str] = &[LOOK_EXT, OLD_LOOK_EXT];
+/// The format tag inside the file; unchanged so older versions can still import.
 const LOOK_FORMAT: &str = "still-look";
 
 #[derive(Serialize, Deserialize)]
@@ -487,25 +511,25 @@ pub fn write_looks(path: &Path, looks: &[(String, Params)]) -> Result<(), String
 
 pub fn read_looks(path: &Path) -> Result<Vec<(String, Params)>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let file: LookFile = serde_json::from_str(&text).map_err(|_| "not a Still look file".to_string())?;
+    let file: LookFile = serde_json::from_str(&text).map_err(|_| "not a Still preset file".to_string())?;
     if file.format != LOOK_FORMAT {
-        return Err("not a Still look file".into());
+        return Err("not a Still preset file".into());
     }
     if file.looks.is_empty() {
-        return Err("the file has no looks".into());
+        return Err("the file has no presets".into());
     }
     Ok(file.looks.into_iter().map(|l| (l.name.trim().chars().take(60).collect(), look_only(&l.params))).collect())
 }
 
 pub fn is_look_file(path: &Path) -> bool {
-    path.extension().map(|e| e.eq_ignore_ascii_case(LOOK_EXT)).unwrap_or(false)
+    path.extension().map(|e| LOOK_EXTS.iter().any(|x| e.eq_ignore_ascii_case(x))).unwrap_or(false)
 }
 
-/// A file name for a look: keeps it readable, drops characters that trip up file systems.
+/// A file name for a preset: keeps it readable, drops characters that trip up file systems.
 pub fn look_file_name(name: &str) -> String {
     let clean: String = name.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '-' }).collect();
     let clean = clean.trim();
-    format!("{}.{LOOK_EXT}", if clean.is_empty() { "Look" } else { clean })
+    format!("{}.{LOOK_EXT}", if clean.is_empty() { "Preset" } else { clean })
 }
 
 #[cfg(test)]
@@ -533,7 +557,7 @@ mod tests {
         assert!(q.masks.is_empty());
         std::fs::write(&path, "{\"hello\": 1}").unwrap();
         assert!(read_looks(&path).is_err());
-        assert_eq!(look_file_name("Field / Night"), "Field - Night.stilllook");
+        assert_eq!(look_file_name("Field / Night"), "Field - Night.stillpreset");
         let _ = std::fs::remove_dir_all(dir);
     }
 
