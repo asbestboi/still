@@ -92,6 +92,19 @@ pub fn load(path: &Path, preview_edge: u32) -> Result<Doc, String> {
     Ok(Doc { path: path.to_path_buf(), name, full: Arc::new(full), preview, thumb_src, icc, exif, source_desc })
 }
 
+/// Decode any supported image (RAW included), upright, keeping its alpha.
+pub fn decode(path: &Path) -> Result<DynamicImage, String> {
+    if is_raw(path) {
+        return load_raw(path);
+    }
+    let reader = ImageReader::open(path).map_err(|e| e.to_string())?.with_guessed_format().map_err(|e| e.to_string())?;
+    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    img.apply_orientation(orientation);
+    Ok(img)
+}
+
 pub fn downsized(img: &DynamicImage, edge: u32) -> Img {
     let (w, h) = (img.width(), img.height());
     let s = edge as f32 / w.max(h) as f32;

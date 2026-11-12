@@ -2,6 +2,7 @@
 
 mod app;
 mod io;
+mod layers;
 mod masks;
 mod pipeline;
 mod ui_kit;

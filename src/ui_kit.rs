@@ -355,7 +355,9 @@ pub fn segmented(ui: &mut Ui, id_salt: &str, selected: &mut usize, labels: &[&st
         }
         let sel = i == *selected;
         let color = if sel { LABEL } else if pressed { LABEL3 } else { LABEL2 };
-        painter.text(r.center(), Align2::CENTER_CENTER, *l, if sel { font_semibold(12.0) } else { font(12.0) }, color);
+        // narrow segments (e.g. seven tabs) get slightly smaller type rather than touching labels
+        let size = if seg_w < 46.0 { 11.0 } else { 12.0 };
+        painter.text(r.center(), Align2::CENTER_CENTER, *l, if sel { font_semibold(size) } else { font(size) }, color);
     }
     changed
 }

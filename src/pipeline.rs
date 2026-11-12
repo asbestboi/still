@@ -206,6 +206,12 @@ pub struct Params {
     pub bloom: f32,
     pub bloom_radius: f32,
     pub bloom_threshold: f32,
+    /// Astigmatism: bright lights smear into streaks or star rays.
+    pub astig: f32,
+    pub astig_length: f32,
+    pub astig_angle: f32,
+    /// 1 line, 2 cross, 3 star
+    pub astig_rays: u8,
     pub halation: f32,
     pub aberration: f32,
     pub softness: f32,
@@ -248,6 +254,9 @@ pub struct Params {
 
     /// Local adjustments, applied in order.
     pub masks: Vec<crate::masks::Mask>,
+
+    /// Photos placed on the canvas, bottom to top.
+    pub layers: Vec<crate::layers::Layer>,
 }
 
 impl Default for Params {
@@ -278,6 +287,10 @@ impl Default for Params {
             bloom: 0.0,
             bloom_radius: 0.4,
             bloom_threshold: 0.5,
+            astig: 0.0,
+            astig_length: 0.4,
+            astig_angle: 90.0,
+            astig_rays: 1,
             halation: 0.0,
             aberration: 0.0,
             softness: 0.0,
@@ -311,6 +324,7 @@ impl Default for Params {
             border_white: true,
             seed: 1,
             masks: Vec::new(),
+            layers: Vec::new(),
         }
     }
 }
@@ -328,6 +342,7 @@ impl Params {
         p.border = self.border;
         p.border_white = self.border_white;
         p.masks = self.masks.clone();
+        p.layers = self.layers.clone();
         p
     }
 }
@@ -491,6 +506,42 @@ fn upscale_to(img: &Img, w: usize, h: usize) -> Img {
     out
 }
 
+/// Astigmatic smearing of highlights: each bright point is spread along `rays`
+/// lines through it (1 = a single streak, 2 = a cross, 3+ = a star), fading
+/// with distance. Red reaches a little further than blue, like real dispersion.
+fn light_streaks(bright: &Img, len: f32, angle: f32, rays: u8) -> Img {
+    // long streaks are traced on a smaller copy and scaled back up
+    let f = ((len / 36.0).floor() as usize).max(1);
+    let work = if f > 1 { downscale(bright, f) } else { bright.clone() };
+    let l = len / f as f32;
+    let taps = (l.ceil() as i32).max(2);
+    let weights: Vec<f32> = (-taps..=taps).map(|k| (-3.0 * (k.abs() as f32) / taps as f32).exp()).collect();
+    let norm = 1.0 / weights.iter().sum::<f32>();
+    let dirs: Vec<(f32, f32)> = (0..rays).map(|r| {
+        let a = angle + r as f32 * std::f32::consts::PI / rays as f32;
+        (a.cos(), a.sin())
+    }).collect();
+    let spread = [1.08f32, 1.0, 0.92];
+    let mut out = Img::new(work.w, work.h);
+    out.px.par_chunks_mut(work.w).enumerate().for_each(|(y, row)| {
+        for (x, o) in row.iter_mut().enumerate() {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let mut acc = [0.0f32; 3];
+            for &(dx, dy) in &dirs {
+                for (i, k) in (-taps..=taps).enumerate() {
+                    let w = weights[i];
+                    for c in 0..3 {
+                        let d = k as f32 * spread[c];
+                        acc[c] += work.sample(fx + dx * d, fy + dy * d)[c] * w;
+                    }
+                }
+            }
+            *o = acc.map(|v| v * norm);
+        }
+    });
+    if f > 1 { upscale_to(&out, bright.w, bright.h) } else { out }
+}
+
 /// Luminance at quantile `q` (0..1), from a sparse sample of the image.
 fn percentile_luma(img: &Img, q: f32) -> f32 {
     let step = (img.px.len() / 40_000).max(1);
@@ -632,6 +683,10 @@ pub fn process(src: &Img, p: &Params) -> Img {
 /// Full render; also returns the opacity of mask `overlay` for on-screen display.
 pub fn process_ext(src: &Img, p: &Params, overlay: Option<usize>) -> (Img, Option<Vec<f32>>) {
     let (mut img, space) = geometry(src, p);
+    // layers that take on the look are part of the picture from here on
+    if !p.layers.is_empty() {
+        crate::layers::composite(&mut img, &p.layers, true, &space);
+    }
     let u = img.unit();
 
     // --- Linear-light stage: exposure, white balance, bloom, halation -------
@@ -647,7 +702,7 @@ pub fn process_ext(src: &Img, p: &Params, overlay: Option<usize>) -> (Img, Optio
         }
     });
 
-    if p.bloom > 0.001 || p.halation > 0.001 {
+    if p.bloom > 0.001 || p.halation > 0.001 || p.astig > 0.001 {
         // The glow comes from the photo's own highlights: the threshold is relative
         // to its bright end, so a dull daylight frame or a flat RAW still blooms.
         let hi = percentile_luma(&img, 0.97).max(0.02);
@@ -663,11 +718,17 @@ pub fn process_ext(src: &Img, p: &Params, overlay: Option<usize>) -> (Img, Optio
         });
         let bloom = (p.bloom > 0.001).then(|| blur(&bright, (8.0 + p.bloom_radius * 60.0) * u));
         let hal = (p.halation > 0.001).then(|| blur(&bright, 9.0 * u));
+        let astig = (p.astig > 0.001).then(|| light_streaks(&bright, (20.0 + p.astig_length * 380.0) * u, p.astig_angle.to_radians(), p.astig_rays.clamp(1, 4)));
         let tint = [1.0, 0.22, 0.06];
         img.px.par_iter_mut().enumerate().for_each(|(i, px)| {
             if let Some(b) = &bloom {
                 for c in 0..3 {
                     px[c] += b.px[i][c] * p.bloom * 0.9;
+                }
+            }
+            if let Some(a) = &astig {
+                for c in 0..3 {
+                    px[c] += a.px[i][c] * p.astig * 3.5;
                 }
             }
             if let Some(h) = &hal {
@@ -815,6 +876,11 @@ pub fn process_ext(src: &Img, p: &Params, overlay: Option<usize>) -> (Img, Optio
     // --- Vignette ----------------------------------------------------------
     if p.vignette.abs() > 0.001 {
         vignette(&mut img, p);
+    }
+
+    // --- Layers placed on top of the finished look ---------------------------
+    if !p.layers.is_empty() {
+        crate::layers::composite(&mut img, &p.layers, false, &space);
     }
 
     // --- Frame -------------------------------------------------------------
@@ -1294,6 +1360,33 @@ pub fn builtin_presets() -> Vec<(String, Params)> {
         shadow_hue: 210.0,
         highlight_tone: 0.15,
         highlight_hue: 30.0,
+        ..d()
+    }));
+
+    // City 17 key art: teal-cyan haze in the shadows, warm skin and the orange
+    // suit standing out against it, a cold backlight glow and a heavy frame.
+    v.push(("City 17".into(), Params {
+        exposure: -0.12,
+        contrast: 0.4,
+        blacks: -0.22,
+        highlights: -0.2,
+        shadows: 0.08,
+        temperature: -0.08,
+        tint: -0.28,
+        saturation: -0.32,
+        vibrance: 0.2,
+        shadow_tone: 0.85,
+        shadow_hue: 178.0,
+        highlight_tone: 0.3,
+        highlight_hue: 30.0,
+        bloom: 0.3,
+        bloom_radius: 0.6,
+        bloom_threshold: 0.6,
+        sharpen: 0.3,
+        fade: 0.06,
+        grain: 0.08,
+        vignette: 0.42,
+        vignette_feather: 0.75,
         ..d()
     }));
 

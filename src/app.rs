@@ -1,4 +1,5 @@
 use crate::io::{self, Doc, ExportSettings, Format};
+use crate::layers::{Blend, Layer};
 use crate::masks::{self, BrushStroke, Local, Mask, Refine, Seed, Shape};
 use crate::pipeline::{self, Aspect, Histogram, Img, Params};
 use crate::ui_kit::{self as k, Btn, Fmt};
@@ -28,6 +29,8 @@ enum Msg {
     LooksImported(Vec<(String, Params)>, Vec<String>),
     Info(String, Option<PathBuf>),
     Repreviewed(PathBuf, Arc<Img>),
+    LayerFiles(Vec<PathBuf>),
+    LayerReady(Result<(PathBuf, f32), String>),
 }
 
 /// Mask overlay colour, read by the render thread.
@@ -99,14 +102,16 @@ enum Tab {
     Looks,
     Adjust,
     Masks,
+    Layers,
     Effects,
     Glitch,
     Crop,
 }
-const TABS: [(Tab, &str); 6] = [
+const TABS: [(Tab, &str); 7] = [
     (Tab::Looks, "Looks"),
     (Tab::Adjust, "Adjust"),
     (Tab::Masks, "Masks"),
+    (Tab::Layers, "Layers"),
     (Tab::Effects, "Effects"),
     (Tab::Glitch, "Glitch"),
     (Tab::Crop, "Crop"),
@@ -128,6 +133,37 @@ enum Frame {
 enum MaskDrag {
     Paint,
     Handle { id: u8, offset: Vec2, origin: Pos2, start: Shape },
+}
+
+/// An in-progress transform of a layer on the canvas.
+#[derive(Clone)]
+struct LayerDrag {
+    /// 0 move, 1 scale (corner), 2 rotate
+    kind: u8,
+    start: Layer,
+    origin: Pos2,
+}
+
+/// Screen-space outline of a layer: centre, the four corners, and the rotate knob.
+fn layer_frame(l: &Layer, map: &Map) -> (Pos2, [Pos2; 4], Pos2) {
+    let c = map.n2s([l.x, l.y]);
+    let (w, h) = l.size(map.long());
+    let (s, co) = l.rotation.to_radians().sin_cos();
+    let ax = vec2(co, s) * (w * 0.5);
+    let ay = vec2(-s, co) * (h * 0.5);
+    let corners = [c - ax - ay, c + ax - ay, c + ax + ay, c - ax + ay];
+    let knob = c - ay - vec2(-s, co) * 26.0;
+    (c, corners, knob)
+}
+
+/// Is `p` inside the layer's (rotated) rectangle?
+fn layer_contains(l: &Layer, map: &Map, p: Pos2) -> bool {
+    let c = map.n2s([l.x, l.y]);
+    let (w, h) = l.size(map.long());
+    let (s, co) = l.rotation.to_radians().sin_cos();
+    let d = p - c;
+    let (u, v) = (d.x * co + d.y * s, -d.x * s + d.y * co);
+    u.abs() <= w * 0.5 && v.abs() <= h * 0.5
 }
 
 /// Maps between normalised frame coordinates and the screen.
@@ -281,6 +317,9 @@ pub struct App {
     guide_golden: bool,
     prefs: io::Prefs,
     settings_open: bool,
+    layer_sel: Option<usize>,
+    layer_drag: Option<LayerDrag>,
+    layers_loading: usize,
     crop_drag: Option<(Grip, [f32; 4], Pos2)>,
 
     builtin: Vec<(String, Params)>,
@@ -343,6 +382,9 @@ impl App {
             guide_golden: saved.guide_golden,
             prefs: saved.prefs.clone(),
             settings_open: false,
+            layer_sel: None,
+            layer_drag: None,
+            layers_loading: 0,
             crop_drag: None,
             builtin: pipeline::builtin_presets(),
             user_presets: saved.presets,
@@ -656,6 +698,8 @@ impl App {
                     self.params.crop = d.crop;
                     // masks belong to a particular photo
                     self.params.masks.clear();
+                    self.params.layers.clear();
+                    self.layer_sel = None;
                     self.mask_sel = None;
                     self.committed = self.params.clone();
                     self.undo.clear();
@@ -677,6 +721,14 @@ impl App {
                 }
                 Msg::DialogClosed => self.dialog_open = false,
                 Msg::LooksImported(looks, errs) => self.add_imported(looks, errs),
+                Msg::LayerFiles(paths) => self.load_layers(paths, ctx),
+                Msg::LayerReady(r) => {
+                    self.layers_loading = self.layers_loading.saturating_sub(1);
+                    match r {
+                        Ok((path, aspect)) => self.push_layer(path, aspect),
+                        Err(e) => self.toast = Some((format!("Couldn't add photo — {e}"), None, Instant::now())),
+                    }
+                }
                 Msg::Info(text, dir) => self.toast = Some((text, dir, Instant::now())),
                 Msg::Repreviewed(path, img) => {
                     if let Some(doc) = &mut self.doc
@@ -717,7 +769,7 @@ impl App {
     fn render_frame(&self) -> Frame {
         match TABS[self.tab].0 {
             Tab::Crop => Frame::Uncropped,
-            Tab::Masks => Frame::Unbordered,
+            Tab::Masks | Tab::Layers => Frame::Unbordered,
             _ => Frame::Output,
         }
     }
@@ -824,10 +876,17 @@ impl App {
             self.persist();
         }
         if !text_focus {
-            for (i, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6].into_iter().enumerate() {
+            for (i, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7].into_iter().enumerate() {
                 if ctx.input(|inp| inp.key_pressed(key) && inp.modifiers.is_none()) {
                     self.tab = i;
                 }
+            }
+            if TABS[self.tab].0 == Tab::Layers
+                && let Some(i) = self.selected_layer()
+                && ctx.input(|inp| inp.key_pressed(Key::Delete) || inp.key_pressed(Key::Backspace))
+            {
+                self.params.layers.remove(i);
+                self.layer_sel = None;
             }
             if TABS[self.tab].0 == Tab::Masks
                 && let Some(i) = self.selected_mask()
@@ -853,7 +912,9 @@ impl App {
         if !looks.is_empty() {
             self.import_look_files(&looks);
         }
-        if let Some(p) = photos.into_iter().next() {
+        if self.doc.is_some() && TABS[self.tab].0 == Tab::Layers {
+            self.load_layers(photos, ctx);
+        } else if let Some(p) = photos.into_iter().next() {
             self.open_path(p, ctx);
         }
     }
@@ -1072,6 +1133,7 @@ impl App {
 
         let cropping = self.crop_mode() && !compare;
         let masking = TABS[self.tab].0 == Tab::Masks && !compare && self.selected_mask().is_some();
+        let layering = TABS[self.tab].0 == Tab::Layers && !compare && !self.params.layers.is_empty();
         if cropping {
             self.view.zoom = 1.0;
             self.view.pan = Vec2::ZERO;
@@ -1142,8 +1204,21 @@ impl App {
             }
         }
 
+        if layering && !space_held && self.tex_frame == Frame::Unbordered {
+            if resp.drag_started()
+                && let Some(o) = ctx.input(|i| i.pointer.press_origin())
+            {
+                self.layer_begin(o, &ctx);
+            }
+            if resp.clicked()
+                && let Some(o) = click_pos(&resp)
+            {
+                self.layer_click(o);
+            }
+        }
+
         // --- drag to pan: 1:1, rubber-banded past the edges, momentum on release
-        if resp.dragged() && self.view.zoom > 1.0 && self.mask_drag.is_none() {
+        if resp.dragged() && self.view.zoom > 1.0 && self.mask_drag.is_none() && self.layer_drag.is_none() {
             self.view.dragging = true;
             self.view.pan += resp.drag_delta();
         }
@@ -1195,6 +1270,9 @@ impl App {
         }
         if masking && self.tex_frame == Frame::Unbordered {
             self.mask_overlay(ui, &resp, rect, img_rect);
+        }
+        if layering && self.tex_frame == Frame::Unbordered {
+            self.layer_overlay(ui, &resp, rect, img_rect);
         }
 
         if self.view.zoom > 1.0 {
@@ -1691,6 +1769,7 @@ impl App {
                 Tab::Looks => self.tab_looks(ui),
                 Tab::Adjust => self.tab_adjust(ui),
                 Tab::Masks => self.tab_masks(ui),
+                Tab::Layers => self.tab_layers(ui),
                 Tab::Effects => self.tab_effects(ui),
                 Tab::Glitch => self.tab_glitch(ui),
                 Tab::Crop => self.tab_crop(ui),
@@ -1821,7 +1900,7 @@ impl App {
         }
         let mut changed = false;
         if let Some(i) = overwrite {
-            self.user_presets[i].1 = Params { masks: Vec::new(), ..self.params.clone() };
+            self.user_presets[i].1 = Params { masks: Vec::new(), layers: Vec::new(), ..self.params.clone() };
             changed = true;
         }
         if let Some(i) = delete {
@@ -1831,7 +1910,7 @@ impl App {
 
         ui.add_space(8.0);
         k::section(ui, "Save Look", false, |ui| {
-            k::caption(ui, "Saves every adjustment except crop, border and masks.");
+            k::caption(ui, "Saves every adjustment except crop, border, masks and layers.");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let te = egui::TextEdit::singleline(&mut self.new_preset)
@@ -1842,7 +1921,7 @@ impl App {
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let ok = !self.new_preset.trim().is_empty();
                 if (k::button(ui, "Save", Btn::Secondary, ok).clicked() || enter) && ok {
-                    self.user_presets.push((self.new_preset.trim().to_string(), Params { masks: Vec::new(), ..self.params.clone() }));
+                    self.user_presets.push((self.new_preset.trim().to_string(), Params { masks: Vec::new(), layers: Vec::new(), ..self.params.clone() }));
                     self.new_preset.clear();
                     changed = true;
                 }
@@ -1940,6 +2019,23 @@ impl App {
             reset!(p, bloom, bloom_radius, bloom_threshold, halation, aberration, vignette, vignette_feather);
         }
 
+        if k::section(ui, "Astigmatism", modified!(p, astig, astig_length, astig_angle, astig_rays), |ui| {
+            k::caption(ui, "Bright lights smear into streaks, like night lights seen through an astigmatic eye.");
+            ui.add_space(2.0);
+            k::slider(ui, "Amount", &mut p.astig, 0.0..=1.0, 0.0, Fmt::Amount);
+            k::slider(ui, "Length", &mut p.astig_length, 0.0..=1.0, 0.4, Fmt::Amount);
+            k::slider(ui, "Angle", &mut p.astig_angle, 0.0..=180.0, 90.0, Fmt::Deg);
+            let mut r = (p.astig_rays.clamp(1, 3) - 1) as usize;
+            if k::segmented(ui, "astig_rays", &mut r, &["Streak", "Cross", "Star"]) {
+                p.astig_rays = r as u8 + 1;
+            }
+            ui.add_space(2.0);
+            k::caption(ui, "Uses the Glow Threshold above to decide which lights streak.");
+            ui.add_space(4.0);
+        }) {
+            reset!(p, astig, astig_length, astig_angle, astig_rays);
+        }
+
         if k::section(ui, "Grain", modified!(p, grain, grain_size, grain_color), |ui| {
             k::slider(ui, "Amount", &mut p.grain, 0.0..=1.0, 0.0, Fmt::Amount);
             k::slider(ui, "Size", &mut p.grain_size, 0.0..=1.0, 0.35, Fmt::Amount);
@@ -2019,6 +2115,396 @@ impl App {
             k::slider(ui, "Block Size", &mut p.block_size, 0.0..=1.0, 0.3, Fmt::Amount);
         }) {
             reset!(p, blocks, block_size);
+        }
+    }
+
+    // --- layers --------------------------------------------------------------
+
+    fn selected_layer(&self) -> Option<usize> {
+        self.layer_sel.filter(|i| *i < self.params.layers.len())
+    }
+
+    fn pick_layer_photos(&mut self, ctx: &egui::Context) {
+        if self.dialog_open {
+            return;
+        }
+        self.dialog_open = true;
+        let tx = self.tx.clone();
+        let ctx2 = ctx.clone();
+        let dir = self.doc.as_ref().and_then(|d| d.path.parent().map(|p| p.to_path_buf()));
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new().set_title("Add Photos as Layers").add_filter("Images", &{
+                let mut v = vec!["jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp", "gif", "tga", "exr", "hdr", "qoi"];
+                v.extend_from_slice(io::RAW_EXTS);
+                v
+            });
+            if let Some(d) = dir {
+                dlg = dlg.set_directory(d);
+            }
+            let picked = dlg.pick_files().unwrap_or_default();
+            let _ = tx.send(Msg::DialogClosed);
+            if !picked.is_empty() {
+                let _ = tx.send(Msg::LayerFiles(picked));
+            }
+            ctx2.request_repaint();
+        });
+    }
+
+    /// Decode photos off the UI thread and add each as a layer when ready.
+    fn load_layers(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        for path in paths {
+            self.layers_loading += 1;
+            let tx = self.tx.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let r = io::decode(&path).map(|img| {
+                    let aspect = crate::layers::register(&path.to_string_lossy(), &img);
+                    (path.clone(), aspect)
+                });
+                let _ = tx.send(Msg::LayerReady(r));
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn push_layer(&mut self, path: PathBuf, aspect: f32) {
+        let (fw, fh) = self.frame_dims();
+        let l = fw.max(fh);
+        let c = self.params.crop;
+        let (cw, ch) = ((c[2] - c[0]) * fw / l, (c[3] - c[1]) * fh / l);
+        // fit inside the middle of the visible frame at about half its size
+        let scale = (cw * 0.5).min(ch * 0.5 * aspect);
+        let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Photo".into());
+        self.params.layers.push(Layer {
+            name,
+            path: path.to_string_lossy().to_string(),
+            aspect,
+            x: (c[0] + c[2]) * 0.5,
+            y: (c[1] + c[3]) * 0.5,
+            scale,
+            ..Layer::default()
+        });
+        self.layer_sel = Some(self.params.layers.len() - 1);
+        self.tab = TABS.iter().position(|t| t.0 == Tab::Layers).unwrap_or(self.tab);
+    }
+
+    /// Fit (false) or fill (true) the visible canvas with the selected layer.
+    fn fit_layer(&mut self, i: usize, fill: bool) {
+        let (fw, fh) = self.frame_dims();
+        let long = fw.max(fh);
+        let c = self.params.crop;
+        let (cw, ch) = ((c[2] - c[0]) * fw / long, (c[3] - c[1]) * fh / long);
+        let l = &mut self.params.layers[i];
+        let (a, b) = (cw, ch * l.aspect);
+        l.scale = if fill { a.max(b) } else { a.min(b) };
+        l.rotation = 0.0;
+        l.x = (c[0] + c[2]) * 0.5;
+        l.y = (c[1] + c[3]) * 0.5;
+    }
+
+    fn layer_begin(&mut self, o: Pos2, ctx: &egui::Context) {
+        let map = self.mask_map(self.last_img_rect);
+        // grab a handle of the selected layer first
+        if let Some(i) = self.selected_layer() {
+            let l = &self.params.layers[i];
+            let (_, corners, knob) = layer_frame(l, &map);
+            let kind = if knob.distance(o) < 14.0 {
+                Some(2)
+            } else if corners.iter().any(|c| c.distance(o) < 14.0) {
+                Some(1)
+            } else if layer_contains(l, &map, o) {
+                Some(0)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                self.layer_drag = Some(LayerDrag { kind, start: l.clone(), origin: o });
+                return;
+            }
+        }
+        // otherwise pick the topmost visible layer under the pointer and move it
+        if let Some(i) = (0..self.params.layers.len()).rev().find(|&i| {
+            let l = &self.params.layers[i];
+            l.visible && layer_contains(l, &map, o)
+        }) {
+            self.layer_sel = Some(i);
+            self.layer_drag = Some(LayerDrag { kind: 0, start: self.params.layers[i].clone(), origin: o });
+        }
+        let _ = ctx;
+    }
+
+    fn layer_click(&mut self, o: Pos2) {
+        let map = self.mask_map(self.last_img_rect);
+        let hit = (0..self.params.layers.len()).rev().find(|&i| {
+            let l = &self.params.layers[i];
+            l.visible && layer_contains(l, &map, o)
+        });
+        self.layer_sel = hit;
+    }
+
+    /// Outline + handles for the selected layer, and live dragging.
+    fn layer_overlay(&mut self, ui: &mut Ui, resp: &egui::Response, clip: Rect, img: Rect) {
+        let ctx = ui.ctx().clone();
+        let map = self.mask_map(img);
+        if let Some(d) = self.layer_drag.clone() {
+            if let (Some(i), Some(p)) = (self.selected_layer(), ctx.input(|inp| inp.pointer.latest_pos())) {
+                let shift = ctx.input(|inp| inp.modifiers.shift);
+                let s = &d.start;
+                let c = map.n2s([s.x, s.y]);
+                let l = &mut self.params.layers[i];
+                match d.kind {
+                    0 => {
+                        let f = map.frame();
+                        let dl = p - d.origin;
+                        l.x = s.x + dl.x / f.x;
+                        l.y = s.y + dl.y / f.y;
+                    }
+                    1 => {
+                        let r0 = (d.origin - c).length().max(1.0);
+                        l.scale = (s.scale * (p - c).length() / r0).clamp(0.005, 20.0);
+                    }
+                    _ => {
+                        let a0 = (d.origin - c).y.atan2((d.origin - c).x);
+                        let a1 = (p - c).y.atan2((p - c).x);
+                        let mut deg = s.rotation + (a1 - a0).to_degrees();
+                        deg = (deg + 180.0).rem_euclid(360.0) - 180.0;
+                        if shift {
+                            deg = (deg / 15.0).round() * 15.0;
+                        }
+                        l.rotation = deg;
+                    }
+                }
+            }
+            if !resp.dragged() || resp.drag_stopped() {
+                self.layer_drag = None;
+            }
+        }
+
+        let Some(i) = self.selected_layer() else { return };
+        let l = &self.params.layers[i];
+        let painter = ui.painter_at(clip);
+        let (c, corners, knob) = layer_frame(l, &map);
+        let shadow = Color32::from_black_alpha(110);
+        let mut outline = corners.to_vec();
+        outline.push(corners[0]);
+        painter.add(egui::Shape::line(outline.clone(), Stroke::new(3.0, Color32::from_black_alpha(70))));
+        painter.add(egui::Shape::line(outline, Stroke::new(1.2, Color32::WHITE)));
+        let top_mid = corners[0] + (corners[1] - corners[0]) * 0.5;
+        painter.line_segment([top_mid, knob], Stroke::new(1.2, Color32::from_white_alpha(200)));
+        let hover = ctx.input(|inp| inp.pointer.hover_pos()).filter(|p| clip.contains(*p));
+        let active = self.layer_drag.as_ref().map(|d| d.kind);
+        for p in corners {
+            let big = active == Some(1) || hover.map(|h| h.distance(p) < 14.0).unwrap_or(false);
+            let r = if big { 6.5 } else { 5.0 };
+            painter.circle_filled(p + vec2(0.0, 1.0), r + 1.5, shadow);
+            painter.circle_filled(p, r, Color32::WHITE);
+        }
+        let kb = active == Some(2) || hover.map(|h| h.distance(knob) < 14.0).unwrap_or(false);
+        painter.circle_filled(knob + vec2(0.0, 1.0), 8.5, shadow);
+        painter.circle_filled(knob, if kb { 8.0 } else { 7.0 }, k::ACCENT);
+        painter.circle_stroke(knob, if kb { 8.0 } else { 7.0 }, Stroke::new(2.0, Color32::WHITE));
+        let _ = c;
+        // cursor feedback
+        if let Some(kind) = active {
+            ctx.set_cursor_icon(match kind {
+                0 => egui::CursorIcon::Grabbing,
+                1 => egui::CursorIcon::ResizeNwSe,
+                _ => egui::CursorIcon::Alias,
+            });
+        } else if let Some(h) = hover {
+            if h.distance(knob) < 14.0 {
+                ctx.set_cursor_icon(egui::CursorIcon::Alias);
+            } else if corners.iter().any(|p| p.distance(h) < 14.0) {
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+            } else if layer_contains(l, &map, h) {
+                ctx.set_cursor_icon(egui::CursorIcon::Grab);
+            }
+        }
+        // live size readout while transforming
+        if active.is_some() {
+            let label = format!("{:.0}%  ·  {:.0}°", l.scale * 100.0, l.rotation);
+            let g = painter.layout_no_wrap(label, k::font_mono(11.5), k::LABEL);
+            let pos = pos2(img.center().x, img.top() + 18.0);
+            let bg = Rect::from_center_size(pos, g.size() + vec2(16.0, 6.0));
+            painter.rect_filled(bg, CornerRadius::same(10), Color32::from_black_alpha(170));
+            painter.galley(bg.center() - g.size() / 2.0, g, k::LABEL);
+        }
+    }
+
+    fn tab_layers(&mut self, ui: &mut Ui) {
+        if self.doc.is_none() {
+            k::caption(ui, "Open a photo first, then add more photos on top of it.");
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        k::caption(ui, "Place other photos on the canvas. Drag to move, corners to scale, the blue knob to rotate (Shift snaps). You can also drop files here.");
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if k::button(ui, "Add Photo…", Btn::Secondary, true).clicked() {
+                self.pick_layer_photos(&ctx);
+            }
+            if self.layers_loading > 0 {
+                ui.spinner();
+            }
+        });
+        ui.add_space(10.0);
+
+        enum Act {
+            Select(usize),
+            Toggle(usize),
+            Duplicate(usize),
+            Up(usize),
+            Down(usize),
+            Delete(usize),
+        }
+        let mut act = None;
+        let sel = self.selected_layer();
+        let n = self.params.layers.len();
+        egui::Frame::NONE.fill(k::CARD).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            // top of the stack first, like any layers panel
+            for i in (0..n).rev() {
+                let l = &self.params.layers[i];
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+                let bg = if sel == Some(i) {
+                    Color32::from_rgba_unmultiplied(10, 132, 255, 70)
+                } else if resp.is_pointer_button_down_on() {
+                    k::FILL_HI
+                } else if resp.hovered() {
+                    k::FILL
+                } else {
+                    Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(r, CornerRadius::same(8), bg);
+                let dot = pos2(r.left() + 16.0, r.center().y);
+                let dresp = ui.interact(Rect::from_center_size(dot, vec2(24.0, 24.0)), ui.scope_id().with(("layer_dot", i)), Sense::click());
+                if l.visible {
+                    ui.painter().circle_filled(dot, 5.0, k::ACCENT);
+                } else {
+                    ui.painter().circle_stroke(dot, 5.0, Stroke::new(1.5, k::LABEL3));
+                }
+                let col = if l.visible { k::LABEL } else { k::LABEL3 };
+                let name: String = l.name.chars().take(22).collect();
+                ui.painter().text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, name, k::font(13.0), col);
+                let tag = format!("{}{}", l.blend.label(), if l.opacity < 0.999 { format!(" · {:.0}%", l.opacity * 100.0) } else { String::new() });
+                ui.painter().text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, tag, k::font(11.0), k::LABEL3);
+                if dresp.clicked() {
+                    act = Some(Act::Toggle(i));
+                } else if resp.clicked() {
+                    act = Some(Act::Select(i));
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("Duplicate").clicked() {
+                        act = Some(Act::Duplicate(i));
+                    }
+                    if i + 1 < n && ui.button("Bring Forward").clicked() {
+                        act = Some(Act::Up(i));
+                    }
+                    if i > 0 && ui.button("Send Backward").clicked() {
+                        act = Some(Act::Down(i));
+                    }
+                    if ui.button("Delete").clicked() {
+                        act = Some(Act::Delete(i));
+                    }
+                });
+            }
+            // the photo itself, always at the bottom
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+            ui.painter().text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, "Photo", k::font(13.0), k::LABEL3);
+            ui.painter().text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, "Background", k::font(11.0), k::LABEL3);
+        });
+        let layers = &mut self.params.layers;
+        match act {
+            Some(Act::Select(i)) => self.layer_sel = Some(i),
+            Some(Act::Toggle(i)) => layers[i].visible = !layers[i].visible,
+            Some(Act::Duplicate(i)) => {
+                let mut l = layers[i].clone();
+                l.name = format!("{} copy", l.name);
+                l.x += 0.03;
+                l.y += 0.03;
+                layers.insert(i + 1, l);
+                self.layer_sel = Some(i + 1);
+            }
+            Some(Act::Up(i)) => {
+                layers.swap(i, i + 1);
+                self.layer_sel = Some(i + 1);
+            }
+            Some(Act::Down(i)) => {
+                layers.swap(i, i - 1);
+                self.layer_sel = Some(i - 1);
+            }
+            Some(Act::Delete(i)) => {
+                layers.remove(i);
+                self.layer_sel = None;
+            }
+            None => {}
+        }
+        if n > 0 {
+            k::caption(ui, "Right-click a layer to duplicate, reorder or delete it.");
+        }
+        ui.add_space(10.0);
+
+        let Some(i) = self.selected_layer() else {
+            if n > 0 {
+                k::caption(ui, "Select a layer to edit it.");
+            }
+            return;
+        };
+        let mut fit = None;
+        let l = &mut self.params.layers[i];
+        let d = Layer::default();
+        if k::section(ui, "Blending", l.opacity < 1.0 || l.blend != Blend::Normal || !l.graded, |ui| {
+            k::slider(ui, "Opacity", &mut l.opacity, 0.0..=1.0, 1.0, Fmt::Amount);
+            ui.add_space(2.0);
+            let w = ui.available_width();
+            let cw = (w - 12.0) / 3.0;
+            for row in Blend::ALL.chunks(3) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for b in row {
+                        if k::chip(ui, vec2(cw, 28.0), b.label(), l.blend == *b).clicked() {
+                            l.blend = *b;
+                        }
+                    }
+                });
+                ui.add_space(2.0);
+            }
+            ui.add_space(2.0);
+            k::switch_row(ui, "Apply Look to Layer", &mut l.graded);
+            k::caption(ui, "On: the layer is graded with the photo. Off: it sits on top of the finished look, good for light leaks and textures (try Screen).");
+            ui.add_space(4.0);
+        }) {
+            l.opacity = d.opacity;
+            l.blend = d.blend;
+            l.graded = d.graded;
+        }
+        if k::section(ui, "Transform", l.rotation != 0.0 || l.flip, |ui| {
+            let mut pct = l.scale * 100.0;
+            k::slider(ui, "Size (% of long edge)", &mut pct, 1.0..=300.0, 50.0, Fmt::Px);
+            l.scale = pct / 100.0;
+            k::slider(ui, "Rotation", &mut l.rotation, -180.0..=180.0, 0.0, Fmt::Deg);
+            k::switch_row(ui, "Flip Horizontal", &mut l.flip);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if k::button(ui, "Fit", Btn::Secondary, true).clicked() {
+                    fit = Some(false);
+                }
+                if k::button(ui, "Fill", Btn::Secondary, true).clicked() {
+                    fit = Some(true);
+                }
+            });
+            ui.add_space(4.0);
+        }) {
+            l.rotation = 0.0;
+            l.flip = false;
+        }
+        if let Some(fill) = fit {
+            self.fit_layer(i, fill);
+        }
+        ui.add_space(4.0);
+        if k::button(ui, "Delete Layer", Btn::Plain, true).clicked() {
+            self.params.layers.remove(i);
+            self.layer_sel = None;
         }
     }
 
