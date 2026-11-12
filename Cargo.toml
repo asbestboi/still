@@ -25,3 +25,7 @@ codegen-units = 4
 
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["eframe"] }
+
+# picks the X11 backend so dropped files arrive under Wayland (see main.rs)
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30.13", default-features = false, features = ["x11"] }

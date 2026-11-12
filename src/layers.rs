@@ -80,6 +80,8 @@ impl Blend {
 #[serde(default)]
 pub struct Layer {
     pub name: String,
+    /// Label colour in the list (0 none, 1..=7 see the app's palette).
+    pub color: u8,
     /// Source image file.
     pub path: String,
     /// Width / height of the source.
@@ -105,6 +107,7 @@ impl Default for Layer {
     fn default() -> Self {
         Layer {
             name: String::new(),
+            color: 0,
             path: String::new(),
             aspect: 1.0,
             visible: true,

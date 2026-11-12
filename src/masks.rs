@@ -76,6 +76,8 @@ impl Local {
 #[serde(default)]
 pub struct Mask {
     pub name: String,
+    /// Label colour in the list (0 none, 1..=7 see the app's palette).
+    pub color: u8,
     pub enabled: bool,
     pub shape: Shape,
     pub invert: bool,
@@ -94,6 +96,7 @@ impl Default for Mask {
     fn default() -> Self {
         Mask {
             name: String::new(),
+            color: 0,
             enabled: true,
             shape: Shape::Everything,
             invert: false,

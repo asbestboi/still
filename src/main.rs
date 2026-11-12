@@ -54,7 +54,11 @@ fn main() -> eframe::Result<()> {
     }
     let initial = args.first().filter(|a| !a.starts_with('-')).map(std::path::PathBuf::from);
 
-    let options = eframe::NativeOptions {
+    // Leave a core for the interface so it stays smooth while a preview renders.
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(cores.saturating_sub(1).max(1)).build_global();
+
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Still")
             .with_app_id("still")
@@ -64,6 +68,19 @@ fn main() -> eframe::Result<()> {
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).unwrap_or_default()),
         ..Default::default()
     };
+
+    // winit can't receive dropped files on Wayland, so prefer XWayland when it's
+    // there, unless switched off in Settings or with STILL_WAYLAND=1.
+    #[cfg(target_os = "linux")]
+    {
+        let native = io::load_saved().prefs.native_wayland || std::env::var_os("STILL_WAYLAND").is_some_and(|v| v != "0");
+        if !native && std::env::var_os("DISPLAY").is_some() {
+            options.event_loop_builder = Some(Box::new(|b| {
+                use winit::platform::x11::EventLoopBuilderExtX11;
+                b.with_x11();
+            }));
+        }
+    }
 
     eframe::run_native("Still", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, initial)))))
 }

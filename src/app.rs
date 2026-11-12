@@ -14,12 +14,14 @@ use std::time::Instant;
 // ---------------------------------------------------------------------------
 
 enum Job {
-    Preview { src: Arc<Img>, params: Params, generation: u64, frame: Frame, overlay: Option<usize> },
+    /// `overlay`: mask index and its wash colour. `draft`: render at half size (fast, while dragging).
+    Preview { src: Arc<Img>, params: Params, generation: u64, frame: Frame, overlay: Option<(usize, u32)>, draft: bool },
     Thumbs { src: Arc<Img>, looks: Vec<Params>, ver: u64 },
 }
 
 enum Msg {
-    Preview { generation: u64, image: egui::ColorImage, hist: Histogram, ms: f32, frame: Frame, overlay: Option<egui::ColorImage> },
+    /// `scale`: how many preview pixels one image pixel covers (2 for drafts).
+    Preview { generation: u64, image: Arc<egui::ColorImage>, hist: Histogram, ms: f32, frame: Frame, overlay: Option<egui::ColorImage>, scale: f32, draft: bool },
     Thumbs { ver: u64, images: Vec<egui::ColorImage> },
     Loaded(Result<Doc, String>),
     Picked(PathBuf),
@@ -34,8 +36,6 @@ enum Msg {
     LayerReady(Result<(PathBuf, f32), String>),
 }
 
-/// Mask overlay colour, read by the render thread.
-static OVERLAY_RGB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xFF2D28);
 const OVERLAY_COLORS: [u32; 3] = [0xFF2D28, 0x30D158, 0x0A84FF];
 const CANVAS_COLORS: [Color32; 3] = [k::CANVAS, Color32::from_rgb(28, 28, 30), Color32::from_rgb(72, 72, 76)];
 
@@ -50,9 +50,8 @@ fn to_color_image(img: &Img) -> egui::ColorImage {
 }
 
 /// The mask as a translucent red wash, like a rubylith.
-fn overlay_image(a: &[f32], w: usize, h: usize) -> egui::ColorImage {
+fn overlay_image(a: &[f32], w: usize, h: usize, c: u32) -> egui::ColorImage {
     let mut rgba = Vec::with_capacity(w * h * 4);
-    let c = OVERLAY_RGB.load(std::sync::atomic::Ordering::Relaxed);
     let (r, g, b) = ((c >> 16) as u8, (c >> 8) as u8, c as u8);
     for v in a {
         rgba.extend_from_slice(&[r, g, b, (v.clamp(0.0, 1.0) * 150.0) as u8]);
@@ -62,6 +61,9 @@ fn overlay_image(a: &[f32], w: usize, h: usize) -> egui::ColorImage {
 
 fn spawn_worker(ctx: egui::Context, jobs: Receiver<Job>, out: Sender<Msg>) {
     std::thread::spawn(move || {
+        let mut cache = pipeline::StageCache::default();
+        // the last preview source and its half-size copy for drafts
+        let mut halves: Option<(Arc<Img>, Arc<Img>)> = None;
         while let Ok(first) = jobs.recv() {
             // coalesce: only the newest preview / thumbnail request matters
             let mut preview = None;
@@ -74,14 +76,28 @@ fn spawn_worker(ctx: egui::Context, jobs: Receiver<Job>, out: Sender<Msg>) {
             while let Ok(j) = jobs.try_recv() {
                 take(j);
             }
-            if let Some(Job::Preview { src, params, generation, frame, overlay }) = preview {
+            if let Some(Job::Preview { src, params, generation, frame, overlay, draft }) = preview {
                 let t = Instant::now();
-                let (img, alpha) = pipeline::process_ext(&src, &params, overlay);
-                let overlay = alpha.map(|a| overlay_image(&a, img.w, img.h));
+                let full_w = src.w as f32;
+                let src = if draft {
+                    match &halves {
+                        Some((full, h)) if Arc::ptr_eq(full, &src) => h.clone(),
+                        _ => {
+                            let h = Arc::new(pipeline::half(&src));
+                            halves = Some((src.clone(), h.clone()));
+                            h
+                        }
+                    }
+                } else {
+                    src
+                };
+                let scale = full_w / src.w.max(1) as f32;
+                let (img, alpha) = pipeline::process_cached(&src, &params, overlay.map(|o| o.0), &mut cache);
+                let overlay = alpha.zip(overlay).map(|(a, (_, rgb))| overlay_image(&a, img.w, img.h, rgb));
                 let hist = pipeline::histogram(&img);
-                let image = to_color_image(&img);
+                let image = Arc::new(to_color_image(&img));
                 let ms = t.elapsed().as_secs_f32() * 1000.0;
-                let _ = out.send(Msg::Preview { generation, image, hist, ms, frame, overlay });
+                let _ = out.send(Msg::Preview { generation, image, hist, ms, frame, overlay, scale, draft });
                 ctx.request_repaint();
             }
             if let Some(Job::Thumbs { src, looks, ver }) = thumbs {
@@ -313,8 +329,13 @@ pub struct App {
     hist: Histogram,
     generation: u64,
     shown_gen: u64,
-    last_sent: Option<(Params, Option<usize>)>,
+    /// What the last preview job rendered: params, overlay, draft.
+    last_sent: Option<(Params, Option<(usize, u32)>, bool)>,
     render_ms: f32,
+    /// Duration of the last full-size render; slow ones get drafts while dragging.
+    full_ms: f32,
+    /// Preview pixels per texture pixel (2 while a draft is shown).
+    tex_scale: f32,
     sent_at: Option<Instant>,
     tex_frame: Frame,
     overlay_tex: Option<egui::TextureHandle>,
@@ -343,6 +364,8 @@ pub struct App {
     snap_lines: (Option<f32>, Option<f32>),
     /// Layer being dragged in the list, for reordering.
     list_drag: Option<usize>,
+    /// Inline rename in the mask / layer list: target, text, focus on next frame.
+    renaming: Option<(Rename, String, bool)>,
     layers_loading: usize,
     crop_drag: Option<(Grip, [f32; 4], Pos2)>,
 
@@ -388,6 +411,8 @@ impl App {
             shown_gen: 0,
             last_sent: None,
             render_ms: 0.0,
+            full_ms: 0.0,
+            tex_scale: 1.0,
             sent_at: None,
             tex_frame: Frame::Output,
             overlay_tex: None,
@@ -413,6 +438,7 @@ impl App {
             layer_drag: None,
             snap_lines: (None, None),
             list_drag: None,
+            renaming: None,
             layers_loading: 0,
             crop_drag: None,
             builtin: pipeline::builtin_presets(),
@@ -454,7 +480,6 @@ impl App {
     /// Push preferences into the parts of the app that read them globally.
     fn apply_prefs(&self) {
         k::set_reduce_motion(self.prefs.reduce_motion);
-        OVERLAY_RGB.store(OVERLAY_COLORS[self.prefs.overlay_color.min(2)], std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Rebuild the working preview at the preferred size (Settings → Preview).
@@ -739,10 +764,14 @@ impl App {
     fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Preview { generation, image, hist, ms, frame, overlay } => {
+                Msg::Preview { generation, image, hist, ms, frame, overlay, scale, draft } => {
                     if generation >= self.shown_gen {
                         self.shown_gen = generation;
                         self.tex_frame = frame;
+                        self.tex_scale = scale;
+                        if !draft {
+                            self.full_ms = ms;
+                        }
                         self.overlay_tex = overlay.map(|o| match self.overlay_tex.take() {
                             Some(mut t) => {
                                 t.set(o, egui::TextureOptions::LINEAR);
@@ -750,7 +779,7 @@ impl App {
                             }
                             None => ctx.load_texture("mask_overlay", o, egui::TextureOptions::LINEAR),
                         });
-                        self.last_image = Some(Arc::new(image.clone()));
+                        self.last_image = Some(image.clone());
                         self.hist = hist;
                         self.render_ms = ms;
                         match &mut self.tex {
@@ -888,7 +917,7 @@ impl App {
 
     /// The red mask overlay shows while shaping a mask, briefly after adding
     /// one, while O is held, or always when switched on.
-    fn overlay_wanted(&self, ctx: &egui::Context) -> Option<usize> {
+    fn overlay_wanted(&self, ctx: &egui::Context) -> Option<(usize, u32)> {
         let i = self.selected_mask()?;
         if TABS[self.tab].0 != Tab::Masks {
             return None;
@@ -896,7 +925,9 @@ impl App {
         let text_focus = ctx.memory(|m| m.focused().is_some());
         let flash = self.overlay_until.map(|t| Instant::now() < t).unwrap_or(false);
         let key = !text_focus && ctx.input(|inp| inp.key_down(egui::Key::O));
-        (self.show_overlay || self.mask_drag.is_some() || flash || key).then_some(i)
+        // a mask with its own label colour shows its wash in that colour
+        let rgb = label_rgb(self.params.masks[i].color).unwrap_or(OVERLAY_COLORS[self.prefs.overlay_color.min(2)]);
+        (self.show_overlay || self.mask_drag.is_some() || flash || key).then_some((i, rgb))
     }
 
     fn send_preview(&mut self, ctx: &egui::Context) {
@@ -916,15 +947,29 @@ impl App {
         if frame != Frame::Output {
             params.border = 0.0;
         }
-        let key = (params, overlay);
-        if self.last_sent.as_ref() == Some(&key) {
+        // names and label colours don't change the picture
+        for m in &mut params.masks {
+            m.name.clear();
+            m.color = 0;
+        }
+        for l in &mut params.layers {
+            l.name.clear();
+            l.color = 0;
+        }
+        // While a slider or brush is held, slow renders are drafted at half size so
+        // the preview keeps up; the full-size render follows on release.
+        let interacting = ctx.input(|i| i.pointer.any_down()) && self.full_ms > 45.0;
+        if let Some((p, o, was_draft)) = &self.last_sent
+            && *p == params
+            && *o == overlay
+            && (!*was_draft || interacting)
+        {
             return;
         }
-        let params = key.0.clone();
         self.generation += 1;
-        self.last_sent = Some(key);
+        self.last_sent = Some((params.clone(), overlay, interacting));
         self.sent_at = Some(Instant::now());
-        let _ = self.jobs.send(Job::Preview { src: doc.preview.clone(), params, generation: self.generation, frame, overlay });
+        let _ = self.jobs.send(Job::Preview { src: doc.preview.clone(), params, generation: self.generation, frame, overlay, draft: interacting });
     }
 
     /// Snapshot the parameters into the undo stack once an interaction ends.
@@ -969,10 +1014,11 @@ impl App {
         if self.doc.is_some() && sc(Modifiers::COMMAND, Key::E) {
             self.export_open = true;
         }
-        if sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || sc(Modifiers::COMMAND, Key::Y) {
+        // while typing (e.g. renaming a mask) undo belongs to the text field
+        if !text_focus && (sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || sc(Modifiers::COMMAND, Key::Y)) {
             self.do_redo();
         }
-        if sc(Modifiers::COMMAND, Key::Z) {
+        if !text_focus && sc(Modifiers::COMMAND, Key::Z) {
             self.do_undo();
         }
         if sc(Modifiers::COMMAND, Key::Num0) {
@@ -1046,7 +1092,11 @@ impl App {
         }
         if let Some(proj) = photos.iter().find(|p| io::is_project_file(p)).cloned() {
             self.open_path(proj, ctx);
-        } else if self.doc.is_some() && TABS[self.tab].0 == Tab::Layers {
+        } else if self.doc.is_some() && !photos.is_empty() {
+            // onto an open photo: place them on top as layers
+            if let Some(i) = TABS.iter().position(|t| t.0 == Tab::Layers) {
+                self.tab = i;
+            }
             self.load_layers(photos, ctx);
         } else if let Some(p) = photos.into_iter().next() {
             self.open_path(p, ctx);
@@ -1065,6 +1115,15 @@ impl eframe::App for App {
         self.poll(&ctx);
         self.shortcuts(&ctx);
         self.handle_drop(&ctx);
+        // a rename only lives as long as its list is on screen
+        let list_shown = match self.renaming {
+            Some((Rename::Mask(i), ..)) => TABS[self.tab].0 == Tab::Masks && i < self.params.masks.len(),
+            Some((Rename::Layer(i), ..)) => TABS[self.tab].0 == Tab::Layers && i < self.params.layers.len(),
+            None => true,
+        };
+        if !list_shown || self.doc.is_none() {
+            self.renaming = None;
+        }
 
         egui::Panel::top("toolbar")
             .exact_size(52.0)
@@ -1100,6 +1159,8 @@ impl App {
     fn toolbar(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let rect = ui.max_rect();
+        // how far the buttons reach on each side, so the title can stay clear of them
+        let (mut left_end, mut right_start) = (rect.left(), rect.right());
         ui.horizontal_centered(|ui| {
             if k::button(ui, "Open", Btn::Secondary, true).on_hover_text("Ctrl+O — a photo or a .still project").clicked() {
                 self.pick_file(&ctx);
@@ -1115,6 +1176,7 @@ impl App {
             if k::button(ui, "Redo", Btn::Plain, !self.redo.is_empty()).on_hover_text("Ctrl+Shift+Z").clicked() {
                 self.do_redo();
             }
+            left_end = ui.min_rect().right();
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if k::button(ui, "Export", Btn::Primary, has_doc).on_hover_text("Ctrl+E").clicked() {
@@ -1128,6 +1190,7 @@ impl App {
                 if k::button(ui, "Revert", Btn::Plain, has_doc && modified).on_hover_text("Reset all edits").clicked() {
                     self.params = Params { seed: self.params.seed, ..Params::default() };
                 }
+                right_start = ui.min_rect().left();
             });
         });
 
@@ -1148,11 +1211,25 @@ impl App {
             (None, None) => ("Still".to_string(), String::new()),
         };
         let cy = rect.center().y;
-        if sub.is_empty() {
-            painter.text(pos2(rect.center().x, cy), Align2::CENTER_CENTER, title, k::font_semibold(13.0), k::LABEL);
-        } else {
-            painter.text(pos2(rect.center().x, cy - 7.0), Align2::CENTER_CENTER, title, k::font_semibold(13.0), k::LABEL);
-            painter.text(pos2(rect.center().x, cy + 9.0), Align2::CENTER_CENTER, sub, k::font(11.0), k::LABEL3);
+        // centred, and cut short with an ellipsis before it reaches a button
+        let cx = rect.center().x;
+        let max_w = 2.0 * (cx - left_end).min(right_start - cx) - 32.0;
+        if max_w < 24.0 {
+            return;
+        }
+        let full = elided(ui, &title, k::font_semibold(13.0), k::LABEL, max_w);
+        let title_g = full.clone();
+        let rows: Vec<Arc<egui::Galley>> =
+            if sub.is_empty() { vec![title_g] } else { vec![title_g, elided(ui, &sub, k::font(11.0), k::LABEL3, max_w)] };
+        let ys: &[f32] = if rows.len() == 1 { &[0.0] } else { &[-7.0, 9.0] };
+        for (g, dy) in rows.into_iter().zip(ys) {
+            let pos = pos2(cx - g.size().x / 2.0, cy + dy - g.size().y / 2.0);
+            painter.galley(pos, g, k::LABEL);
+        }
+        if full.elided {
+            // the whole name on hover
+            let r = Rect::from_center_size(pos2(cx, cy - if sub.is_empty() { 0.0 } else { 7.0 }), full.size());
+            ui.interact(r, Id::unique("toolbar_title"), Sense::hover()).on_hover_text(title);
         }
     }
 }
@@ -1287,7 +1364,9 @@ impl App {
 
         let tex = if compare { self.orig_tex.as_ref() } else { self.tex.as_ref() };
         let Some(tex) = tex.or(self.orig_tex.as_ref()) else { return };
-        let (tex_id, tsize) = (tex.id(), tex.size_vec2());
+        // a draft texture is smaller; lay it out at the full preview size
+        let scale = if !compare && self.tex.is_some() { self.tex_scale } else { 1.0 };
+        let (tex_id, tsize) = (tex.id(), tex.size_vec2() * scale);
 
         let pad = 36.0;
         let avail = rect.shrink(pad);
@@ -1421,7 +1500,7 @@ impl App {
             self.layer_overlay(ui, &resp, rect, img_rect);
         }
 
-        if self.view.zoom > 1.0 {
+        if self.view.zoom > 1.0 && (resp.hovered() || resp.dragged()) {
             ctx.set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
         }
 
@@ -1491,7 +1570,8 @@ impl App {
         }
         let r = to_screen(shown);
 
-        let hover = ctx.input(|i| i.pointer.hover_pos()).filter(|p| clip.contains(*p));
+        let over_canvas = resp.hovered() || resp.dragged();
+        let hover = ctx.input(|i| i.pointer.hover_pos()).filter(|p| over_canvas && clip.contains(*p));
         let active = self.crop_drag.map(|d| d.0).or_else(|| hover.and_then(|h| grip_at(r, h)));
         if let Some(g) = active {
             ctx.set_cursor_icon(match g {
@@ -1653,7 +1733,9 @@ impl App {
         }
 
         let painter = ui.painter_at(clip);
-        let hover = ctx.input(|inp| inp.pointer.hover_pos()).filter(|p| clip.contains(*p));
+        // only while the canvas itself is under the pointer, not a sheet or menu above it
+        let over_canvas = resp.hovered() || resp.dragged();
+        let hover = ctx.input(|inp| inp.pointer.hover_pos()).filter(|p| over_canvas && clip.contains(*p));
         if self.picking_hue {
             if hover.is_some() {
                 ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -1841,7 +1923,14 @@ impl App {
         let r = rect.shrink(14.0);
         ui.painter().rect_filled(r, CornerRadius::same(16), k::ACCENT.gamma_multiply(0.08));
         ui.painter().rect_stroke(r, CornerRadius::same(16), Stroke::new(2.0, k::ACCENT), egui::StrokeKind::Inside);
-        ui.painter().text(r.center(), Align2::CENTER_CENTER, "Drop to open", k::font_semibold(15.0), k::LABEL);
+        let project = ui.ctx().input(|i| i.raw.hovered_files.iter().any(|f| f.path.as_deref().map(io::is_project_file).unwrap_or(false)));
+        let (title, sub) = if project {
+            ("Drop to open the project", "")
+        } else {
+            ("Drop to add as a layer", "To edit a different photo instead, use Open (Ctrl+O).")
+        };
+        ui.painter().text(r.center() - vec2(0.0, 9.0), Align2::CENTER_CENTER, title, k::font_semibold(15.0), k::LABEL);
+        ui.painter().text(r.center() + vec2(0.0, 13.0), Align2::CENTER_CENTER, sub, k::font(12.0), k::LABEL2);
     }
 
     fn toast_view(&mut self, ui: &mut Ui, rect: Rect) {
@@ -2510,7 +2599,9 @@ impl App {
         painter.add(egui::Shape::line(outline, Stroke::new(1.2, Color32::WHITE)));
         let top_mid = corners[0] + (corners[1] - corners[0]) * 0.5;
         painter.line_segment([top_mid, knob], Stroke::new(1.2, Color32::from_white_alpha(200)));
-        let hover = ctx.input(|inp| inp.pointer.hover_pos()).filter(|p| clip.contains(*p));
+        // only while the canvas itself is under the pointer, not a sheet or menu above it
+        let over_canvas = resp.hovered() || resp.dragged();
+        let hover = ctx.input(|inp| inp.pointer.hover_pos()).filter(|p| over_canvas && clip.contains(*p));
         let active = self.layer_drag.as_ref().map(|d| d.kind);
         for p in corners {
             let big = active == Some(1) || hover.map(|h| h.distance(p) < 14.0).unwrap_or(false);
@@ -2579,7 +2670,7 @@ impl App {
             return;
         }
         let ctx = ui.ctx().clone();
-        k::caption(ui, "Place other photos on the canvas. Drag to move, corners to scale, side handles to stretch, the blue knob to rotate. Edges snap to the canvas (hold Ctrl to place freely); arrow keys nudge. You can also drop files here.");
+        k::caption(ui, "Place other photos on the canvas. Drag to move, corners to scale, side handles to stretch, the blue knob to rotate. Edges snap to the canvas (hold Ctrl to place freely); arrow keys nudge. You can also drop photos onto the canvas. Double-click a layer to rename it.");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if k::button(ui, "Add Photo…", Btn::Secondary, true).clicked() {
@@ -2599,8 +2690,11 @@ impl App {
             Down(usize),
             Delete(usize),
             Move(usize, usize),
+            Rename(usize),
+            Color(usize, u8),
         }
         let mut act = None;
+        let mut renamed = None;
         let sel = self.selected_layer();
         let n = self.params.layers.len();
         let mut rows: Vec<(usize, Rect)> = Vec::new();
@@ -2611,7 +2705,7 @@ impl App {
                 let l = &self.params.layers[i];
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click_and_drag());
                 rows.push((i, r));
-                if resp.drag_started() {
+                if resp.drag_started() && self.renaming.is_none() {
                     self.list_drag = Some(i);
                 }
                 let bg = if self.list_drag == Some(i) {
@@ -2629,21 +2723,44 @@ impl App {
                 let dot = pos2(r.left() + 16.0, r.center().y);
                 let dresp = ui.interact(Rect::from_center_size(dot, vec2(24.0, 24.0)), ui.scope_id().with(("layer_dot", i)), Sense::click());
                 if l.visible {
-                    ui.painter().circle_filled(dot, 5.0, k::ACCENT);
+                    ui.painter().circle_filled(dot, 5.0, label_color(l.color).unwrap_or(k::ACCENT));
                 } else {
-                    ui.painter().circle_stroke(dot, 5.0, Stroke::new(1.5, k::LABEL3));
+                    ui.painter().circle_stroke(dot, 5.0, Stroke::new(1.5, label_color(l.color).unwrap_or(k::LABEL3)));
                 }
                 let col = if l.visible { k::LABEL } else { k::LABEL3 };
-                let name: String = l.name.chars().take(22).collect();
-                ui.painter().text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, name, k::font(13.0), col);
-                let tag = format!("{}{}", l.blend.label(), if l.opacity < 0.999 { format!(" · {:.0}%", l.opacity * 100.0) } else { String::new() });
-                ui.painter().text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, tag, k::font(11.0), k::LABEL3);
+                match &mut self.renaming {
+                    Some((Rename::Layer(j), buf, focus)) if *j == i => match rename_field(ui, r, buf, focus) {
+                        RenameOutcome::Editing => {}
+                        RenameOutcome::Commit(name) => renamed = Some((i, Some(name))),
+                        RenameOutcome::Cancel => renamed = Some((i, None)),
+                    },
+                    _ => {
+                        let tag = format!("{}{}", l.blend.label(), if l.opacity < 0.999 { format!(" · {:.0}%", l.opacity * 100.0) } else { String::new() });
+                        let tag = ui.painter().layout_no_wrap(tag, k::font(11.0), k::LABEL3);
+                        let tag_x = r.right() - 10.0 - tag.size().x;
+                        ui.painter().galley(pos2(tag_x, r.center().y - tag.size().y / 2.0), tag, k::LABEL3);
+                        let name = elided(ui, &l.name, k::font(13.0), col, tag_x - 10.0 - (r.left() + 32.0));
+                        let full = name.elided;
+                        ui.painter().galley(pos2(r.left() + 32.0, r.center().y - name.size().y / 2.0), name, col);
+                        let resp = if full && self.list_drag.is_none() { resp.clone().on_hover_text(&l.name) } else { resp.clone() };
+                        if resp.double_clicked() && !dresp.hovered() {
+                            act = Some(Act::Rename(i));
+                        }
+                    }
+                }
                 if dresp.clicked() {
                     act = Some(Act::Toggle(i));
-                } else if resp.clicked() {
+                } else if resp.clicked() && act.is_none() {
                     act = Some(Act::Select(i));
                 }
                 resp.context_menu(|ui| {
+                    if ui.button("Rename").clicked() {
+                        act = Some(Act::Rename(i));
+                    }
+                    if let Some(c) = color_menu(ui, l.color) {
+                        act = Some(Act::Color(i, c));
+                    }
+                    ui.separator();
                     if ui.button("Duplicate").clicked() {
                         act = Some(Act::Duplicate(i));
                     }
@@ -2711,7 +2828,17 @@ impl App {
                 layers.insert(to, l);
                 self.layer_sel = Some(to);
             }
+            Some(Act::Rename(i)) => self.renaming = Some((Rename::Layer(i), layers[i].name.clone(), true)),
+            Some(Act::Color(i, c)) => layers[i].color = c,
             None => {}
+        }
+        if let Some((i, name)) = renamed {
+            if let Some(name) = name.filter(|n| !n.is_empty())
+                && let Some(l) = self.params.layers.get_mut(i)
+            {
+                l.name = name;
+            }
+            self.renaming = None;
         }
         if n > 0 {
             k::caption(ui, "Drag layers in the list to restack them. Right-click for more.");
@@ -2855,8 +2982,11 @@ impl App {
             Up(usize),
             Down(usize),
             Delete(usize),
+            Rename(usize),
+            Color(usize, u8),
         }
         let mut act = None;
+        let mut renamed = None;
         let sel = self.selected_mask();
         let n = self.params.masks.len();
         egui::Frame::NONE.fill(k::CARD).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
@@ -2878,23 +3008,48 @@ impl App {
                 let dot = pos2(r.left() + 16.0, r.center().y);
                 let dot_r = Rect::from_center_size(dot, vec2(24.0, 24.0));
                 let dresp = ui.interact(dot_r, ui.scope_id().with(("mask_dot", i)), Sense::click());
+                let dot_col = label_color(m.color).unwrap_or(k::ACCENT);
                 if m.enabled {
-                    ui.painter().circle_filled(dot, 5.0, k::ACCENT);
+                    ui.painter().circle_filled(dot, 5.0, dot_col);
                 } else {
-                    ui.painter().circle_stroke(dot, 5.0, Stroke::new(1.5, k::LABEL3));
+                    ui.painter().circle_stroke(dot, 5.0, Stroke::new(1.5, label_color(m.color).unwrap_or(k::LABEL3)));
                 }
                 let dresp = dresp.on_hover_text(if m.enabled { "Hide mask" } else { "Show mask" });
                 let col = if m.enabled { k::LABEL } else { k::LABEL3 };
-                ui.painter().text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, &m.name, k::font(13.0), col);
-                let edited = !m.adj.is_identity();
-                let tag = format!("{}{}", if m.invert { "Inverted · " } else { "" }, if edited { "Edited" } else { "No edits" });
-                ui.painter().text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, tag, k::font(11.0), k::LABEL3);
+                match &mut self.renaming {
+                    Some((Rename::Mask(j), buf, focus)) if *j == i => match rename_field(ui, r, buf, focus) {
+                        RenameOutcome::Editing => {}
+                        RenameOutcome::Commit(name) => renamed = Some((i, Some(name))),
+                        RenameOutcome::Cancel => renamed = Some((i, None)),
+                    },
+                    _ => {
+                        let edited = !m.adj.is_identity();
+                        let tag = format!("{}{}", if m.invert { "Inverted · " } else { "" }, if edited { "Edited" } else { "No edits" });
+                        let tag = ui.painter().layout_no_wrap(tag, k::font(11.0), k::LABEL3);
+                        let tag_x = r.right() - 10.0 - tag.size().x;
+                        ui.painter().galley(pos2(tag_x, r.center().y - tag.size().y / 2.0), tag, k::LABEL3);
+                        let name = elided(ui, &m.name, k::font(13.0), col, tag_x - 10.0 - (r.left() + 32.0));
+                        let full = name.elided;
+                        ui.painter().galley(pos2(r.left() + 32.0, r.center().y - name.size().y / 2.0), name, col);
+                        let resp = if full { resp.clone().on_hover_text(&m.name) } else { resp.clone() };
+                        if resp.double_clicked() && !dresp.hovered() {
+                            act = Some(Act::Rename(i));
+                        }
+                    }
+                }
                 if dresp.clicked() {
                     act = Some(Act::Toggle(i));
-                } else if resp.clicked() {
+                } else if resp.clicked() && act.is_none() {
                     act = Some(Act::Select(i));
                 }
                 resp.context_menu(|ui| {
+                    if ui.button("Rename").clicked() {
+                        act = Some(Act::Rename(i));
+                    }
+                    if let Some(c) = color_menu(ui, m.color) {
+                        act = Some(Act::Color(i, c));
+                    }
+                    ui.separator();
                     if ui.button("Duplicate").clicked() {
                         act = Some(Act::Duplicate(i));
                     }
@@ -2942,9 +3097,19 @@ impl App {
                 masks.remove(i);
                 self.mask_sel = None;
             }
+            Some(Act::Rename(i)) => self.renaming = Some((Rename::Mask(i), masks[i].name.clone(), true)),
+            Some(Act::Color(i, c)) => masks[i].color = c,
             None => {}
         }
-        k::caption(ui, "Right-click a mask for more. Masks apply top to bottom.");
+        if let Some((i, name)) = renamed {
+            if let Some(name) = name.filter(|n| !n.is_empty())
+                && let Some(m) = self.params.masks.get_mut(i)
+            {
+                m.name = name;
+            }
+            self.renaming = None;
+        }
+        k::caption(ui, "Double-click a mask to rename it; right-click for colour and more. Masks apply top to bottom.");
         ui.add_space(10.0);
 
         // --- selected mask ---------------------------------------------------
@@ -3512,6 +3677,13 @@ impl App {
                             k::caption(ui, "On: the next photo opens with your current look, handy for a series. Off: every photo starts clean.");
                             ui.add_space(12.0);
 
+                            if cfg!(target_os = "linux") {
+                                group(ui, "System");
+                                k::switch_row(ui, "Native Wayland", &mut self.prefs.native_wayland);
+                                k::caption(ui, "Off (default): Still runs through XWayland, so you can drag photos onto the window. On: native Wayland, but drag and drop won't work. Applies after a restart.");
+                                ui.add_space(12.0);
+                            }
+
                             group(ui, "Looks");
                             ui.horizontal(|ui| {
                                 if k::button(ui, "Import Looks…", Btn::Secondary, true).clicked() {
@@ -3555,6 +3727,93 @@ impl App {
             self.settings_open = false;
             self.persist();
         }
+    }
+}
+
+/// Label colours for masks and layers; index 0 means no colour.
+const LABELS: [(&str, u32); 7] = [
+    ("Red", 0xFF453A),
+    ("Orange", 0xFF9F0A),
+    ("Yellow", 0xFFD60A),
+    ("Green", 0x30D158),
+    ("Blue", 0x0A84FF),
+    ("Purple", 0xBF5AF2),
+    ("Gray", 0x98989D),
+];
+
+fn label_rgb(c: u8) -> Option<u32> {
+    (c as usize).checked_sub(1).and_then(|i| LABELS.get(i)).map(|l| l.1)
+}
+
+fn label_color(c: u8) -> Option<Color32> {
+    label_rgb(c).map(|v| Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
+}
+
+/// Single-line text cut to `max_w` with an ellipsis.
+fn elided(ui: &Ui, text: &str, font: egui::FontId, color: Color32, max_w: f32) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(12.0));
+    ui.painter().layout_job(job)
+}
+
+/// "Change Color" submenu for a list row's context menu; returns the picked label.
+fn color_menu(ui: &mut Ui, current: u8) -> Option<u8> {
+    let mut pick = None;
+    ui.menu_button("Change Color", |ui| {
+        for c in 0..=LABELS.len() as u8 {
+            let name = if c == 0 { "None" } else { LABELS[c as usize - 1].0 };
+            let (r, resp) = ui.allocate_exact_size(vec2(130.0, 24.0), Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(r, CornerRadius::same(5), k::FILL_HI);
+            }
+            let dot = pos2(r.left() + 12.0, r.center().y);
+            match label_color(c) {
+                Some(col) => ui.painter().circle_filled(dot, 5.5, col),
+                None => ui.painter().circle_stroke(dot, 5.0, Stroke::new(1.2, k::LABEL3)),
+            };
+            ui.painter().text(pos2(r.left() + 26.0, r.center().y), Align2::LEFT_CENTER, name, k::font(13.0), k::LABEL);
+            if current == c {
+                ui.painter().text(pos2(r.right() - 8.0, r.center().y), Align2::RIGHT_CENTER, "✓", k::font(12.0), k::LABEL2);
+            }
+            if resp.clicked() {
+                pick = Some(c);
+                ui.close();
+            }
+        }
+    });
+    pick
+}
+
+/// Which list row is being renamed.
+#[derive(Clone, Copy, PartialEq)]
+enum Rename {
+    Mask(usize),
+    Layer(usize),
+}
+
+/// What happened to an inline rename this frame.
+enum RenameOutcome {
+    Editing,
+    Commit(String),
+    Cancel,
+}
+
+/// The text field over a row's name while renaming it.
+fn rename_field(ui: &mut Ui, r: Rect, buf: &mut String, focus: &mut bool) -> RenameOutcome {
+    let tr = Rect::from_min_max(pos2(r.left() + 26.0, r.top() + 4.0), pos2(r.right() - 6.0, r.bottom() - 4.0));
+    let te = ui.put(tr, egui::TextEdit::singleline(buf).font(k::font(13.0)).margin(egui::Margin::symmetric(5, 3)).char_limit(80));
+    if *focus {
+        te.request_focus();
+        *focus = false;
+    }
+    if te.lost_focus() {
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            RenameOutcome::Cancel
+        } else {
+            RenameOutcome::Commit(buf.trim().to_string())
+        }
+    } else {
+        RenameOutcome::Editing
     }
 }
 
@@ -3787,5 +4046,70 @@ mod tests {
         assert_eq!(h2.state().params, edit);
         assert_eq!(h2.state().project.as_deref(), Some(proj.as_path()));
         assert!(!h2.state().unsaved());
+    }
+
+    #[derive(Debug)]
+    struct TestDrop(PathBuf);
+    impl egui::DroppedFile for TestDrop {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+    }
+
+    #[test]
+    fn e2e_dropped_photo_becomes_a_layer() {
+        let dir = temp_dir("drop");
+        let photo = test_photo(&dir);
+        let layer = test_layer_png(&dir);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_eframe(move |cc| App::new(cc, None));
+        h.step();
+        // dropped on the empty window: opens the photo
+        h.input_mut().dropped_files.push(Arc::new(TestDrop(photo)));
+        settle(&mut h, |a| a.doc.is_some());
+        assert!(h.state().params.layers.is_empty());
+        // dropped on an open photo, from any tab: placed on top as a layer
+        h.state_mut().tab = 1;
+        h.input_mut().dropped_files.push(Arc::new(TestDrop(layer)));
+        settle(&mut h, |a| !a.params.layers.is_empty());
+        assert!(TABS[h.state().tab].0 == Tab::Layers);
+        assert_eq!(h.state().doc.as_ref().unwrap().name, "photo.png", "the photo stays open");
+    }
+
+    #[test]
+    fn e2e_rename_and_colour_skip_the_render() {
+        let mut h = open_with_layer("rename");
+        h.state_mut().tab = TABS.iter().position(|t| t.0 == Tab::Masks).unwrap();
+        h.state_mut().add_mask(1);
+        settle(&mut h, |a| a.tex_frame == Frame::Unbordered && rendered(a) && a.overlay_until.map(|t| Instant::now() > t).unwrap_or(true));
+        settle(&mut h, rendered);
+        let generation = h.state().generation;
+
+        h.state_mut().renaming = Some((Rename::Mask(0), String::new(), true));
+        h.step();
+        h.event(egui::Event::Text("Sky".into()));
+        h.step();
+        h.key_press(egui::Key::Enter);
+        h.step();
+        h.step();
+        assert_eq!(h.state().params.masks[0].name, "Sky");
+        assert!(h.state().renaming.is_none());
+
+        // renaming with an empty name keeps the old one
+        h.state_mut().renaming = Some((Rename::Mask(0), String::new(), true));
+        h.step();
+        h.key_press(egui::Key::Enter);
+        h.step();
+        h.step();
+        assert_eq!(h.state().params.masks[0].name, "Sky");
+
+        h.state_mut().params.masks[0].color = 3;
+        h.state_mut().params.layers[0].name = "Sun flare".into();
+        h.state_mut().params.layers[0].color = 5;
+        h.step();
+        h.step();
+        assert_eq!(h.state().generation, generation, "names and colours must not re-render the photo");
     }
 }

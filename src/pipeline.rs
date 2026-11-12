@@ -5,6 +5,7 @@
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub type Px = [f32; 3];
 
@@ -682,6 +683,81 @@ pub fn process(src: &Img, p: &Params) -> Img {
 
 /// Full render; also returns the opacity of mask `overlay` for on-screen display.
 pub fn process_ext(src: &Img, p: &Params, overlay: Option<usize>) -> (Img, Option<Vec<f32>>) {
+    let (img, space) = base(src, p);
+    finish(img, &space, p, overlay)
+}
+
+/// Remembers the global-look stage of the last renders, so edits that only
+/// touch masks, detail, glitch, texture, vignette, top layers or the border
+/// (and showing a mask overlay) skip geometry, exposure, colour and bloom.
+#[derive(Default)]
+pub struct StageCache {
+    /// (source, upstream params) → base image. Two slots: draft and full preview.
+    slots: Vec<(Arc<Img>, Params, Arc<(Img, crate::masks::Space)>)>,
+}
+
+/// Only the fields `base` reads; everything else at its default.
+fn upstream_key(p: &Params) -> Params {
+    Params {
+        rotate: p.rotate,
+        flip_h: p.flip_h,
+        straighten: p.straighten,
+        crop: p.crop,
+        exposure: p.exposure,
+        contrast: p.contrast,
+        highlights: p.highlights,
+        shadows: p.shadows,
+        whites: p.whites,
+        blacks: p.blacks,
+        fade: p.fade,
+        temperature: p.temperature,
+        tint: p.tint,
+        saturation: p.saturation,
+        vibrance: p.vibrance,
+        mono: p.mono,
+        shadow_hue: p.shadow_hue,
+        shadow_tone: p.shadow_tone,
+        highlight_hue: p.highlight_hue,
+        highlight_tone: p.highlight_tone,
+        bloom: p.bloom,
+        bloom_radius: p.bloom_radius,
+        bloom_threshold: p.bloom_threshold,
+        astig: p.astig,
+        astig_length: p.astig_length,
+        astig_angle: p.astig_angle,
+        astig_rays: p.astig_rays,
+        halation: p.halation,
+        layers: p.layers.iter().filter(|l| l.graded && l.visible).cloned().collect(),
+        ..Params::default()
+    }
+}
+
+/// `process_ext`, reusing the cached global-look stage when it still applies.
+pub fn process_cached(src: &Arc<Img>, p: &Params, overlay: Option<usize>, cache: &mut StageCache) -> (Img, Option<Vec<f32>>) {
+    let key = upstream_key(p);
+    let hit = cache.slots.iter().position(|(s, k, _)| Arc::ptr_eq(s, src) && *k == key);
+    let stage = match hit {
+        Some(i) => cache.slots[i].2.clone(),
+        None => {
+            let stage = Arc::new(base(src, p));
+            cache.slots.retain(|(s, _, _)| !Arc::ptr_eq(s, src));
+            cache.slots.push((src.clone(), key, stage.clone()));
+            if cache.slots.len() > 2 {
+                cache.slots.remove(0);
+            }
+            stage
+        }
+    };
+    finish(stage.0.clone(), &stage.1, p, overlay)
+}
+
+/// Half-size copy of a preview, for fast drafts while a slider is dragged.
+pub fn half(img: &Img) -> Img {
+    downscale(img, 2)
+}
+
+/// Geometry, layers under the look, exposure, white balance, glow, tone and colour.
+fn base(src: &Img, p: &Params) -> (Img, crate::masks::Space) {
     let (mut img, space) = geometry(src, p);
     // layers that take on the look are part of the picture from here on
     if !p.layers.is_empty() {
@@ -825,6 +901,13 @@ pub fn process_ext(src: &Img, p: &Params, overlay: Option<usize>) -> (Img, Optio
         }
         *px = c;
     });
+    (img, space)
+}
+
+/// Masks and everything after them.
+fn finish(mut img: Img, space: &crate::masks::Space, p: &Params, overlay: Option<usize>) -> (Img, Option<Vec<f32>>) {
+    let space = *space;
+    let u = img.unit();
 
     // --- Local adjustments -------------------------------------------------
     let mask_alpha = if p.masks.is_empty() { None } else { crate::masks::apply(&mut img, &p.masks, &space, u, overlay) };
@@ -1457,3 +1540,41 @@ pub fn builtin_presets() -> Vec<(String, Params)> {
     v
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gradient(w: usize, h: usize) -> Img {
+        let mut img = Img::new(w, h);
+        for (i, p) in img.px.iter_mut().enumerate() {
+            let (x, y) = ((i % w) as f32 / w as f32, (i / w) as f32 / h as f32);
+            *p = [x, y, (x + y) * 0.5];
+        }
+        img
+    }
+
+    #[test]
+    fn cached_render_matches_uncached() {
+        let src = Arc::new(gradient(64, 48));
+        let mut cache = StageCache::default();
+        let mut p = Params { exposure: 0.4, bloom: 0.5, contrast: 0.3, ..Params::default() };
+        let mask = crate::masks::Mask { shape: crate::masks::Shape::Radial { c: [0.5, 0.5], rx: 0.2, ry: 0.2, angle: 0.0, feather: 0.5 }, ..Default::default() };
+        p.masks.push(mask);
+        // a miss, then a hit with only downstream edits, then a miss again
+        for step in 0..3 {
+            match step {
+                1 => {
+                    p.vignette = 0.5;
+                    p.masks[0].adj.exposure = 1.0;
+                }
+                2 => p.exposure = -0.2,
+                _ => {}
+            }
+            let (a, oa) = process_cached(&src, &p, Some(0), &mut cache);
+            let (b, ob) = process_ext(&src, &p, Some(0));
+            assert_eq!(a.px, b.px, "step {step}");
+            assert_eq!(oa, ob, "step {step}");
+        }
+    }
+}

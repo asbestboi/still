@@ -387,11 +387,23 @@ pub struct Prefs {
     pub show_render_time: bool,
     pub reduce_motion: bool,
     pub keep_look: bool,
+    /// Linux: talk to Wayland directly. Off runs through XWayland, which is
+    /// what makes drag and drop work (winit has no Wayland drag and drop yet).
+    pub native_wayland: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { preview_quality: 1, canvas: 0, overlay_color: 0, histogram: 0, show_render_time: true, reduce_motion: false, keep_look: true }
+        Prefs {
+            preview_quality: 1,
+            canvas: 0,
+            overlay_color: 0,
+            histogram: 0,
+            show_render_time: true,
+            reduce_motion: false,
+            keep_look: true,
+            native_wayland: false,
+        }
     }
 }
 
