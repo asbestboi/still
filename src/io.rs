@@ -25,6 +25,13 @@ pub const RAW_EXTS: &[&str] = &[
     "erf", "kdc", "dcr", "mos", "mef", "mrw", "ari",
 ];
 
+/// Extensions for a file-dialog filter. The Linux dialogs match patterns
+/// case-sensitively, and cameras name their files `DSC00747.ARW`, so each
+/// extension is offered in lower and upper case.
+pub fn dialog_exts(exts: &[&str]) -> Vec<String> {
+    exts.iter().flat_map(|e| [e.to_lowercase(), e.to_uppercase()]).collect()
+}
+
 fn is_raw(path: &Path) -> bool {
     path.extension()
         .map(|e| RAW_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
@@ -36,10 +43,23 @@ fn is_raw(path: &Path) -> bool {
 fn load_raw(path: &Path) -> Result<DynamicImage, String> {
     let path = path.to_path_buf();
     std::panic::catch_unwind(move || -> Result<DynamicImage, String> {
-        let raw = rawler::decode_file(&path).map_err(|e| e.to_string())?;
+        let src = rawler::rawsource::RawSource::new(&path).map_err(|e| e.to_string())?;
+        let params = rawler::decoders::RawDecodeParams::default();
+        let raw = rawler::decode(&src, &params).map_err(|e| e.to_string())?;
         let dev = rawler::imgop::develop::RawDevelop::default();
         let inter = dev.develop_intermediate(&raw).map_err(|e| e.to_string())?;
-        inter.to_dynamic_image().ok_or_else(|| "RAW develop produced no image".to_string())
+        let mut img = inter.to_dynamic_image().ok_or_else(|| "RAW develop produced no image".to_string())?;
+        // The sensor data is stored landscape; turn portrait shots upright.
+        // rawler leaves `RawImage::orientation` at Normal, so read the EXIF tag.
+        let orientation = rawler::get_decoder(&src)
+            .and_then(|d| d.raw_metadata(&src, &params))
+            .ok()
+            .and_then(|m| m.exif.orientation)
+            .and_then(|o| Orientation::from_exif(o as u8));
+        if let Some(o) = orientation {
+            img.apply_orientation(o);
+        }
+        Ok(img)
     })
     .map_err(|_| "this RAW format isn't supported".to_string())?
 }
