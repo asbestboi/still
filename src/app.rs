@@ -561,7 +561,7 @@ impl App {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let dlg = rfd::FileDialog::new().set_title("Import Looks").add_filter("Still Look", &[io::LOOK_EXT]);
+            let dlg = rfd::FileDialog::new().set_title("Import Looks").add_filter("Still Look", &io::dialog_exts(&[io::LOOK_EXT]));
             match dlg.pick_files() {
                 Some(paths) => {
                     let (looks, errs) = read_look_files(&paths);
@@ -647,9 +647,9 @@ impl App {
                 .add_filter("Photos & Projects", &{
                     let mut v = vec![io::PROJECT_EXT, "jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp", "gif", "tga", "exr", "hdr", "qoi", "pnm"];
                     v.extend_from_slice(io::RAW_EXTS);
-                    v
+                    io::dialog_exts(&v)
                 })
-                .add_filter("Still Project", &[io::PROJECT_EXT]);
+                .add_filter("Still Project", &io::dialog_exts(&[io::PROJECT_EXT]));
             if let Some(d) = dir {
                 dlg = dlg.set_directory(d);
             }
@@ -2282,7 +2282,7 @@ impl App {
             let mut dlg = rfd::FileDialog::new().set_title("Add Photos as Layers").add_filter("Images", &{
                 let mut v = vec!["jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp", "gif", "tga", "exr", "hdr", "qoi"];
                 v.extend_from_slice(io::RAW_EXTS);
-                v
+                io::dialog_exts(&v)
             });
             if let Some(d) = dir {
                 dlg = dlg.set_directory(d);
