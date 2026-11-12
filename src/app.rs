@@ -30,6 +30,7 @@ enum Msg {
     Info(String, Option<PathBuf>),
     Repreviewed(PathBuf, Arc<Img>),
     LayerFiles(Vec<PathBuf>),
+    SaveProjectTo(PathBuf),
     LayerReady(Result<(PathBuf, f32), String>),
 }
 
@@ -154,6 +155,21 @@ fn layer_frame(l: &Layer, map: &Map) -> (Pos2, [Pos2; 4], Pos2) {
     let corners = [c - ax - ay, c + ax - ay, c + ax + ay, c - ax + ay];
     let knob = c - ay - vec2(-s, co) * 26.0;
     (c, corners, knob)
+}
+
+/// Mid-edge stretch handles: (kind, position). 3 right, 4 left, 5 bottom, 6 top.
+fn layer_edges(l: &Layer, map: &Map) -> [(u8, Pos2); 4] {
+    let c = map.n2s([l.x, l.y]);
+    let (w, h) = l.size(map.long());
+    let (s, co) = l.rotation.to_radians().sin_cos();
+    let ax = vec2(co, s) * (w * 0.5);
+    let ay = vec2(-s, co) * (h * 0.5);
+    [(3, c + ax), (4, c - ax), (5, c + ay), (6, c - ay)]
+}
+
+/// Snap `v` to the nearest of `targets` within `dist` screen pixels.
+fn snap(v: f32, targets: &[f32], dist: f32) -> Option<f32> {
+    targets.iter().copied().filter(|t| (t - v).abs() < dist).min_by(|a, b| (a - v).abs().total_cmp(&(b - v).abs()))
 }
 
 /// Is `p` inside the layer's (rotated) rectangle?
@@ -317,8 +333,16 @@ pub struct App {
     guide_golden: bool,
     prefs: io::Prefs,
     settings_open: bool,
+    /// The open project file, and the edit as it was last saved.
+    project: Option<PathBuf>,
+    saved_params: Option<Params>,
+    pending_project: Option<Params>,
     layer_sel: Option<usize>,
     layer_drag: Option<LayerDrag>,
+    /// Guides shown while a layer is snapped (screen x / y).
+    snap_lines: (Option<f32>, Option<f32>),
+    /// Layer being dragged in the list, for reordering.
+    list_drag: Option<usize>,
     layers_loading: usize,
     crop_drag: Option<(Grip, [f32; 4], Pos2)>,
 
@@ -382,8 +406,13 @@ impl App {
             guide_golden: saved.guide_golden,
             prefs: saved.prefs.clone(),
             settings_open: false,
+            project: None,
+            saved_params: None,
+            pending_project: None,
             layer_sel: None,
             layer_drag: None,
+            snap_lines: (None, None),
+            list_drag: None,
             layers_loading: 0,
             crop_drag: None,
             builtin: pipeline::builtin_presets(),
@@ -437,6 +466,53 @@ impl App {
         std::thread::spawn(move || {
             let img = Arc::new(io::downsized(&full, edge));
             let _ = tx.send(Msg::Repreviewed(path, img));
+            ctx.request_repaint();
+        });
+    }
+
+    // --- projects ------------------------------------------------------------
+
+    fn unsaved(&self) -> bool {
+        self.doc.is_some() && self.saved_params.as_ref() != Some(&self.params) && (self.project.is_some() || self.params != Params { seed: self.params.seed, ..Params::default() })
+    }
+
+    fn save_project(&mut self, path: PathBuf) {
+        let Some(doc) = &self.doc else { return };
+        match io::write_project(&path, &doc.path, &self.params) {
+            Ok(()) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                self.toast = Some((format!("Saved {name}"), path.parent().map(|d| d.to_path_buf()), Instant::now()));
+                self.project = Some(path);
+                self.saved_params = Some(self.params.clone());
+            }
+            Err(e) => self.toast = Some((format!("Couldn't save — {e}"), None, Instant::now())),
+        }
+    }
+
+    /// Ctrl+S: save in place, or ask where the first time (or always, with `as_new`).
+    fn save(&mut self, as_new: bool, ctx: &egui::Context) {
+        let Some(doc) = &self.doc else { return };
+        if !as_new && let Some(p) = self.project.clone() {
+            return self.save_project(p);
+        }
+        if self.dialog_open {
+            return;
+        }
+        self.dialog_open = true;
+        let stem = doc.path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "photo".into());
+        let name = format!("{stem}.{}", io::PROJECT_EXT);
+        let dir = self.project.as_ref().and_then(|p| p.parent()).or_else(|| doc.path.parent()).map(|p| p.to_path_buf());
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new().set_title("Save Project").set_file_name(&name).add_filter("Still Project", &[io::PROJECT_EXT]);
+            if let Some(d) = dir {
+                dlg = dlg.set_directory(d);
+            }
+            let _ = tx.send(match dlg.save_file() {
+                Some(p) => Msg::SaveProjectTo(p),
+                None => Msg::DialogClosed,
+            });
             ctx.request_repaint();
         });
     }
@@ -533,6 +609,19 @@ impl App {
     }
 
     fn open_path(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if io::is_project_file(&path) {
+            match io::read_project(&path) {
+                Ok((photo, params)) => {
+                    self.pending_project = Some(params);
+                    self.project = Some(path);
+                    return self.open_path(photo, ctx);
+                }
+                Err(e) => {
+                    self.toast = Some((format!("Couldn't open project — {e}"), None, Instant::now()));
+                    return;
+                }
+            }
+        }
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         self.loading = Some(path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
@@ -554,12 +643,13 @@ impl App {
         let dir = self.doc.as_ref().and_then(|d| d.path.parent().map(|p| p.to_path_buf()));
         std::thread::spawn(move || {
             let mut dlg = rfd::FileDialog::new()
-                .set_title("Open Photo")
-                .add_filter("Images", &{
-                    let mut v = vec!["jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp", "gif", "tga", "exr", "hdr", "qoi", "pnm"];
+                .set_title("Open Photo or Project")
+                .add_filter("Photos & Projects", &{
+                    let mut v = vec![io::PROJECT_EXT, "jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp", "gif", "tga", "exr", "hdr", "qoi", "pnm"];
                     v.extend_from_slice(io::RAW_EXTS);
                     v
-                });
+                })
+                .add_filter("Still Project", &[io::PROJECT_EXT]);
             if let Some(d) = dir {
                 dlg = dlg.set_directory(d);
             }
@@ -701,6 +791,16 @@ impl App {
                     self.params.layers.clear();
                     self.layer_sel = None;
                     self.mask_sel = None;
+                    match self.pending_project.take() {
+                        Some(p) => {
+                            self.params = p;
+                            self.saved_params = Some(self.params.clone());
+                        }
+                        None => {
+                            self.project = None;
+                            self.saved_params = None;
+                        }
+                    }
                     self.committed = self.params.clone();
                     self.undo.clear();
                     self.redo.clear();
@@ -709,6 +809,7 @@ impl App {
                 }
                 Msg::Loaded(Err(e)) => {
                     self.loading = None;
+                    self.pending_project = None;
                     self.toast = Some((format!("Couldn't open photo — {e}"), None, Instant::now()));
                 }
                 Msg::Picked(p) => {
@@ -722,6 +823,13 @@ impl App {
                 Msg::DialogClosed => self.dialog_open = false,
                 Msg::LooksImported(looks, errs) => self.add_imported(looks, errs),
                 Msg::LayerFiles(paths) => self.load_layers(paths, ctx),
+                Msg::SaveProjectTo(mut p) => {
+                    self.dialog_open = false;
+                    if !io::is_project_file(&p) {
+                        p.set_extension(io::PROJECT_EXT);
+                    }
+                    self.save_project(p);
+                }
                 Msg::LayerReady(r) => {
                     self.layers_loading = self.layers_loading.saturating_sub(1);
                     match r {
@@ -852,7 +960,13 @@ impl App {
         if sc(Modifiers::COMMAND, Key::O) {
             self.pick_file(ctx);
         }
-        if self.doc.is_some() && (sc(Modifiers::COMMAND, Key::E) || sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::S)) {
+        if self.doc.is_some() && sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) {
+            self.save(true, ctx);
+        }
+        if self.doc.is_some() && sc(Modifiers::COMMAND, Key::S) {
+            self.save(false, ctx);
+        }
+        if self.doc.is_some() && sc(Modifiers::COMMAND, Key::E) {
             self.export_open = true;
         }
         if sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || sc(Modifiers::COMMAND, Key::Y) {
@@ -888,6 +1002,24 @@ impl App {
                 self.params.layers.remove(i);
                 self.layer_sel = None;
             }
+            // arrow keys nudge the selected layer by a screen pixel (Shift: ten)
+            if TABS[self.tab].0 == Tab::Layers
+                && let Some(i) = self.selected_layer()
+            {
+                let f = self.mask_map(self.last_img_rect).frame();
+                let step = if ctx.input(|inp| inp.modifiers.shift) { 10.0 } else { 1.0 };
+                let mut d = Vec2::ZERO;
+                for (key, v) in [(Key::ArrowLeft, vec2(-1.0, 0.0)), (Key::ArrowRight, vec2(1.0, 0.0)), (Key::ArrowUp, vec2(0.0, -1.0)), (Key::ArrowDown, vec2(0.0, 1.0))] {
+                    if ctx.input(|inp| inp.key_pressed(key)) {
+                        d += v * step;
+                    }
+                }
+                if d != Vec2::ZERO && f.x > 0.0 && f.y > 0.0 {
+                    let l = &mut self.params.layers[i];
+                    l.x += d.x / f.x;
+                    l.y += d.y / f.y;
+                }
+            }
             if TABS[self.tab].0 == Tab::Masks
                 && let Some(i) = self.selected_mask()
             {
@@ -912,7 +1044,9 @@ impl App {
         if !looks.is_empty() {
             self.import_look_files(&looks);
         }
-        if self.doc.is_some() && TABS[self.tab].0 == Tab::Layers {
+        if let Some(proj) = photos.iter().find(|p| io::is_project_file(p)).cloned() {
+            self.open_path(proj, ctx);
+        } else if self.doc.is_some() && TABS[self.tab].0 == Tab::Layers {
             self.load_layers(photos, ctx);
         } else if let Some(p) = photos.into_iter().next() {
             self.open_path(p, ctx);
@@ -967,11 +1101,14 @@ impl App {
         let ctx = ui.ctx().clone();
         let rect = ui.max_rect();
         ui.horizontal_centered(|ui| {
-            if k::button(ui, "Open", Btn::Secondary, true).clicked() {
+            if k::button(ui, "Open", Btn::Secondary, true).on_hover_text("Ctrl+O — a photo or a .still project").clicked() {
                 self.pick_file(&ctx);
             }
-            ui.add_space(4.0);
             let has_doc = self.doc.is_some();
+            if k::button(ui, "Save", Btn::Plain, has_doc).on_hover_text("Ctrl+S — save the edit as a .still project (Ctrl+Shift+S: Save As)").clicked() {
+                self.save(false, &ctx);
+            }
+            ui.add_space(4.0);
             if k::button(ui, "Undo", Btn::Plain, !self.undo.is_empty()).on_hover_text("Ctrl+Z").clicked() {
                 self.do_undo();
             }
@@ -998,7 +1135,16 @@ impl App {
         let painter = ui.painter();
         let (title, sub) = match (&self.doc, &self.loading) {
             (_, Some(name)) => (name.clone(), "Opening…".to_string()),
-            (Some(d), None) => (d.name.clone(), d.source_desc.clone()),
+            (Some(d), None) => {
+                let mut sub = d.source_desc.clone();
+                if let Some(p) = &self.project {
+                    sub = format!("{} · {sub}", p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+                }
+                if self.unsaved() {
+                    sub.push_str(" · Edited");
+                }
+                (d.name.clone(), sub)
+            }
             (None, None) => ("Still".to_string(), String::new()),
         };
         let cy = rect.center().y;
@@ -1724,7 +1870,7 @@ impl App {
             let resp = ui.interact(lr, Id::unique("toast_reveal"), Sense::click());
             painter.text(lr.center(), Align2::CENTER_CENTER, "Show", k::font_semibold(13.0), k::ACCENT.gamma_multiply(t));
             if resp.clicked() {
-                let _ = std::process::Command::new("xdg-open").arg(d).spawn();
+                io::reveal(&d);
             }
         }
     }
@@ -2197,7 +2343,22 @@ impl App {
         let l = &mut self.params.layers[i];
         let (a, b) = (cw, ch * l.aspect);
         l.scale = if fill { a.max(b) } else { a.min(b) };
+        l.stretch = 1.0;
         l.rotation = 0.0;
+        l.x = (c[0] + c[2]) * 0.5;
+        l.y = (c[1] + c[3]) * 0.5;
+    }
+
+    /// Stretch the layer so it touches every side of the visible canvas.
+    fn stretch_layer(&mut self, i: usize) {
+        let (fw, fh) = self.frame_dims();
+        let long = fw.max(fh);
+        let c = self.params.crop;
+        let (cw, ch) = ((c[2] - c[0]) * fw / long, (c[3] - c[1]) * fh / long);
+        let l = &mut self.params.layers[i];
+        l.rotation = 0.0;
+        l.scale = cw;
+        l.stretch = ch * l.aspect / cw.max(1e-4);
         l.x = (c[0] + c[2]) * 0.5;
         l.y = (c[1] + c[3]) * 0.5;
     }
@@ -2208,10 +2369,13 @@ impl App {
         if let Some(i) = self.selected_layer() {
             let l = &self.params.layers[i];
             let (_, corners, knob) = layer_frame(l, &map);
+            let edge = layer_edges(l, &map).into_iter().find(|(_, p)| p.distance(o) < 12.0).map(|e| e.0);
             let kind = if knob.distance(o) < 14.0 {
                 Some(2)
             } else if corners.iter().any(|c| c.distance(o) < 14.0) {
                 Some(1)
+            } else if edge.is_some() {
+                edge
             } else if layer_contains(l, &map, o) {
                 Some(0)
             } else {
@@ -2248,16 +2412,70 @@ impl App {
         let map = self.mask_map(img);
         if let Some(d) = self.layer_drag.clone() {
             if let (Some(i), Some(p)) = (self.selected_layer(), ctx.input(|inp| inp.pointer.latest_pos())) {
-                let shift = ctx.input(|inp| inp.modifiers.shift);
+                let (shift, no_snap) = ctx.input(|inp| (inp.modifiers.shift, inp.modifiers.command));
                 let s = &d.start;
                 let c = map.n2s([s.x, s.y]);
                 let l = &mut self.params.layers[i];
+                let upright = (s.rotation.rem_euclid(90.0)).min(90.0 - s.rotation.rem_euclid(90.0)) < 0.01;
+                self.snap_lines = (None, None);
                 match d.kind {
                     0 => {
-                        let f = map.frame();
                         let dl = p - d.origin;
-                        l.x = s.x + dl.x / f.x;
-                        l.y = s.y + dl.y / f.y;
+                        let mut nc = c + dl;
+                        // snap edges and centre to the canvas sides and centre
+                        if upright && !no_snap {
+                            let (w, h) = s.size(map.long());
+                            let (hw, hh) = if (s.rotation.rem_euclid(180.0) - 90.0).abs() < 1.0 { (h / 2.0, w / 2.0) } else { (w / 2.0, h / 2.0) };
+                            let xs = [img.left(), img.center().x, img.right()];
+                            let ys = [img.top(), img.center().y, img.bottom()];
+                            let cand_x = [(nc.x - hw, -hw), (nc.x, 0.0), (nc.x + hw, hw)];
+                            let cand_y = [(nc.y - hh, -hh), (nc.y, 0.0), (nc.y + hh, hh)];
+                            if let Some((t, off)) = cand_x.iter().filter_map(|(v, off)| snap(*v, &xs, 8.0).map(|t| (t, *off))).next() {
+                                nc.x = t - off;
+                                self.snap_lines.0 = Some(t);
+                            }
+                            if let Some((t, off)) = cand_y.iter().filter_map(|(v, off)| snap(*v, &ys, 8.0).map(|t| (t, *off))).next() {
+                                nc.y = t - off;
+                                self.snap_lines.1 = Some(t);
+                            }
+                        }
+                        let n = map.s2n(nc);
+                        l.x = n[0];
+                        l.y = n[1];
+                    }
+                    3..=6 => {
+                        // stretch one side; the opposite side stays where it is
+                        let (w0, h0) = s.size(map.long());
+                        let (sn, co) = s.rotation.to_radians().sin_cos();
+                        let (ax, ay) = (vec2(co, sn), vec2(-sn, co));
+                        let (axis, sign, len0) = match d.kind {
+                            3 => (ax, 1.0, w0),
+                            4 => (ax, -1.0, w0),
+                            5 => (ay, 1.0, h0),
+                            _ => (ay, -1.0, h0),
+                        };
+                        let mut len = (len0 + (p - d.origin).dot(axis) * sign).max(4.0);
+                        // snap the moving side to the canvas sides when upright
+                        if upright && !no_snap {
+                            let edge = c + axis * sign * (len - len0 / 2.0);
+                            let horizontal = axis.x.abs() > 0.5;
+                            let (v, targets) = if horizontal { (edge.x, [img.left(), img.center().x, img.right()]) } else { (edge.y, [img.top(), img.center().y, img.bottom()]) };
+                            if let Some(t) = snap(v, &targets, 8.0) {
+                                len += (t - v) * if horizontal { axis.x.signum() * sign } else { axis.y.signum() * sign };
+                                if horizontal {
+                                    self.snap_lines.0 = Some(t);
+                                } else {
+                                    self.snap_lines.1 = Some(t);
+                                }
+                            }
+                        }
+                        let nc = c + axis * sign * (len - len0) / 2.0;
+                        let (nw, nh) = if d.kind <= 4 { (len, h0) } else { (w0, len) };
+                        l.scale = (nw / map.long()).clamp(0.002, 20.0);
+                        l.stretch = (nh / (nw / s.aspect.max(1e-3))).clamp(0.01, 100.0);
+                        let n = map.s2n(nc);
+                        l.x = n[0];
+                        l.y = n[1];
                     }
                     1 => {
                         let r0 = (d.origin - c).length().max(1.0);
@@ -2277,6 +2495,7 @@ impl App {
             }
             if !resp.dragged() || resp.drag_stopped() {
                 self.layer_drag = None;
+                self.snap_lines = (None, None);
             }
         }
 
@@ -2299,6 +2518,20 @@ impl App {
             painter.circle_filled(p + vec2(0.0, 1.0), r + 1.5, shadow);
             painter.circle_filled(p, r, Color32::WHITE);
         }
+        for (kind, p) in layer_edges(l, &map) {
+            let big = active == Some(kind) || hover.map(|h| h.distance(p) < 12.0).unwrap_or(false);
+            let r = if big { 5.5 } else { 4.0 };
+            painter.circle_filled(p + vec2(0.0, 1.0), r + 1.5, shadow);
+            painter.circle_filled(p, r, Color32::WHITE);
+            painter.circle_stroke(p, r, Stroke::new(1.0, k::ACCENT));
+        }
+        let guide = Stroke::new(1.0, Color32::from_rgb(255, 214, 10));
+        if let Some(x) = self.snap_lines.0 {
+            painter.line_segment([pos2(x, img.top()), pos2(x, img.bottom())], guide);
+        }
+        if let Some(y) = self.snap_lines.1 {
+            painter.line_segment([pos2(img.left(), y), pos2(img.right(), y)], guide);
+        }
         let kb = active == Some(2) || hover.map(|h| h.distance(knob) < 14.0).unwrap_or(false);
         painter.circle_filled(knob + vec2(0.0, 1.0), 8.5, shadow);
         painter.circle_filled(knob, if kb { 8.0 } else { 7.0 }, k::ACCENT);
@@ -2309,10 +2542,14 @@ impl App {
             ctx.set_cursor_icon(match kind {
                 0 => egui::CursorIcon::Grabbing,
                 1 => egui::CursorIcon::ResizeNwSe,
+                3 | 4 => egui::CursorIcon::ResizeHorizontal,
+                5 | 6 => egui::CursorIcon::ResizeVertical,
                 _ => egui::CursorIcon::Alias,
             });
         } else if let Some(h) = hover {
-            if h.distance(knob) < 14.0 {
+            if let Some((kind, _)) = layer_edges(l, &map).into_iter().find(|(_, p)| p.distance(h) < 12.0) {
+                ctx.set_cursor_icon(if kind <= 4 { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::ResizeVertical });
+            } else if h.distance(knob) < 14.0 {
                 ctx.set_cursor_icon(egui::CursorIcon::Alias);
             } else if corners.iter().any(|p| p.distance(h) < 14.0) {
                 ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
@@ -2322,7 +2559,12 @@ impl App {
         }
         // live size readout while transforming
         if active.is_some() {
-            let label = format!("{:.0}%  ·  {:.0}°", l.scale * 100.0, l.rotation);
+            let (w, h) = l.size(1.0);
+            let label = if l.stretch != 1.0 {
+                format!("{:.0} × {:.0}%  ·  {:.0}°", w * 100.0, h * 100.0, l.rotation)
+            } else {
+                format!("{:.0}%  ·  {:.0}°", l.scale * 100.0, l.rotation)
+            };
             let g = painter.layout_no_wrap(label, k::font_mono(11.5), k::LABEL);
             let pos = pos2(img.center().x, img.top() + 18.0);
             let bg = Rect::from_center_size(pos, g.size() + vec2(16.0, 6.0));
@@ -2337,7 +2579,7 @@ impl App {
             return;
         }
         let ctx = ui.ctx().clone();
-        k::caption(ui, "Place other photos on the canvas. Drag to move, corners to scale, the blue knob to rotate (Shift snaps). You can also drop files here.");
+        k::caption(ui, "Place other photos on the canvas. Drag to move, corners to scale, side handles to stretch, the blue knob to rotate. Edges snap to the canvas (hold Ctrl to place freely); arrow keys nudge. You can also drop files here.");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if k::button(ui, "Add Photo…", Btn::Secondary, true).clicked() {
@@ -2356,17 +2598,25 @@ impl App {
             Up(usize),
             Down(usize),
             Delete(usize),
+            Move(usize, usize),
         }
         let mut act = None;
         let sel = self.selected_layer();
         let n = self.params.layers.len();
+        let mut rows: Vec<(usize, Rect)> = Vec::new();
         egui::Frame::NONE.fill(k::CARD).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             // top of the stack first, like any layers panel
             for i in (0..n).rev() {
                 let l = &self.params.layers[i];
-                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
-                let bg = if sel == Some(i) {
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click_and_drag());
+                rows.push((i, r));
+                if resp.drag_started() {
+                    self.list_drag = Some(i);
+                }
+                let bg = if self.list_drag == Some(i) {
+                    k::FILL_HI
+                } else if sel == Some(i) {
                     Color32::from_rgba_unmultiplied(10, 132, 255, 70)
                 } else if resp.is_pointer_button_down_on() {
                     k::FILL_HI
@@ -2408,6 +2658,25 @@ impl App {
                     }
                 });
             }
+            // drag a row up or down to restack; an accent line shows where it lands
+            if let Some(from) = self.list_drag {
+                let y = ui.ctx().input(|inp| inp.pointer.latest_pos()).map(|p| p.y).unwrap_or(0.0);
+                // rows are listed top-of-stack first; find the slot under the pointer
+                let slot = rows.iter().position(|(_, r)| y < r.center().y).unwrap_or(rows.len());
+                if let Some(line_y) = rows.get(slot).map(|(_, r)| r.top() - 1.0).or_else(|| rows.last().map(|(_, r)| r.bottom() + 1.0)) {
+                    let (l, rr) = (rows[0].1.left() + 6.0, rows[0].1.right() - 6.0);
+                    ui.painter().line_segment([pos2(l, line_y), pos2(rr, line_y)], Stroke::new(2.0, k::ACCENT));
+                }
+                if !ui.ctx().input(|inp| inp.pointer.any_down()) {
+                    // slot counts from the top of the stack; convert to a stack index
+                    let to = n - slot.min(n);
+                    let to = if to > from { to - 1 } else { to };
+                    if to != from {
+                        act = Some(Act::Move(from, to.min(n - 1)));
+                    }
+                    self.list_drag = None;
+                }
+            }
             // the photo itself, always at the bottom
             let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
             ui.painter().text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, "Photo", k::font(13.0), k::LABEL3);
@@ -2437,10 +2706,15 @@ impl App {
                 layers.remove(i);
                 self.layer_sel = None;
             }
+            Some(Act::Move(from, to)) => {
+                let l = layers.remove(from);
+                layers.insert(to, l);
+                self.layer_sel = Some(to);
+            }
             None => {}
         }
         if n > 0 {
-            k::caption(ui, "Right-click a layer to duplicate, reorder or delete it.");
+            k::caption(ui, "Drag layers in the list to restack them. Right-click for more.");
         }
         ui.add_space(10.0);
 
@@ -2451,6 +2725,7 @@ impl App {
             return;
         };
         let mut fit = None;
+        let mut stretch_full = false;
         let l = &mut self.params.layers[i];
         let d = Layer::default();
         if k::section(ui, "Blending", l.opacity < 1.0 || l.blend != Blend::Normal || !l.graded, |ui| {
@@ -2478,10 +2753,13 @@ impl App {
             l.blend = d.blend;
             l.graded = d.graded;
         }
-        if k::section(ui, "Transform", l.rotation != 0.0 || l.flip, |ui| {
+        if k::section(ui, "Transform", l.rotation != 0.0 || l.flip || l.stretch != 1.0, |ui| {
+            k::slider(ui, "Position X", &mut l.x, -0.5..=1.5, 0.5, Fmt::Signed);
+            k::slider(ui, "Position Y", &mut l.y, -0.5..=1.5, 0.5, Fmt::Signed);
             let mut pct = l.scale * 100.0;
             k::slider(ui, "Size (% of long edge)", &mut pct, 1.0..=300.0, 50.0, Fmt::Px);
             l.scale = pct / 100.0;
+            k::slider(ui, "Stretch Vertically", &mut l.stretch, 0.1..=4.0, 1.0, Fmt::Amount);
             k::slider(ui, "Rotation", &mut l.rotation, -180.0..=180.0, 0.0, Fmt::Deg);
             k::switch_row(ui, "Flip Horizontal", &mut l.flip);
             ui.add_space(4.0);
@@ -2492,14 +2770,21 @@ impl App {
                 if k::button(ui, "Fill", Btn::Secondary, true).clicked() {
                     fit = Some(true);
                 }
+                if k::button(ui, "Stretch", Btn::Secondary, true).on_hover_text("Stretch to every side of the canvas").clicked() {
+                    stretch_full = true;
+                }
             });
             ui.add_space(4.0);
         }) {
             l.rotation = 0.0;
             l.flip = false;
+            l.stretch = 1.0;
         }
         if let Some(fill) = fit {
             self.fit_layer(i, fill);
+        }
+        if stretch_full {
+            self.stretch_layer(i);
         }
         ui.add_space(4.0);
         if k::button(ui, "Delete Layer", Btn::Plain, true).clicked() {
@@ -3264,7 +3549,7 @@ impl App {
         if reveal {
             let dir = io::config_dir();
             let _ = std::fs::create_dir_all(&dir);
-            let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+            io::reveal(&dir);
         }
         if close {
             self.settings_open = false;
@@ -3355,5 +3640,152 @@ mod tests {
         }
         assert_eq!(seen, Some(at), "click position must be known when the click fires");
         assert_eq!(origin_on_click, None, "press_origin is gone on the click frame (the original bug)");
+    }
+
+    // ------------------------------------------------------------------
+    // End-to-end: the real app, driven with real pointer events.
+    // ------------------------------------------------------------------
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("still-e2e-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn test_photo(dir: &std::path::Path) -> PathBuf {
+        let img = image::RgbImage::from_fn(900, 600, |x, y| image::Rgb([(x / 4) as u8, (y / 3) as u8, 120]));
+        let p = dir.join("photo.png");
+        img.save(&p).unwrap();
+        p
+    }
+
+    fn test_layer_png(dir: &std::path::Path) -> PathBuf {
+        let img = image::RgbaImage::from_pixel(200, 100, image::Rgba([250, 160, 30, 255]));
+        let p = dir.join("layer.png");
+        img.save(&p).unwrap();
+        p
+    }
+
+    /// Step the app until `done` holds (background threads need real time).
+    fn settle(h: &mut egui_kittest::Harness<'_, App>, done: impl Fn(&App) -> bool) {
+        for _ in 0..600 {
+            h.step();
+            if done(h.state()) {
+                h.step();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("app never settled");
+    }
+
+    fn rendered(a: &App) -> bool {
+        a.generation > 0 && a.shown_gen == a.generation && a.last_img_rect.is_positive()
+    }
+
+    fn drag(h: &mut egui_kittest::Harness<'_, App>, from: Pos2, to: Pos2) {
+        h.hover_at(from);
+        h.step();
+        h.drag_at(from);
+        h.step();
+        for k in 1..=12 {
+            h.hover_at(from + (to - from) * (k as f32 / 12.0));
+            h.step();
+        }
+        h.drop_at(to);
+        h.step();
+    }
+
+    fn open_with_layer(tag: &str) -> egui_kittest::Harness<'static, App> {
+        let dir = temp_dir(tag);
+        let photo = test_photo(&dir);
+        let layer = test_layer_png(&dir);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_eframe(move |cc| App::new(cc, Some(photo)));
+        settle(&mut h, |a| a.doc.is_some());
+        h.state_mut().load_layers(vec![layer], &egui::Context::default());
+        settle(&mut h, |a| !a.params.layers.is_empty());
+        settle(&mut h, |a| a.tex_frame == Frame::Unbordered && rendered(a));
+        h
+    }
+
+    #[test]
+    fn e2e_layer_moves_after_adding() {
+        let mut h = open_with_layer("move");
+        let (x0, y0) = (h.state().params.layers[0].x, h.state().params.layers[0].y);
+        let map = h.state().mask_map(h.state().last_img_rect);
+        let c = map.n2s([x0, y0]);
+        drag(&mut h, c, c + vec2(120.0, 60.0));
+        let l = &h.state().params.layers[0];
+        assert!(l.x > x0 + 0.05 && l.y > y0 + 0.05, "layer did not move: {x0},{y0} -> {},{}", l.x, l.y);
+
+        // deselect, then drag it again: picking it up by clicking on it must work too
+        h.state_mut().layer_sel = None;
+        h.step();
+        let (x1, y1) = (h.state().params.layers[0].x, h.state().params.layers[0].y);
+        let c = map.n2s([x1, y1]);
+        drag(&mut h, c, c - vec2(80.0, 0.0));
+        let l = &h.state().params.layers[0];
+        assert!(l.x < x1 - 0.03, "second move failed: {x1} -> {}", l.x);
+        assert!((l.y - y1).abs() < 0.01);
+    }
+
+    #[test]
+    fn e2e_stretch_and_snap_to_canvas_sides() {
+        let mut h = open_with_layer("stretch");
+        let img = h.state().last_img_rect;
+        let map = h.state().mask_map(img);
+        let before = h.state().params.layers[0].clone();
+        let (w0, h0) = before.size(map.long());
+        // grab the right-hand stretch handle and pull it 100 px outwards
+        let right = layer_edges(&before, &map)[0].1;
+        let left_before = right.x - w0;
+        drag(&mut h, right, right + vec2(100.0, 0.0));
+        let l = h.state().params.layers[0].clone();
+        let (w1, h1) = l.size(map.long());
+        assert!((w1 - (w0 + 100.0)).abs() < 2.0, "width {w0} -> {w1}");
+        assert!((h1 - h0).abs() < 1.0, "height should not change: {h0} -> {h1}");
+        let left_after = map.n2s([l.x, l.y]).x - w1 / 2.0;
+        assert!((left_after - left_before).abs() < 1.0, "opposite side must stay put");
+
+        // drag the right side to within a few pixels of the canvas edge: it snaps exactly
+        let right = layer_edges(&l, &map)[0].1;
+        let target = pos2(img.right() - 5.0, right.y);
+        drag(&mut h, right, target);
+        let l = h.state().params.layers[0].clone();
+        let (w2, _) = l.size(map.long());
+        let right_edge = map.n2s([l.x, l.y]).x + w2 / 2.0;
+        assert!((right_edge - img.right()).abs() < 0.5, "should snap to the canvas side: {right_edge} vs {}", img.right());
+
+        // Stretch fills every side of the canvas
+        h.state_mut().stretch_layer(0);
+        let l = h.state().params.layers[0].clone();
+        let (w3, h3) = l.size(map.long());
+        let c = map.n2s([l.x, l.y]);
+        assert!((c.x - w3 / 2.0 - img.left()).abs() < 1.0 && (c.x + w3 / 2.0 - img.right()).abs() < 1.0);
+        assert!((c.y - h3 / 2.0 - img.top()).abs() < 1.0 && (c.y + h3 / 2.0 - img.bottom()).abs() < 1.0);
+    }
+
+    #[test]
+    fn e2e_project_save_and_reopen() {
+        let mut h = open_with_layer("project");
+        h.state_mut().add_mask(1);
+        h.state_mut().params.masks[0].adj.exposure = 0.7;
+        h.state_mut().params.layers[0].stretch = 1.7;
+        h.state_mut().params.crop = [0.1, 0.1, 0.9, 0.85];
+        h.step();
+        assert!(h.state().unsaved());
+        let proj = temp_dir("project").join("edit.still");
+        h.state_mut().save_project(proj.clone());
+        h.step();
+        assert!(!h.state().unsaved(), "saving clears the edited marker");
+        let edit = h.state().params.clone();
+
+        // a fresh app opening the project gets the photo and the whole edit back
+        let p2 = proj.clone();
+        let mut h2 = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_eframe(move |cc| App::new(cc, Some(p2)));
+        settle(&mut h2, |a| a.doc.is_some());
+        assert_eq!(h2.state().params, edit);
+        assert_eq!(h2.state().project.as_deref(), Some(proj.as_path()));
+        assert!(!h2.state().unsaved());
     }
 }

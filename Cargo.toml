@@ -22,3 +22,6 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 4
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["eframe"] }

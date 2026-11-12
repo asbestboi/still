@@ -329,11 +329,27 @@ fn tri_dither(x: u32, y: u32, c: u32) -> f32 {
 // ---------------------------------------------------------------------------
 
 pub fn config_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("still")
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let base = if cfg!(windows) {
+        env("APPDATA")
+    } else if cfg!(target_os = "macos") {
+        env("HOME").map(|h| h.join("Library/Application Support"))
+    } else {
+        env("XDG_CONFIG_HOME").or_else(|| env("HOME").map(|h| h.join(".config")))
+    };
+    base.unwrap_or_else(|| PathBuf::from(".")).join(if cfg!(windows) { "Still" } else { "still" })
+}
+
+/// Show a folder in the system file manager.
+pub fn reveal(dir: &Path) {
+    let cmd = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(cmd).arg(dir).spawn();
 }
 
 /// App preferences (the Settings sheet).
@@ -488,4 +504,125 @@ mod tests {
         assert_eq!(look_file_name("Field / Night"), "Field - Night.stilllook");
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn projects_round_trip_and_survive_being_moved() {
+        let root = std::env::temp_dir().join(format!("still-proj-{}", std::process::id()));
+        let a = root.join("a");
+        std::fs::create_dir_all(a.join("pics")).unwrap();
+        let photo = a.join("pics/p.png");
+        image::RgbImage::new(4, 4).save(&photo).unwrap();
+        let layer = a.join("pics/l.png");
+        image::RgbImage::new(4, 4).save(&layer).unwrap();
+        let mut params = pipeline::builtin_presets().remove(3).1;
+        params.crop = [0.1, 0.2, 0.8, 0.9];
+        params.masks.push(crate::masks::Mask::default());
+        params.layers.push(crate::layers::Layer { path: layer.to_string_lossy().to_string(), stretch: 2.0, ..Default::default() });
+        let proj = a.join("edit.still");
+        write_project(&proj, &photo, &params).unwrap();
+        let (p, back) = read_project(&proj).unwrap();
+        assert_eq!(absolute(&p), absolute(&photo));
+        assert_eq!(back, Params { layers: back.layers.clone(), ..params.clone() });
+        // move the whole folder: paths resolve relative to the project
+        let b = root.join("b");
+        std::fs::rename(&a, &b).unwrap();
+        let (p, back) = read_project(&b.join("edit.still")).unwrap();
+        assert!(p.starts_with(&b) && p.exists());
+        assert!(Path::new(&back.layers[0].path).starts_with(&b));
+        assert!(read_project(&b.join("pics/p.png")).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Project files
+// ---------------------------------------------------------------------------
+
+/// A saved edit: which photo, and everything done to it (look, crop, masks,
+/// layers). Paths are stored both absolute and relative to the project file,
+/// so a folder with the project and its photos can be moved or shared.
+pub const PROJECT_EXT: &str = "still";
+const PROJECT_FORMAT: &str = "still-project";
+
+#[derive(Serialize, Deserialize)]
+struct ProjectFile {
+    format: String,
+    version: u32,
+    photo: String,
+    #[serde(default)]
+    photo_relative: Option<String>,
+    params: Params,
+    /// Relative paths of layer sources, in the same order as `params.layers`.
+    #[serde(default)]
+    layers_relative: Vec<Option<String>>,
+}
+
+pub fn is_project_file(path: &Path) -> bool {
+    path.extension().map(|e| e.eq_ignore_ascii_case(PROJECT_EXT)).unwrap_or(false)
+}
+
+/// `target` relative to `base_dir`, when they share a root.
+fn relative_to(target: &Path, base_dir: &Path) -> Option<String> {
+    let t: Vec<_> = target.components().collect();
+    let b: Vec<_> = base_dir.components().collect();
+    let common = t.iter().zip(&b).take_while(|(a, c)| a == c).count();
+    if common == 0 {
+        return None;
+    }
+    let mut rel = PathBuf::new();
+    for _ in common..b.len() {
+        rel.push("..");
+    }
+    for c in &t[common..] {
+        rel.push(c.as_os_str());
+    }
+    Some(rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn absolute(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+pub fn write_project(path: &Path, photo: &Path, params: &Params) -> Result<(), String> {
+    let dir = absolute(path.parent().unwrap_or(Path::new(".")));
+    let photo_abs = absolute(photo);
+    let file = ProjectFile {
+        format: PROJECT_FORMAT.into(),
+        version: 1,
+        photo: photo_abs.to_string_lossy().to_string(),
+        photo_relative: relative_to(&photo_abs, &dir),
+        layers_relative: params.layers.iter().map(|l| relative_to(&absolute(Path::new(&l.path)), &dir)).collect(),
+        params: params.clone(),
+    };
+    let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension(format!("{PROJECT_EXT}.part"));
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// Read a project: the photo to open and the edit to apply to it.
+pub fn read_project(path: &Path) -> Result<(PathBuf, Params), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let file: ProjectFile = serde_json::from_str(&text).map_err(|_| "not a Still project".to_string())?;
+    if file.format != PROJECT_FORMAT {
+        return Err("not a Still project".into());
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    // prefer the original location; fall back to the same place relative to the project
+    let resolve = |abs: &str, rel: Option<&String>| -> Option<PathBuf> {
+        let a = PathBuf::from(abs);
+        if a.exists() {
+            return Some(a);
+        }
+        rel.map(|r| dir.join(r)).filter(|p| p.exists())
+    };
+    let photo = resolve(&file.photo, file.photo_relative.as_ref())
+        .ok_or_else(|| format!("photo not found: {}", Path::new(&file.photo).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()))?;
+    let mut params = file.params;
+    for (i, l) in params.layers.iter_mut().enumerate() {
+        if let Some(p) = resolve(&l.path, file.layers_relative.get(i).and_then(|r| r.as_ref())) {
+            l.path = p.to_string_lossy().to_string();
+        }
+    }
+    Ok((photo, params))
 }

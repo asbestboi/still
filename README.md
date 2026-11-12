@@ -1,9 +1,18 @@
 # Still
 
-A quiet photo editor for Linux, written in Rust (egui).
+A quiet photo editor for Linux and Windows, written in Rust (egui).
 Tone, colour, film texture and a few restrained glitches. No more than that.
 
-## Run
+## Download
+
+Grab the latest build from **Releases**:
+
+- **Linux:** `Still-x86_64.AppImage`. Run `chmod +x Still-x86_64.AppImage`, then run the file.
+- **Windows:** `Still-windows-x64.exe`. The app isn't code-signed, so SmartScreen may ask: choose *More info → Run anyway*.
+
+Releases are built by GitHub Actions (`.github/workflows/release.yml`) whenever a `v*` tag is pushed.
+
+## Build from source
 
 ```sh
 cargo run --release                 # open the app
@@ -23,7 +32,8 @@ still --render "Overcast" in.RW2 out.tif
 - **Looks:** fifteen built-in looks with live thumbnails (including Pathologic, Deus Ex, MGS4 and Half-Life 2 “City 17” game looks), plus your own saved looks
 - **Adjust:** exposure, contrast, highlights/shadows, whites/blacks, fade, white balance, saturation/vibrance, B&W, split toning, sharpen/soften
 - **Masks:** local adjustments through **Object** selections (click a subject and it grows to its edges, with a threshold; click more spots to add or Alt+click to remove), linear gradients, radial (elliptical) masks, a brush with feather, flow and erase, and luminance or colour ranges. You can refine any shape by a luminance or colour range, picking the colour from the photo. Each mask has its own exposure, contrast, highlights, shadows, temperature, tint, saturation, sharpness and colour wash, plus invert, amount, a red overlay view and a visibility toggle. Masks stay attached to the picture when you re-crop, and they render the same in the preview and the export
-- **Layers:** place other photos on the canvas, PNG transparency included. Move, scale and rotate them directly on the photo (Shift snaps rotation). Each layer has opacity, nine blend modes (Normal, Multiply, Screen, Overlay, Soft Light, Darken, Lighten, Difference, Add), flip, Fit/Fill, ordering and visibility. A layer either takes on the look with the photo or sits on top of it, which suits light leaks and textures. Add layers with **Add Photo…** or drop files on the window while the Layers tab is open
+- **Projects:** **Save** (Ctrl+S) stores the photo and the whole edit (look, crop, masks, layers) in a `.still` file. Open it again later with **Open**, by dropping it on the window, or with `still edit.still`. If you move a folder that holds the project together with its photos, it still opens
+- **Layers:** place other photos on the canvas, PNG transparency included. Move, scale and rotate them directly on the photo (Shift snaps rotation). Side handles stretch a layer, and **Stretch** fills the whole canvas. Edges snap to the canvas sides and centre (hold Ctrl to place freely). Arrow keys nudge a layer, and dragging layers in the list reorders them. Each layer has opacity, nine blend modes (Normal, Multiply, Screen, Overlay, Soft Light, Darken, Lighten, Difference, Add), flip, Fit/Fill, ordering and visibility. A layer either takes on the look with the photo or sits on top of it, which suits light leaks and textures. Add layers with **Add Photo…** or drop files on the window while the Layers tab is open
 - **Effects:** bloom, halation, astigmatism (lights smear into streaks, crosses or stars), chromatic aberration, vignette, film grain, CCD noise, scanlines, posterize with ordered dither, downsample (blocky or soft low resolution)
 - **Glitch:** pixel sort, data streaks, slice shift, RGB split, block compression. Each one is seeded, so **Shuffle** gives a new arrangement you can reproduce
 - **Crop:** drag the crop rectangle on the photo; Free, Original, Square, 5:4, 3:2, 4:3, 16:9, 2.39:1 and XPan presets in landscape or portrait; straighten, rotate, flip, border; rule-of-thirds and golden-ratio guides
@@ -58,6 +68,7 @@ still --render friend.stilllook in.jpg out.jpg
 | | |
 |---|---|
 | Ctrl+O | Open |
+| Ctrl+S / Ctrl+Shift+S | Save project / Save As |
 | Ctrl+E | Export |
 | Ctrl+, | Settings |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / Redo |
@@ -69,8 +80,11 @@ still --render friend.stilllook in.jpg out.jpg
 | [ / ] | Brush size |
 | Space + drag | Pan while a mask is selected |
 | Delete | Delete the selected mask or layer |
+| Arrow keys (+Shift) | Nudge the selected layer |
 | Ctrl+0 / double-click | Fit / zoom |
 | Double-click a slider | Reset it |
 | Shift + drag a slider | Fine adjustment |
 
-Settings and saved looks are stored in `~/.config/still/settings.json`.
+Settings and saved looks are stored in `~/.config/still/settings.json` (Windows: `%APPDATA%\Still\settings.json`).
+
+The interface font is Adwaita Sans, bundled under the SIL Open Font License (`assets/fonts/OFL.txt`).

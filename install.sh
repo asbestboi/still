@@ -5,4 +5,5 @@ cd "$(dirname "$0")"
 cargo build --release
 install -Dm755 target/release/still "$HOME/.local/bin/still"
 install -Dm644 still.desktop "$HOME/.local/share/applications/still.desktop"
+install -Dm644 assets/icon-256.png "$HOME/.local/share/icons/hicolor/256x256/apps/still.png"
 echo "Installed: ~/.local/bin/still (make sure ~/.local/bin is on your PATH)"

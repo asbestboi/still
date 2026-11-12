@@ -90,6 +90,8 @@ pub struct Layer {
     pub y: f32,
     /// Width in units of the frame's long edge.
     pub scale: f32,
+    /// Height multiplier on top of the source's own proportions (stretching).
+    pub stretch: f32,
     /// Degrees, clockwise.
     pub rotation: f32,
     pub flip: bool,
@@ -109,6 +111,7 @@ impl Default for Layer {
             x: 0.5,
             y: 0.5,
             scale: 0.5,
+            stretch: 1.0,
             rotation: 0.0,
             flip: false,
             opacity: 1.0,
@@ -122,7 +125,7 @@ impl Layer {
     /// Layer size in frame pixels for a frame whose long edge is `long`.
     pub fn size(&self, long: f32) -> (f32, f32) {
         let w = self.scale * long;
-        (w, w / self.aspect.max(1e-3))
+        (w, w / self.aspect.max(1e-3) * self.stretch.max(1e-3))
     }
 }
 
@@ -333,5 +336,12 @@ mod tests {
         let l = Layer { path: "test://clear".into(), aspect: 1.0, scale: 0.8, ..Layer::default() };
         composite(&mut img, &[l], true, &sp);
         assert!(img.px.iter().all(|p| *p == [0.2; 3]));
+    }
+
+    #[test]
+    fn stretch_changes_only_the_height() {
+        let l = Layer { aspect: 2.0, scale: 0.5, stretch: 3.0, ..Layer::default() };
+        let (w, h) = l.size(100.0);
+        assert_eq!((w, h), (50.0, 75.0));
     }
 }

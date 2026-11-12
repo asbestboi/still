@@ -48,39 +48,20 @@ pub fn setup_fonts(ctx: &egui::Context) {
     use egui::epaint::text::{FontData, FontDefinitions, VariationCoords};
     use std::sync::Arc;
 
-    let candidates: [(&str, Option<&str>); 6] = [
-        ("/usr/share/fonts/inter/InterVariable.ttf", None),
-        ("/usr/share/fonts/TTF/InterVariable.ttf", None),
-        ("/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf", None),
-        ("/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf", None),
-        ("/usr/share/fonts/TTF/OpenSans-Regular.ttf", Some("/usr/share/fonts/TTF/OpenSans-SemiBold.ttf")),
-        ("/usr/share/fonts/open-sans/OpenSans-Regular.ttf", Some("/usr/share/fonts/open-sans/OpenSans-SemiBold.ttf")),
-    ];
+    // Bundled so the interface looks the same on every system (Adwaita Sans,
+    // an Inter derivative, SIL Open Font License: see assets/fonts/OFL.txt).
+    static UI_FONT: &[u8] = include_bytes!("../assets/fonts/AdwaitaSans-Regular.ttf");
 
     let mut defs = FontDefinitions::default();
     let fallbacks = defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    let mut regular_name = None;
-    let mut semibold_name = None;
-
-    for (path, bold_path) in candidates {
-        let Ok(bytes) = std::fs::read(path) else { continue };
-        let mut regular = FontData::from_owned(bytes.clone());
-        regular.tweak.coords = VariationCoords::new([(b"wght", 420.0)]);
-        defs.font_data.insert("ui".into(), Arc::new(regular));
-        regular_name = Some("ui".to_string());
-
-        let semi = match bold_path.and_then(|p| std::fs::read(p).ok()) {
-            Some(b) => FontData::from_owned(b),
-            None => {
-                let mut f = FontData::from_owned(bytes);
-                f.tweak.coords = VariationCoords::new([(b"wght", 620.0)]);
-                f
-            }
-        };
-        defs.font_data.insert("ui-semibold".into(), Arc::new(semi));
-        semibold_name = Some("ui-semibold".to_string());
-        break;
-    }
+    let mut regular = FontData::from_static(UI_FONT);
+    regular.tweak.coords = VariationCoords::new([(b"wght", 420.0)]);
+    defs.font_data.insert("ui".into(), Arc::new(regular));
+    let mut semi = FontData::from_static(UI_FONT);
+    semi.tweak.coords = VariationCoords::new([(b"wght", 620.0)]);
+    defs.font_data.insert("ui-semibold".into(), Arc::new(semi));
+    let regular_name = Some("ui".to_string());
+    let semibold_name = Some("ui-semibold".to_string());
 
     let mut prop = fallbacks.clone();
     if let Some(r) = &regular_name {

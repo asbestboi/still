@@ -1,0 +1,88 @@
+# Builds Still for Linux (AppImage) and Windows (.exe).
+# Push a tag like v0.2.0 to publish both as a GitHub release;
+# run it by hand from the Actions tab to just get the files as artifacts.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux AppImage
+    # an older base keeps the AppImage compatible with older distributions (glibc 2.35)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - name: Package AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          OUTPUT: Still-x86_64.AppImage
+        run: |
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          install -m755 target/release/still AppDir/usr/bin/still
+          install -m644 still.desktop AppDir/usr/share/applications/still.desktop
+          install -m644 assets/icon-256.png AppDir/usr/share/icons/hicolor/256x256/apps/still.png
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir \
+            --desktop-file AppDir/usr/share/applications/still.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/still.png \
+            --output appimage
+          ls -la Still-x86_64.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: Still-x86_64.AppImage
+
+  windows:
+    name: Windows exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: Copy-Item target/release/still.exe Still-windows-x64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: Still-windows-x64.exe
+
+  release:
+    name: Publish release
+    needs: [linux, windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Still ${{ github.ref_name }}
+          generate_release_notes: true
+          body: |
+            **Linux:** download `Still-x86_64.AppImage`, make it executable (`chmod +x Still-x86_64.AppImage`) and run it.
+            **Windows:** download `Still-windows-x64.exe` and run it. Windows SmartScreen may warn about an unsigned app; choose *More info → Run anyway*.
+          files: |
+            Still-x86_64.AppImage
+            Still-windows-x64.exe

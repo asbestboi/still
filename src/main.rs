@@ -1,5 +1,8 @@
 //! Still — a quiet photo editor.
 
+// no console window behind the app on Windows (release builds)
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod io;
 mod layers;
@@ -57,7 +60,8 @@ fn main() -> eframe::Result<()> {
             .with_app_id("still")
             .with_inner_size([1440.0, 920.0])
             .with_min_inner_size([960.0, 640.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).unwrap_or_default()),
         ..Default::default()
     };
 
