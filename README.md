@@ -1,6 +1,6 @@
 # Still
 
-A quiet photo editor for Linux and Windows, written in Rust (egui).
+A quiet photo editor for Linux, Windows and macOS, written in Rust (egui).
 Tone, colour, film texture and a few restrained glitches. No more than that.
 
 ## Download
@@ -9,6 +9,7 @@ Grab the latest build from **Releases**:
 
 - **Linux:** `Still-x86_64.AppImage`. Run `chmod +x Still-x86_64.AppImage`, then run the file.
 - **Windows:** `Still-windows-x64.exe`. The app isn't code-signed, so SmartScreen may ask: choose *More info → Run anyway*.
+- **macOS** (Apple Silicon and Intel, macOS 11+): `Still-macos.dmg`. Open it and drag Still into Applications. The app isn't notarized, so the first launch is blocked: open *System Settings → Privacy & Security* and click *Open Anyway* (or run `xattr -dr com.apple.quarantine /Applications/Still.app`).
 
 Releases are built by GitHub Actions (`.github/workflows/release.yml`) whenever a `v*` tag is pushed.
 
