@@ -99,6 +99,8 @@ pub struct Layer {
     pub blend: Blend,
     /// Placed under the look (graded with the photo) or on top of it.
     pub graded: bool,
+    /// Sits behind the photo, showing through where masks cut it out.
+    pub behind: bool,
 }
 
 impl Default for Layer {
@@ -117,6 +119,7 @@ impl Default for Layer {
             opacity: 1.0,
             blend: Blend::Normal,
             graded: true,
+            behind: false,
         }
     }
 }
@@ -233,16 +236,46 @@ fn source(path: &str) -> Option<Arc<Source>> {
 // Compositing
 // ---------------------------------------------------------------------------
 
-/// Draw every visible layer whose `graded` flag matches, bottom to top.
-pub fn composite(img: &mut Img, layers: &[Layer], graded: bool, sp: &Space) {
-    for l in layers.iter().filter(|l| l.visible && l.graded == graded && l.opacity > 0.001) {
+fn drawn(layers: &[Layer], graded: bool, behind: bool) -> impl Iterator<Item = &Layer> {
+    layers.iter().filter(move |l| l.visible && l.graded == graded && l.behind == behind && l.opacity > 0.001)
+}
+
+/// Draw every visible layer in front of the photo whose `graded` flag
+/// matches, bottom to top. With `cover` (the picture's opacity, where masks
+/// cut it out) the layers also fill it in.
+pub fn composite(img: &mut Img, layers: &[Layer], graded: bool, sp: &Space, mut cover: Option<&mut [f32]>) {
+    for l in drawn(layers, graded, false) {
         if let Some(src) = source(&l.path) {
-            draw(img, l, &src, sp);
+            draw(img, cover.as_deref_mut(), l, &src, sp);
         }
     }
 }
 
-fn draw(img: &mut Img, l: &Layer, src: &Source, sp: &Space) {
+/// Put the layers marked "behind" under the picture: they show only where
+/// `alpha` (the picture's opacity) is below 1, and `alpha` grows to match.
+pub fn composite_behind(img: &mut Img, alpha: &mut [f32], layers: &[Layer], graded: bool, sp: &Space) {
+    let mut under: Option<(Img, Vec<f32>)> = None;
+    for l in drawn(layers, graded, true) {
+        if let Some(src) = source(&l.path) {
+            let (u, c) = under.get_or_insert_with(|| (Img::new(img.w, img.h), vec![0.0; img.w * img.h]));
+            draw(u, Some(c), l, &src, sp);
+        }
+    }
+    let Some((under, cu)) = under else { return };
+    // the picture over what's behind it; `under` is drawn over transparency,
+    // so its colours are already weighted by its coverage
+    img.px.par_iter_mut().zip(alpha.par_iter_mut()).zip(under.px.par_iter().zip(cu.par_iter())).for_each(|((px, a), (u, &c))| {
+        let out = *a + c * (1.0 - *a);
+        if out > 1e-5 && c > 0.0 {
+            for ch in 0..3 {
+                px[ch] = (px[ch] * *a + u[ch] * (1.0 - *a)) / out;
+            }
+        }
+        *a = out;
+    });
+}
+
+fn draw(img: &mut Img, cover: Option<&mut [f32]>, l: &Layer, src: &Source, sp: &Space) {
     let long = sp.long();
     let (lw, lh) = l.size(long);
     if lw < 0.5 || lh < 0.5 {
@@ -264,7 +297,12 @@ fn draw(img: &mut Img, l: &Layer, src: &Source, sp: &Space) {
     // the coarsest level that still has at least one texel per output pixel
     let lev = src.levels.iter().rev().find(|v| v.w as f32 >= lw * 0.98).unwrap_or(&src.levels[0]);
     let (opacity, blend, flip, w) = (l.opacity.clamp(0.0, 1.0), l.blend, l.flip, img.w);
-    img.px[y0 * w..y1 * w].par_chunks_mut(w).enumerate().for_each(|(ry, row)| {
+    let rows = img.px[y0 * w..y1 * w].par_chunks_mut(w);
+    let covers: Vec<Option<&mut [f32]>> = match cover {
+        Some(c) => c[y0 * w..y1 * w].chunks_mut(w).map(Some).collect(),
+        None => (y0..y1).map(|_| None).collect(),
+    };
+    rows.zip(covers).enumerate().for_each(|(ry, (row, mut crow))| {
         let dy = (y0 + ry) as f32 + 0.5 - cy;
         for x in x0..x1 {
             let dx = x as f32 + 0.5 - cx;
@@ -288,10 +326,29 @@ fn draw(img: &mut Img, l: &Layer, src: &Source, sp: &Space) {
             }
             let inv = if t[3] > 1e-5 { 1.0 / t[3] } else { 0.0 };
             let base = &mut row[x];
-            for ch in 0..3 {
-                let b = base[ch].clamp(0.0, 1.0);
-                let col = (t[ch] * inv).clamp(0.0, 1.0);
-                base[ch] = b + (blend.apply(b, col) - b) * a;
+            match crow.as_deref_mut() {
+                None => {
+                    for ch in 0..3 {
+                        let b = base[ch].clamp(0.0, 1.0);
+                        let col = (t[ch] * inv).clamp(0.0, 1.0);
+                        base[ch] = b + (blend.apply(b, col) - b) * a;
+                    }
+                }
+                Some(crow) => {
+                    // over a partly transparent picture: the blend only acts
+                    // where there is picture; elsewhere the layer is itself
+                    let a0 = crow[x];
+                    let out = a0 + a * (1.0 - a0);
+                    if out > 1e-5 {
+                        for ch in 0..3 {
+                            let b = base[ch].clamp(0.0, 1.0);
+                            let col = (t[ch] * inv).clamp(0.0, 1.0);
+                            let over = a * (a0 * blend.apply(b, col) + (1.0 - a0) * col) + (1.0 - a) * a0 * b;
+                            base[ch] = over / out;
+                        }
+                    }
+                    crow[x] = out;
+                }
             }
         }
     });
@@ -312,19 +369,19 @@ mod tests {
         let mut img = Img { w: 200, h: 100, px: vec![[0.5; 3]; 200 * 100] };
         // 0.25 of the long edge = 50 px wide, 25 px tall, centred at (60, 50)
         let l = Layer { path: "test://red".into(), aspect: 2.0, x: 0.3, y: 0.5, scale: 0.25, ..Layer::default() };
-        composite(&mut img, &[l.clone()], true, &sp);
+        composite(&mut img, std::slice::from_ref(&l), true, &sp, None);
         assert_eq!(img.px[50 * 200 + 60], [1.0, 0.0, 0.0]);
         assert_eq!(img.px[50 * 200 + 100], [0.5, 0.5, 0.5]);
         assert_eq!(img.px[30 * 200 + 60], [0.5, 0.5, 0.5]);
         // multiply at half opacity
         let mut img2 = Img { w: 200, h: 100, px: vec![[0.5; 3]; 200 * 100] };
         let m = Layer { blend: Blend::Multiply, opacity: 0.5, ..l.clone() };
-        composite(&mut img2, &[m], true, &sp);
+        composite(&mut img2, &[m], true, &sp, None);
         let p = img2.px[50 * 200 + 60];
         assert!((p[0] - 0.5).abs() < 1e-3 && (p[1] - 0.25).abs() < 1e-3);
         // the other stage leaves it alone
         let mut img3 = Img { w: 200, h: 100, px: vec![[0.5; 3]; 200 * 100] };
-        composite(&mut img3, &[l], false, &sp);
+        composite(&mut img3, &[l], false, &sp, None);
         assert_eq!(img3.px[50 * 200 + 60], [0.5, 0.5, 0.5]);
     }
 
@@ -334,7 +391,7 @@ mod tests {
         let sp = Space { fw: 100.0, fh: 100.0, ox: 0.0, oy: 0.0 };
         let mut img = Img { w: 100, h: 100, px: vec![[0.2; 3]; 100 * 100] };
         let l = Layer { path: "test://clear".into(), aspect: 1.0, scale: 0.8, ..Layer::default() };
-        composite(&mut img, &[l], true, &sp);
+        composite(&mut img, &[l], true, &sp, None);
         assert!(img.px.iter().all(|p| *p == [0.2; 3]));
     }
 
