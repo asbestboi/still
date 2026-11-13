@@ -10,7 +10,9 @@ mod magnet;
 mod masks;
 mod pipeline;
 mod retouch;
+mod text;
 mod ui_kit;
+mod update;
 
 /// Headless batch mode: `still --render <look> <input> <output>`
 fn render_cli(args: &[String]) -> Result<(), String> {
@@ -33,12 +35,7 @@ fn render_cli(args: &[String]) -> Result<(), String> {
     let mut settings = io::ExportSettings::default();
     let out = std::path::PathBuf::from(output);
     let ext = out.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    settings.format = match ext.as_str() {
-        "png" => io::Format::Png,
-        "tif" | "tiff" => io::Format::Tiff,
-        "webp" => io::Format::Webp,
-        _ => io::Format::Jpeg,
-    };
+    settings.format = io::Format::from_ext(&ext).unwrap_or(io::Format::Jpeg);
     let t = std::time::Instant::now();
     io::export(&doc, &params, &settings, &out)?;
     eprintln!("{} → {} ({:.2}s)", input, output, t.elapsed().as_secs_f32());
@@ -55,6 +52,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     let initial = args.first().filter(|a| !a.starts_with('-')).map(std::path::PathBuf::from);
+    update::clean_up();
 
     // Leave a core for the interface so it stays smooth while a preview renders.
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);

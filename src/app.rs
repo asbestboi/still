@@ -17,13 +17,15 @@ use std::time::Instant;
 enum Job {
     /// `overlay`: mask index and its wash colour. `draft`: render at half size (fast, while dragging).
     /// `logical_w`: width of the working preview, which the canvas lays out by.
-    Preview { src: Arc<Img>, logical_w: usize, params: Params, generation: u64, frame: Frame, overlay: Option<(usize, u32)>, draft: bool },
+    /// `true_px`: the source is the picture at its real resolution, so the
+    /// result can be shown as crisp pixels when zoomed in.
+    Preview { src: Arc<Img>, logical_w: usize, params: Params, generation: u64, frame: Frame, overlay: Option<(usize, u32)>, draft: bool, true_px: bool },
     Thumbs { src: Arc<Img>, looks: Vec<Params>, ver: u64 },
 }
 
 enum Msg {
     /// `scale`: how many preview pixels one image pixel covers (2 for drafts).
-    Preview { generation: u64, image: Arc<egui::ColorImage>, hist: Histogram, ms: f32, frame: Frame, overlay: Option<egui::ColorImage>, scale: f32, draft: bool },
+    Preview { generation: u64, image: Arc<egui::ColorImage>, hist: Histogram, ms: f32, frame: Frame, overlay: Option<egui::ColorImage>, scale: f32, draft: bool, true_px: bool },
     Thumbs { ver: u64, images: Vec<egui::ColorImage> },
     Loaded(Result<Doc, String>),
     Picked(PathBuf),
@@ -38,6 +40,43 @@ enum Msg {
     LayerReady(Result<(PathBuf, f32), String>),
     /// A sharper source for zoomed-in viewing: photo, long edge, image.
     DetailReady(PathBuf, u32, Arc<Img>),
+    /// An update check finished; `true` when asked for by hand.
+    UpdateChecked(Result<Option<crate::update::Release>, String>, bool),
+    UpdateProgress(f32),
+    UpdateInstalled(Result<PathBuf, String>),
+    FontImported(Result<String, String>),
+}
+
+/// Where an update stands, for the banner and Settings.
+#[derive(Clone)]
+enum Upd {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(crate::update::Release),
+    Downloading(crate::update::Release, f32),
+    Ready(crate::update::Release, PathBuf),
+    Failed(String),
+}
+
+/// Texture filtering: real pixels stay crisp squares when magnified (if the
+/// pixel view is on); anything resampled is smoothed.
+fn tex_options(true_px: bool, pixel_view: bool) -> egui::TextureOptions {
+    if true_px && pixel_view {
+        egui::TextureOptions { magnification: egui::TextureFilter::Nearest, ..egui::TextureOptions::LINEAR }
+    } else {
+        egui::TextureOptions::LINEAR
+    }
+}
+
+/// A fresh random seed (from the clock; good enough for arrangements).
+fn random_seed() -> u32 {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+    let mut z = t.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z % 9_999_999) as u32 + 1
 }
 
 /// Largest long edge used for the sharper zoomed-in preview.
@@ -99,7 +138,7 @@ fn spawn_worker(ctx: egui::Context, jobs: Receiver<Job>, out: Sender<Msg>) {
             while let Ok(j) = jobs.try_recv() {
                 take(j);
             }
-            if let Some(Job::Preview { src, logical_w, params, generation, frame, overlay, draft }) = preview {
+            if let Some(Job::Preview { src, logical_w, params, generation, frame, overlay, draft, true_px }) = preview {
                 let t = Instant::now();
                 let full_w = logical_w as f32;
                 let src = if draft {
@@ -124,7 +163,7 @@ fn spawn_worker(ctx: egui::Context, jobs: Receiver<Job>, out: Sender<Msg>) {
                     None => to_color_image(img),
                 });
                 let ms = t.elapsed().as_secs_f32() * 1000.0;
-                let _ = out.send(Msg::Preview { generation, image, hist, ms, frame, overlay, scale, draft });
+                let _ = out.send(Msg::Preview { generation, image, hist, ms, frame, overlay, scale, draft, true_px: true_px && !draft });
                 ctx.request_repaint();
             }
             if let Some(Job::Thumbs { src, looks, ver }) = thumbs {
@@ -228,14 +267,71 @@ fn snap(v: f32, targets: &[f32], dist: f32) -> Option<f32> {
     targets.iter().copied().filter(|t| (t - v).abs() < dist).min_by(|a, b| (a - v).abs().total_cmp(&(b - v).abs()))
 }
 
-/// Is `p` inside the layer's (rotated) rectangle?
+/// Is `p` inside the layer's (rotated, possibly bent) outline?
 fn layer_contains(l: &Layer, map: &Map, p: Pos2) -> bool {
     let c = map.n2s([l.x, l.y]);
     let (w, h) = l.size(map.long());
     let (s, co) = l.rotation.to_radians().sin_cos();
     let d = p - c;
     let (u, v) = (d.x * co + d.y * s, -d.x * s + d.y * co);
-    u.abs() <= w * 0.5 && v.abs() <= h * 0.5
+    if l.warp.is_identity() {
+        return u.abs() <= w * 0.5 && v.abs() <= h * 0.5;
+    }
+    point_in_polygon(&l.outline(map.long(), 12), [u, v])
+}
+
+/// Even-odd test of `p` against a closed polygon.
+fn point_in_polygon(poly: &[[f32; 2]], p: [f32; 2]) -> bool {
+    let mut inside = false;
+    let n = poly.len();
+    for i in 0..n {
+        let (a, b) = (poly[i], poly[(i + n - 1) % n]);
+        if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0] {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// A point in the layer's own unit square (0..1 across and down, as bent) on screen.
+fn unit_to_screen(l: &Layer, map: &Map, q: [f32; 2]) -> Pos2 {
+    let c = map.n2s([l.x, l.y]);
+    let (w, h) = l.size(map.long());
+    let (s, co) = l.rotation.to_radians().sin_cos();
+    let (x, y) = ((q[0] - 0.5) * w, (q[1] - 0.5) * h);
+    c + vec2(x * co - y * s, x * s + y * co)
+}
+
+/// A screen point in the layer's own unit square.
+fn screen_to_unit(l: &Layer, map: &Map, p: Pos2) -> [f32; 2] {
+    let c = map.n2s([l.x, l.y]);
+    let (w, h) = l.size(map.long());
+    let (s, co) = l.rotation.to_radians().sin_cos();
+    let d = p - c;
+    let (x, y) = (d.x * co + d.y * s, -d.x * s + d.y * co);
+    [x / w.max(1e-3) + 0.5, y / h.max(1e-3) + 0.5]
+}
+
+/// The draggable points of the bend: perspective corners (mode 1) or mesh points (mode 2).
+fn warp_handles(l: &Layer, map: &Map, mode: u8) -> Vec<Pos2> {
+    match mode {
+        1 => l.warp.quad().iter().map(|q| unit_to_screen(l, map, *q)).collect(),
+        2 if l.warp.has_mesh() => {
+            let h = crate::layers::Homography::square_to_quad(l.warp.quad());
+            (0..l.warp.points()).map(|k| unit_to_screen(l, map, l.warp.apply(&h, l.warp.mesh_rest(k)[0], l.warp.mesh_rest(k)[1]))).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// A text layer's default name: its first line.
+fn text_name(t: &str) -> String {
+    let line = t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("Text");
+    let mut n: String = line.chars().take(32).collect();
+    if line.chars().count() > 32 {
+        n.push('…');
+    }
+    n
 }
 
 /// Maps between normalised frame coordinates and the screen.
@@ -476,6 +572,28 @@ pub struct App {
     clone_size: f32,
     clone_feather: f32,
     clone_opacity: f32,
+    /// Animation playback, and when the frame on screen went up.
+    playing: bool,
+    frame_shown_at: Instant,
+    /// The preview / original texture shows the picture's real pixels.
+    tex_true_px: bool,
+    orig_true_px: bool,
+    update: Upd,
+    /// The update banner was put away for this session.
+    update_hidden: bool,
+    /// A seed copied from one effect, to paste into another.
+    seed_clip: Option<u32>,
+    /// What dragging on a layer's handles does: 0 move / scale / turn,
+    /// 1 perspective corners, 2 mesh points.
+    warp_mode: u8,
+    /// A perspective corner or mesh point being dragged: handle, layer at the start.
+    warp_drag: Option<(usize, Layer)>,
+    /// Put the cursor in the text box (a text layer was double-clicked).
+    focus_text: bool,
+    /// Fonts for the picker, found once when first needed.
+    fonts: Option<Vec<crate::text::FontChoice>>,
+    font_filter: String,
+    logo: Option<egui::TextureHandle>,
 
     builtin: Vec<(String, Params)>,
     user_presets: Vec<(String, Params)>,
@@ -565,6 +683,19 @@ impl App {
             clone_size: 0.35,
             clone_feather: 0.5,
             clone_opacity: 1.0,
+            playing: false,
+            frame_shown_at: Instant::now(),
+            tex_true_px: false,
+            orig_true_px: false,
+            update: Upd::Idle,
+            update_hidden: false,
+            seed_clip: None,
+            warp_mode: 0,
+            warp_drag: None,
+            focus_text: false,
+            fonts: None,
+            font_filter: String::new(),
+            logo: None,
             builtin: pipeline::builtin_presets(),
             user_presets: saved.presets,
             thumbs: Vec::new(),
@@ -581,6 +712,9 @@ impl App {
             rx,
         };
         app.apply_prefs();
+        if app.prefs.check_updates && !cfg!(test) {
+            app.check_updates(&cc.egui_ctx, false);
+        }
         if let Some(p) = initial {
             if io::is_look_file(&p) {
                 app.import_look_files(&[p]);
@@ -603,8 +737,82 @@ impl App {
     }
 
     /// Push preferences into the parts of the app that read them globally.
-    fn apply_prefs(&self) {
-        k::set_reduce_motion(self.prefs.reduce_motion);
+    fn apply_prefs(&self) {}
+
+    // --- updates -------------------------------------------------------------
+
+    fn check_updates(&mut self, ctx: &egui::Context, manual: bool) {
+        if matches!(self.update, Upd::Checking | Upd::Downloading(..)) {
+            return;
+        }
+        self.update = Upd::Checking;
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let r = crate::update::check();
+            let _ = tx.send(Msg::UpdateChecked(r, manual));
+            ctx.request_repaint();
+        });
+    }
+
+    fn install_update(&mut self, rel: crate::update::Release, ctx: &egui::Context) {
+        if !crate::update::can_self_update() || rel.asset.is_none() {
+            // builds from source, or no file for this system: the release page
+            io::open_url(&rel.page);
+            return;
+        }
+        self.update = Upd::Downloading(rel.clone(), 0.0);
+        self.update_hidden = false;
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let (ptx, pctx) = (tx.clone(), ctx.clone());
+            let r = crate::update::install(&rel, &move |f| {
+                let _ = ptx.send(Msg::UpdateProgress(f));
+                pctx.request_repaint();
+            });
+            let _ = tx.send(Msg::UpdateInstalled(r));
+            ctx.request_repaint();
+        });
+    }
+
+    // --- animations ------------------------------------------------------------
+
+    /// Show frame `i` of an animated picture.
+    fn goto_frame(&mut self, i: usize, ctx: &egui::Context) {
+        let edge = self.prefs.preview_edge();
+        let pixel_view = self.prefs.pixel_view;
+        let Some(doc) = &mut self.doc else { return };
+        let Some(n) = doc.anim.as_ref().map(|a| a.len()) else { return };
+        let i = i % n.max(1);
+        if i == doc.frame {
+            return;
+        }
+        doc.show_frame(i, edge);
+        self.orig_true_px = doc.preview.w as u32 == doc.full.width();
+        self.orig_tex = Some(ctx.load_texture("original", to_color_image(&doc.preview), tex_options(self.orig_true_px, pixel_view)));
+        self.detail_src = None;
+        self.detail_req = None;
+        // the edit is the same but the picture isn't: render again
+        self.last_sent = None;
+        self.frame_shown_at = Instant::now();
+    }
+
+    /// Advance a playing animation when its frame has been up long enough.
+    fn tick_animation(&mut self, ctx: &egui::Context) {
+        let Some((frame, delay)) = self.doc.as_ref().and_then(|d| d.anim.as_ref().map(|a| (d.frame, a.delay(d.frame)))) else {
+            self.playing = false;
+            return;
+        };
+        if !self.playing {
+            return;
+        }
+        let due = std::time::Duration::from_millis(delay as u64);
+        let up = self.frame_shown_at.elapsed();
+        if up >= due {
+            self.goto_frame(frame + 1, ctx);
+            ctx.request_repaint_after(due);
+        } else {
+            ctx.request_repaint_after(due - up);
+        }
     }
 
     /// Rebuild the working preview at the preferred size (Settings → Preview).
@@ -857,16 +1065,7 @@ impl App {
         }
         self.exporting = true;
         // Doc isn't Clone (it owns big buffers), so share what the exporter needs.
-        let job_doc = Doc {
-            path: doc.path.clone(),
-            name: doc.name.clone(),
-            full: doc.full.clone(),
-            preview: doc.preview.clone(),
-            thumb_src: doc.thumb_src.clone(),
-            icc: doc.icc.clone(),
-            exif: doc.exif.clone(),
-            source_desc: String::new(),
-        };
+        let job_doc = doc.share();
         let params = self.params.clone();
         let settings = self.export.clone();
         let tx = self.tx.clone();
@@ -900,11 +1099,13 @@ impl App {
     fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Preview { generation, image, hist, ms, frame, overlay, scale, draft } => {
+                Msg::Preview { generation, image, hist, ms, frame, overlay, scale, draft, true_px } => {
                     if generation >= self.shown_gen {
                         self.shown_gen = generation;
                         self.tex_frame = frame;
                         self.tex_scale = scale;
+                        self.tex_true_px = true_px;
+                        let opts = tex_options(true_px, self.prefs.pixel_view);
                         if !draft {
                             self.full_ms = ms;
                         }
@@ -919,8 +1120,8 @@ impl App {
                         self.hist = hist;
                         self.render_ms = ms;
                         match &mut self.tex {
-                            Some(t) => t.set(image, egui::TextureOptions::LINEAR),
-                            None => self.tex = Some(ctx.load_texture("preview", image, egui::TextureOptions::LINEAR)),
+                            Some(t) => t.set(image, opts),
+                            None => self.tex = Some(ctx.load_texture("preview", image, opts)),
                         }
                     }
                 }
@@ -935,7 +1136,11 @@ impl App {
                 }
                 Msg::Loaded(Ok(doc)) => {
                     self.loading = None;
-                    self.orig_tex = Some(ctx.load_texture("original", to_color_image(&doc.preview), egui::TextureOptions::LINEAR));
+                    self.orig_true_px = doc.preview.w as u32 == doc.full.width();
+                    self.orig_tex = Some(ctx.load_texture("original", to_color_image(&doc.preview), tex_options(self.orig_true_px, self.prefs.pixel_view)));
+                    // an animation starts playing
+                    self.playing = doc.anim.is_some();
+                    self.frame_shown_at = Instant::now();
                     let portrait = doc.preview.h > doc.preview.w;
                     self.doc = Some(doc);
                     self.tex = None;
@@ -1019,9 +1224,58 @@ impl App {
                     if let Some(doc) = &mut self.doc
                         && doc.path == path
                     {
-                        self.orig_tex = Some(ctx.load_texture("original", to_color_image(&img), egui::TextureOptions::LINEAR));
+                        self.orig_true_px = img.w as u32 == doc.full.width();
+                        self.orig_tex = Some(ctx.load_texture("original", to_color_image(&img), tex_options(self.orig_true_px, self.prefs.pixel_view)));
                         doc.preview = img;
                         self.last_sent = None;
+                    }
+                }
+                Msg::UpdateChecked(r, manual) => match r {
+                    Ok(Some(rel)) => {
+                        let skipped = !manual && rel.version == self.prefs.skip_version;
+                        if skipped {
+                            self.update = Upd::Idle;
+                        } else if self.prefs.auto_update && !manual && crate::update::can_self_update() && rel.asset.is_some() {
+                            self.install_update(rel, ctx);
+                        } else {
+                            self.update = Upd::Available(rel);
+                            self.update_hidden = false;
+                        }
+                    }
+                    Ok(None) => self.update = if manual { Upd::UpToDate } else { Upd::Idle },
+                    Err(e) => self.update = if manual { Upd::Failed(format!("Couldn't check for updates: {e}")) } else { Upd::Idle },
+                },
+                Msg::UpdateProgress(f) => {
+                    if let Upd::Downloading(_, p) = &mut self.update {
+                        *p = f;
+                    }
+                }
+                Msg::UpdateInstalled(r) => {
+                    let rel = match &self.update {
+                        Upd::Downloading(rel, _) => Some(rel.clone()),
+                        _ => None,
+                    };
+                    self.update = match (r, rel) {
+                        (Ok(path), Some(rel)) => Upd::Ready(rel, path),
+                        (Err(e), _) => Upd::Failed(format!("Couldn't install the update: {e}")),
+                        (Ok(_), None) => Upd::Idle,
+                    };
+                    self.update_hidden = false;
+                }
+                Msg::FontImported(r) => {
+                    self.dialog_open = false;
+                    match r {
+                        Ok(path) => {
+                            self.fonts = None;
+                            if let Some(i) = self.selected_layer()
+                                && let Some(t) = self.params.layers[i].text.clone()
+                            {
+                                let new = crate::text::TextSpec { font: path.clone(), ..t };
+                                self.set_text(i, new);
+                            }
+                            self.toast = Some((format!("Added font {}", crate::text::font_name(&path)), None, Instant::now()));
+                        }
+                        Err(e) => self.toast = Some((format!("Couldn't add the font: {e}"), None, Instant::now())),
                     }
                 }
                 Msg::Exported(r) => {
@@ -1160,7 +1414,8 @@ impl App {
         self.sent_at = Some(Instant::now());
         let src = detail.unwrap_or_else(|| doc.preview.clone());
         let logical_w = doc.preview.w;
-        let _ = self.jobs.send(Job::Preview { src, logical_w, params, generation: self.generation, frame, overlay, draft: interacting });
+        let true_px = src.w as u32 == doc.full.width() && src.h as u32 == doc.full.height();
+        let _ = self.jobs.send(Job::Preview { src, logical_w, params, generation: self.generation, frame, overlay, draft: interacting, true_px });
     }
 
     /// Snapshot the parameters into the undo stack once an interaction ends.
@@ -1365,6 +1620,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        self.tick_animation(&ctx);
         self.shortcuts(&ctx);
         self.handle_drop(&ctx);
         self.handle_paste(&ctx);
@@ -1599,10 +1855,13 @@ impl App {
         let painter = ui.painter_at(rect);
         let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
 
-        let Some(_doc) = &self.doc else {
+        let Some(doc) = &self.doc else {
             self.empty_state(ui, rect, hovering_files);
+            self.update_banner(ui, rect);
             return;
         };
+        // the picture is shown at its real resolution (small images, pixel art)
+        let native = doc.preview.w as u32 == doc.full.width();
 
         let compare_key = ctx.input(|i| i.key_down(egui::Key::Backslash));
         let compare_btn = ctx.data(|d| d.get_temp::<bool>(Id::unique("compare_btn")).unwrap_or(false));
@@ -1621,11 +1880,14 @@ impl App {
         let Some(tex) = tex.or(self.orig_tex.as_ref()) else { return };
         // a draft texture is smaller; lay it out at the full preview size
         let scale = if !compare && self.tex.is_some() { self.tex_scale } else { 1.0 };
-        let (tex_id, tsize) = (tex.id(), tex.size_vec2() * scale);
+        let (tex_id, tsize, tex_px) = (tex.id(), tex.size_vec2() * scale, tex.size());
 
         let pad = 36.0;
         let avail = rect.shrink(pad);
-        let fit = (avail.width() / tsize.x).min(avail.height() / tsize.y).min(4.0);
+        let fit = (avail.width() / tsize.x).min(avail.height() / tsize.y);
+        // small pictures fill the canvas in whole steps, so every pixel is the same size
+        let fit = if native && self.prefs.pixel_view && fit > 1.0 { fit.floor() } else { fit.min(4.0) };
+        let max_zoom = if self.prefs.pixel_view { 64.0 } else { 12.0 };
 
         // --- input: zoom (pinch / wheel) about the pointer ------------------
         let (scroll, pinch, hover_pos) = ctx.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta(), i.pointer.hover_pos()));
@@ -1633,7 +1895,7 @@ impl App {
             let factor = pinch * (scroll * 0.0018).exp();
             if (factor - 1.0).abs() > 1e-4 {
                 let old = self.view.zoom;
-                let new = (old * factor).clamp(1.0, 12.0);
+                let new = (old * factor).clamp(1.0, max_zoom);
                 if let Some(p) = hover_pos {
                     let rel = p - rect.center();
                     self.view.pan = rel - (rel - self.view.pan) * (new / old);
@@ -1648,7 +1910,19 @@ impl App {
                 k::spring_set(&ctx, Id::unique("pany"), self.view.pan.y, 0.0);
             }
         }
-        if resp.double_clicked() && !cropping {
+        // double-clicking a text layer edits its text instead of zooming
+        let text_hit = (layering && resp.double_clicked())
+            .then(|| click_pos(&resp))
+            .flatten()
+            .and_then(|o| {
+                let map = self.mask_map(self.last_img_rect);
+                (0..self.params.layers.len()).rev().find(|&i| self.layer_pickable(i) && layer_contains(&self.params.layers[i], &map, o))
+            })
+            .filter(|&i| self.params.layers[i].text.is_some());
+        if let Some(i) = text_hit {
+            self.layer_sel = Some(i);
+            self.focus_text = true;
+        } else if resp.double_clicked() && !cropping {
             if self.view.zoom > 1.01 {
                 self.view.zoom = 1.0;
                 self.view.pan = Vec2::ZERO;
@@ -1757,6 +2031,29 @@ impl App {
         let img_rect = Rect::from_center_size(rect.center() + vec2(px, py), size);
         painter.image(tex_id, img_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         self.last_img_rect = img_rect;
+        // like Paint: a grid between the real pixels once they're big
+        let true_px = if compare || self.tex.is_none() { self.orig_true_px } else { self.tex_true_px };
+        if self.prefs.pixel_view && self.prefs.pixel_grid && true_px {
+            let [tw, th] = tex_px;
+            let cell = img_rect.width() / tw.max(1) as f32;
+            if cell >= 8.0 {
+                let a = ((cell - 8.0) / 10.0).clamp(0.0, 1.0);
+                let st = Stroke::new(1.0, Color32::from_rgba_unmultiplied(128, 128, 128, (18.0 + 42.0 * a) as u8));
+                let vis = img_rect.intersect(rect);
+                let i0 = ((vis.left() - img_rect.left()) / cell).floor().max(0.0) as usize;
+                let i1 = (((vis.right() - img_rect.left()) / cell).ceil() as usize).min(tw);
+                let j0 = ((vis.top() - img_rect.top()) / cell).floor().max(0.0) as usize;
+                let j1 = (((vis.bottom() - img_rect.top()) / cell).ceil() as usize).min(th);
+                for i in i0..=i1 {
+                    let x = (img_rect.left() + i as f32 * cell).round() + 0.5;
+                    painter.line_segment([pos2(x, vis.top()), pos2(x, vis.bottom())], st);
+                }
+                for j in j0..=j1 {
+                    let y = (img_rect.top() + j as f32 * cell).round() + 0.5;
+                    painter.line_segment([pos2(vis.left(), y), pos2(vis.right(), y)], st);
+                }
+            }
+        }
         // the hand for panning goes first, so a tool's own cursor (colour
         // picker, brush, object crosshair) can replace it
         if self.view.zoom > 1.0 && (resp.hovered() || resp.dragged()) {
@@ -1805,6 +2102,8 @@ impl App {
         }
 
         self.canvas_hud(ui, rect, fit, zoom);
+        self.frame_bar(ui, rect);
+        self.update_banner(ui, rect);
         self.toast_view(ui, rect);
         if hovering_files {
             self.drop_hint(ui, rect);
@@ -1961,12 +2260,12 @@ impl App {
 
     /// The picture inside the preview, excluding any border.
     fn content_rect(&self, img: Rect) -> Rect {
-        if self.tex_frame != Frame::Output || self.params.border <= 0.001 {
+        if self.tex_frame != Frame::Output || self.params.border_amount() <= 0.001 {
             return img;
         }
         let (fw, fh) = self.frame_dims();
         let (_, _, cw, ch) = pipeline::crop_px(fw as usize, fh as usize, self.params.crop);
-        let b = (self.params.border * 0.12 * cw.min(ch) as f32).round();
+        let b = (self.params.border_amount() * 0.12 * cw.min(ch) as f32).round();
         let fx = b / (cw as f32 + 2.0 * b) * img.width();
         let fy = b / (ch as f32 + 2.0 * b) * img.height();
         img.shrink2(vec2(fx, fy))
@@ -2376,6 +2675,130 @@ impl App {
         }
     }
 
+    /// Playback controls above the HUD for an animated GIF / WebP / PNG.
+    fn frame_bar(&mut self, ui: &mut Ui, rect: Rect) {
+        let ctx = ui.ctx().clone();
+        let Some((frame, n)) = self.doc.as_ref().and_then(|d| d.anim.as_ref().map(|a| (d.frame, a.len()))) else { return };
+        let w = 340.0;
+        let bar = Rect::from_center_size(pos2(rect.center().x, rect.bottom() - 80.0), vec2(w, 34.0));
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(bar, CornerRadius::same(17), Color32::from_rgba_unmultiplied(38, 38, 42, 225));
+        k::stroke_rect(ui, bar, 17, Color32::from_white_alpha(16));
+        let btn = |ui: &mut Ui, r: Rect, id: &str, label: &str, tip: &str| {
+            let resp = ui.interact(r, Id::unique(id), Sense::click());
+            let col = if resp.is_pointer_button_down_on() { k::LABEL3 } else if resp.hovered() { k::LABEL } else { k::LABEL2 };
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, label, k::font_semibold(12.0), col);
+            resp.on_hover_text(tip).clicked()
+        };
+        let r_prev = Rect::from_min_size(bar.min + vec2(8.0, 0.0), vec2(30.0, bar.height()));
+        let r_play = Rect::from_min_size(bar.min + vec2(38.0, 0.0), vec2(46.0, bar.height()));
+        let r_next = Rect::from_min_size(bar.min + vec2(84.0, 0.0), vec2(30.0, bar.height()));
+        if btn(ui, r_prev, "anim_prev", "‹", "Previous frame") {
+            self.playing = false;
+            self.goto_frame(frame + n - 1, &ctx);
+        }
+        if btn(ui, r_play, "anim_play", if self.playing { "Pause" } else { "Play" }, "Play or pause the animation") {
+            self.playing = !self.playing;
+            self.frame_shown_at = Instant::now();
+        }
+        if btn(ui, r_next, "anim_next", "›", "Next frame") {
+            self.playing = false;
+            self.goto_frame(frame + 1, &ctx);
+        }
+        // scrubber: one notch per frame
+        let track = Rect::from_min_max(pos2(bar.left() + 124.0, bar.center().y - 2.0), pos2(bar.right() - 70.0, bar.center().y + 2.0));
+        let hit = ui.interact(track.expand2(vec2(6.0, 12.0)), Id::unique("anim_scrub"), Sense::click_and_drag());
+        if (hit.dragged() || hit.clicked())
+            && let Some(p) = hit.interact_pointer_pos()
+        {
+            let t = ((p.x - track.left()) / track.width()).clamp(0.0, 1.0);
+            self.playing = false;
+            self.goto_frame((t * (n - 1) as f32).round() as usize, &ctx);
+        }
+        painter.rect_filled(track, CornerRadius::same(2), k::FILL);
+        let x = track.left() + track.width() * frame as f32 / (n - 1).max(1) as f32;
+        painter.rect_filled(Rect::from_min_max(track.min, pos2(x, track.max.y)), CornerRadius::same(2), Color32::from_gray(200));
+        painter.circle_filled(pos2(x, track.center().y), if hit.hovered() || hit.dragged() { 6.5 } else { 5.5 }, Color32::WHITE);
+        painter.text(pos2(bar.right() - 14.0, bar.center().y), Align2::RIGHT_CENTER, format!("{} / {n}", frame + 1), k::font_mono(11.5), k::LABEL2);
+    }
+
+    /// "A new version is available" and the progress of installing it.
+    fn update_banner(&mut self, ui: &mut Ui, rect: Rect) {
+        let ctx = ui.ctx().clone();
+        if self.update_hidden {
+            return;
+        }
+        let (title, detail): (String, String) = match &self.update {
+            Upd::Available(r) => (format!("Still {} is available", r.version), format!("You have {}.", crate::update::CURRENT)),
+            Upd::Downloading(r, f) => (format!("Downloading Still {}…", r.version), format!("{:.0}%", f * 100.0)),
+            Upd::Ready(r, _) => (format!("Still {} is installed", r.version), "Restart to start using it.".into()),
+            Upd::Failed(e) => ("Update didn't work".into(), e.clone()),
+            _ => return,
+        };
+        let w = 330.0;
+        let card = Rect::from_min_size(pos2(rect.left() + 16.0, rect.top() + 16.0), vec2(w, 92.0));
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(card.translate(vec2(0.0, 4.0)).expand(2.0), CornerRadius::same(16), Color32::from_black_alpha(60));
+        painter.rect_filled(card, CornerRadius::same(14), Color32::from_rgba_unmultiplied(44, 44, 48, 240));
+        k::stroke_rect(ui, card, 14, Color32::from_white_alpha(18));
+        painter.text(card.min + vec2(16.0, 20.0), Align2::LEFT_CENTER, title, k::font_semibold(13.0), k::LABEL);
+        painter.text(card.min + vec2(16.0, 40.0), Align2::LEFT_CENTER, detail, k::font(12.0), k::LABEL2);
+        let row = Rect::from_min_max(pos2(card.left() + 12.0, card.bottom() - 38.0), pos2(card.right() - 12.0, card.bottom() - 8.0));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        child.spacing_mut().item_spacing.x = 4.0;
+        match self.update.clone() {
+            Upd::Available(rel) => {
+                let can = crate::update::can_self_update() && rel.asset.is_some();
+                if k::button(&mut child, if can { "Install" } else { "Download" }, Btn::Primary, true)
+                    .on_hover_text(if can { "Download and install it; it starts on the next launch" } else { "Open the release page" })
+                    .clicked()
+                {
+                    self.install_update(rel.clone(), &ctx);
+                }
+                if k::button(&mut child, "What's New", Btn::Plain, true).clicked() {
+                    io::open_url(&rel.page);
+                }
+                if k::button(&mut child, "Skip", Btn::Plain, true).on_hover_text("Don't remind me about this version").clicked() {
+                    self.prefs.skip_version = rel.version.clone();
+                    self.update = Upd::Idle;
+                    self.persist();
+                }
+                if k::button(&mut child, "Later", Btn::Plain, true).clicked() {
+                    self.update_hidden = true;
+                }
+            }
+            Upd::Downloading(_, f) => {
+                let (bar, _) = child.allocate_exact_size(vec2(row.width() - 8.0, 6.0), Sense::hover());
+                child.painter().rect_filled(bar, CornerRadius::same(3), k::FILL);
+                child.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * f, bar.height())), CornerRadius::same(3), k::ACCENT);
+            }
+            Upd::Ready(_, path) => {
+                if k::button(&mut child, "Restart Now", Btn::Primary, true).clicked() {
+                    if self.unsaved() {
+                        self.toast = Some(("Save your edit first (Ctrl+S), then restart".into(), None, Instant::now()));
+                    } else {
+                        match crate::update::relaunch(&path) {
+                            Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                            Err(e) => self.toast = Some((format!("Couldn't restart: {e}"), None, Instant::now())),
+                        }
+                    }
+                }
+                if k::button(&mut child, "Later", Btn::Plain, true).clicked() {
+                    self.update_hidden = true;
+                }
+            }
+            Upd::Failed(_) => {
+                if k::button(&mut child, "Open Releases", Btn::Secondary, true).on_hover_text("Download it by hand").clicked() {
+                    io::open_url(&format!("https://github.com/{}/releases/latest", crate::update::REPO));
+                }
+                if k::button(&mut child, "Dismiss", Btn::Plain, true).clicked() {
+                    self.update = Upd::Idle;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn empty_state(&mut self, ui: &mut Ui, rect: Rect, hovering: bool) {
         let ctx = ui.ctx().clone();
         let painter = ui.painter_at(rect);
@@ -2389,30 +2812,39 @@ impl App {
         let list_h = if recent.is_empty() { 0.0 } else { 34.0 + recent.len() as f32 * 34.0 };
         let c = c - vec2(0.0, list_h / 2.0);
         let lift = k::spring(&ctx, Id::unique("drop_lift"), if hovering { 1.0 } else { 0.0 }, 1.0, 0.3);
-        let card = Rect::from_center_size(c, vec2(380.0, 230.0) * (1.0 + lift * 0.03));
+        let card = Rect::from_center_size(c, vec2(380.0, 290.0) * (1.0 + lift * 0.03));
+        let logo = self
+            .logo
+            .get_or_insert_with(|| {
+                let img = image::load_from_memory(include_bytes!("../assets/icon-256.png")).map(|i| i.to_rgba8()).unwrap_or_default();
+                let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                ctx.load_texture("logo", ci, egui::TextureOptions::LINEAR)
+            })
+            .id();
+        painter.image(logo, Rect::from_center_size(c + vec2(0.0, -94.0), vec2(76.0, 76.0)), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         painter.rect_stroke(
             card,
             CornerRadius::same(20),
             Stroke::new(1.5, k::lerp_color(Color32::from_white_alpha(22), k::ACCENT, lift)),
             egui::StrokeKind::Inside,
         );
-        painter.text(c + vec2(0.0, -46.0), Align2::CENTER_CENTER, "Still", k::font_semibold(30.0), k::LABEL);
+        painter.text(c + vec2(0.0, -28.0), Align2::CENTER_CENTER, "Still", k::font_semibold(30.0), k::LABEL);
         painter.text(
-            c + vec2(0.0, -12.0),
+            c + vec2(0.0, 6.0),
             Align2::CENTER_CENTER,
             if hovering { "Release to open" } else { "Drop a photo here, or open one to begin." },
             k::font(13.0),
             k::LABEL2,
         );
-        let btn_rect = Rect::from_center_size(c + vec2(0.0, 34.0), vec2(140.0, 30.0));
+        let btn_rect = Rect::from_center_size(c + vec2(0.0, 50.0), vec2(140.0, 30.0));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(btn_rect).layout(egui::Layout::top_down(egui::Align::Center)));
         if k::button(&mut child, "Open Photo…", Btn::Primary, true).clicked() {
             self.pick_file(&ctx);
         }
         painter.text(
-            c + vec2(0.0, 84.0),
+            c + vec2(0.0, 100.0),
             Align2::CENTER_CENTER,
-            "RAW · JPEG · PNG · TIFF · WebP · EXR",
+            "RAW · JPEG · PNG · TIFF · WebP · GIF · EXR",
             k::font(11.0),
             k::LABEL3,
         );
@@ -2552,18 +2984,14 @@ impl App {
             });
             ui.add_space(2.0);
         }
-        // content cross-fades and settles in when switching tabs
-        let fid = Id::unique("tab_fade");
+        // switching tabs is instant: no fade or slide
         if prev != self.tab {
-            k::spring_set(&ctx, fid, 0.0, 0.0);
+            ctx.request_repaint();
         }
-        let fade = k::spring(&ctx, fid, 1.0, 1.0, 0.25);
         ui.add_space(12.0);
 
         let has_doc = self.doc.is_some();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.multiply_opacity(fade);
-            ui.add_space((1.0 - fade) * 8.0);
             if !has_doc && TABS[self.tab].0 == Tab::Presets {
                 k::caption(ui, "Open a photo to preview presets.");
             }
@@ -2873,12 +3301,17 @@ impl App {
             reset!(p, astig, astig_length, astig_angle, astig_rays);
         }
 
-        if k::section(ui, "Grain", modified!(p, grain, grain_size, grain_color), |ui| {
+        let clip = &mut self.seed_clip;
+        let main = p.seed;
+        if k::section(ui, "Grain", modified!(p, grain, grain_size, grain_color, seed_grain), |ui| {
             k::slider(ui, "Amount", &mut p.grain, 0.0..=1.0, 0.0, Fmt::Amount);
             k::slider(ui, "Size", &mut p.grain_size, 0.0..=1.0, 0.35, Fmt::Amount);
             k::slider(ui, "Color", &mut p.grain_color, 0.0..=1.0, 0.0, Fmt::Amount);
+            seed_row(ui, "seed_grain", &mut p.seed_grain, Some(main), clip);
+            k::caption(ui, "The seed places the grain and the CCD noise.");
+            ui.add_space(4.0);
         }) {
-            reset!(p, grain, grain_size, grain_color);
+            reset!(p, grain, grain_size, grain_color, seed_grain);
         }
 
         if k::section(ui, "Sensor", modified!(p, sensor_noise, scanlines, scanline_spacing), |ui| {
@@ -2907,38 +3340,41 @@ impl App {
     fn tab_glitch(&mut self, ui: &mut Ui) {
         self.apply_to(ui, "glitch_mask", "Glitches", |m| m.glitch, |m, on| m.glitch = on);
         let p = &mut self.params;
-        k::caption(ui, "Glitches are placed by a seed. Shuffle for a new arrangement.");
+        let clip = &mut self.seed_clip;
+        k::caption(ui, "Glitches and grain are placed by seeds. Every effect follows the main seed until you give it its own: type a number, roll a random one, or copy a seed from one effect and paste it into another.");
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if k::button(ui, "Shuffle", Btn::Secondary, true).clicked() {
-                p.seed = p.seed.wrapping_mul(1_103_515_245).wrapping_add(12_345) % 100_000 + 1;
-            }
-            ui.label(egui::RichText::new(format!("Seed {}", p.seed)).font(k::font_mono(11.5)).color(k::LABEL3));
-        });
+        seed_row(ui, "seed_main", &mut p.seed, None, clip);
         ui.add_space(10.0);
+        let main = p.seed;
 
-        if k::section(ui, "Pixel Sort", modified!(p, sort_amount, sort_low, sort_high, sort_vertical, sort_reverse), |ui| {
+        if k::section(ui, "Pixel Sort", modified!(p, sort_amount, sort_low, sort_high, sort_vertical, sort_reverse, seed_sort), |ui| {
             k::slider(ui, "Amount", &mut p.sort_amount, 0.0..=1.0, 0.0, Fmt::Amount);
             k::slider(ui, "Threshold Low", &mut p.sort_low, 0.0..=1.0, 0.45, Fmt::Amount);
             k::slider(ui, "Threshold High", &mut p.sort_high, 0.0..=1.0, 1.0, Fmt::Amount);
             k::switch_row(ui, "Vertical", &mut p.sort_vertical);
             k::switch_row(ui, "Reverse", &mut p.sort_reverse);
+            seed_row(ui, "seed_sort", &mut p.seed_sort, Some(main), clip);
+            ui.add_space(4.0);
         }) {
-            reset!(p, sort_amount, sort_low, sort_high, sort_vertical, sort_reverse);
+            reset!(p, sort_amount, sort_low, sort_high, sort_vertical, sort_reverse, seed_sort);
         }
 
-        if k::section(ui, "Data Streaks", modified!(p, streaks, streak_width), |ui| {
+        if k::section(ui, "Data Streaks", modified!(p, streaks, streak_width, seed_streaks), |ui| {
             k::slider(ui, "Amount", &mut p.streaks, 0.0..=1.0, 0.0, Fmt::Amount);
             k::slider(ui, "Width", &mut p.streak_width, 0.0..=1.0, 0.3, Fmt::Amount);
+            seed_row(ui, "seed_streaks", &mut p.seed_streaks, Some(main), clip);
+            ui.add_space(4.0);
         }) {
-            reset!(p, streaks, streak_width);
+            reset!(p, streaks, streak_width, seed_streaks);
         }
 
-        if k::section(ui, "Slice Shift", modified!(p, slices, slice_shift), |ui| {
+        if k::section(ui, "Slice Shift", modified!(p, slices, slice_shift, seed_slices), |ui| {
             k::slider(ui, "Amount", &mut p.slices, 0.0..=1.0, 0.0, Fmt::Amount);
             k::slider(ui, "Offset", &mut p.slice_shift, 0.0..=1.0, 0.3, Fmt::Amount);
+            seed_row(ui, "seed_slices", &mut p.seed_slices, Some(main), clip);
+            ui.add_space(4.0);
         }) {
-            reset!(p, slices, slice_shift);
+            reset!(p, slices, slice_shift, seed_slices);
         }
 
         if k::section(ui, "RGB Split", modified!(p, rgb_split, rgb_angle), |ui| {
@@ -2948,11 +3384,13 @@ impl App {
             reset!(p, rgb_split, rgb_angle);
         }
 
-        if k::section(ui, "Compression", modified!(p, blocks, block_size), |ui| {
+        if k::section(ui, "Compression", modified!(p, blocks, block_size, seed_blocks), |ui| {
             k::slider(ui, "Amount", &mut p.blocks, 0.0..=1.0, 0.0, Fmt::Amount);
             k::slider(ui, "Block Size", &mut p.block_size, 0.0..=1.0, 0.3, Fmt::Amount);
+            seed_row(ui, "seed_blocks", &mut p.seed_blocks, Some(main), clip);
+            ui.add_space(4.0);
         }) {
-            reset!(p, blocks, block_size);
+            reset!(p, blocks, block_size, seed_blocks);
         }
     }
 
@@ -3032,6 +3470,205 @@ impl App {
         self.tab = TABS.iter().position(|t| t.0 == Tab::Layers).unwrap_or(self.tab);
     }
 
+    /// A new text layer in the middle of the visible canvas.
+    fn add_text_layer(&mut self) {
+        let (fw, fh) = self.frame_dims();
+        let long = fw.max(fh);
+        let c = self.params.crop;
+        let ch = (c[3] - c[1]) * fh / long;
+        let spec = crate::text::TextSpec::default();
+        let (w_em, h_em) = crate::text::measure(&spec);
+        // letters about a tenth of the visible height
+        let em = ch * 0.1;
+        self.params.layers.push(Layer {
+            name: text_name(&spec.text),
+            aspect: (w_em / h_em.max(1e-3)).clamp(1e-3, 1e3),
+            x: (c[0] + c[2]) * 0.5,
+            y: (c[1] + c[3]) * 0.5,
+            scale: w_em * em,
+            // on top of the finished look, so grain and glitches leave it clean
+            graded: false,
+            text: Some(spec),
+            ..Layer::default()
+        });
+        self.layer_sel = Some(self.params.layers.len() - 1);
+        self.tab = TABS.iter().position(|t| t.0 == Tab::Layers).unwrap_or(self.tab);
+        self.focus_text = true;
+    }
+
+    /// Change a text layer's text or style. The letters keep their size on
+    /// the canvas: the layer grows and shrinks with the text.
+    fn set_text(&mut self, i: usize, new: crate::text::TextSpec) {
+        let Some(l) = self.params.layers.get_mut(i) else { return };
+        let old = l.text.clone();
+        if old.as_ref() == Some(&new) {
+            return;
+        }
+        let (nw, nh) = crate::text::measure(&new);
+        if let Some(o) = &old {
+            let (ow, _) = crate::text::measure(o);
+            if ow > 1e-4 && nw > 1e-4 {
+                l.scale = (l.scale * nw / ow).clamp(1e-4, 1e4);
+            }
+        }
+        l.aspect = (nw / nh.max(1e-4)).clamp(1e-3, 1e3);
+        // the name follows the text until the layer is renamed
+        if old.as_ref().map(|o| text_name(&o.text)) == Some(l.name.clone()) {
+            l.name = text_name(&new.text);
+        }
+        l.text = Some(new);
+    }
+
+    fn pick_font(&mut self, ctx: &egui::Context) {
+        if self.dialog_open {
+            return;
+        }
+        self.dialog_open = true;
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new().set_title("Add a Font").add_filter("Fonts", &io::dialog_exts(crate::text::FONT_EXTS)).pick_file();
+            let _ = tx.send(match picked {
+                Some(p) => Msg::FontImported(crate::text::import_font(&p)),
+                None => Msg::DialogClosed,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// The text box, font and spacing of a text layer.
+    fn text_sections(&mut self, ui: &mut Ui, i: usize) {
+        let ctx = ui.ctx().clone();
+        let Some(spec) = self.params.layers[i].text.clone() else { return };
+        let mut t = spec.clone();
+        let mut add_font = false;
+        let d = crate::text::TextSpec::default();
+        let focus = std::mem::take(&mut self.focus_text);
+        if self.fonts.is_none() {
+            self.fonts = Some(crate::text::font_choices());
+        }
+        let fonts = self.fonts.clone().unwrap_or_default();
+        let filter = &mut self.font_filter;
+        let typo_modified = t.font != d.font || t.weight != d.weight || t.italic != d.italic || t.align != d.align || t.tracking != d.tracking || t.leading != d.leading;
+        if k::section(ui, "Text", typo_modified, |ui| {
+            let te = egui::TextEdit::multiline(&mut t.text)
+                .id(Id::unique("text_layer_box"))
+                .desired_rows(3)
+                .desired_width(f32::INFINITY)
+                .font(k::font(14.0))
+                .hint_text("Type here")
+                .margin(egui::Margin::symmetric(8, 6));
+            let r = ui.add(te);
+            if focus {
+                r.request_focus();
+            }
+            ui.add_space(6.0);
+            field_label(ui, "Font");
+            egui::ComboBox::from_id_salt("text_font")
+                .selected_text(crate::text::font_name(&t.font))
+                .width(ui.available_width())
+                .height(360.0)
+                .show_ui(ui, |ui| {
+                    ui.add(egui::TextEdit::singleline(filter).hint_text("Search fonts").desired_width(f32::INFINITY));
+                    let q = filter.to_lowercase();
+                    let mut last = u8::MAX;
+                    for f in fonts.iter().filter(|f| q.is_empty() || f.name.to_lowercase().contains(&q)).take(600) {
+                        if f.source != last {
+                            last = f.source;
+                            ui.label(egui::RichText::new(["Built in", "Added in Still", "On this computer"][f.source.min(2) as usize]).size(11.0).color(k::LABEL3));
+                        }
+                        ui.selectable_value(&mut t.font, f.path.clone(), &f.name);
+                    }
+                });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if k::button(ui, "Add Font…", Btn::Secondary, true).on_hover_text("Use a .ttf or .otf file; Still keeps a copy").clicked() {
+                    add_font = true;
+                }
+                if !t.font.is_empty() && k::button(ui, "Built-in Font", Btn::Plain, true).clicked() {
+                    t.font.clear();
+                }
+            });
+            ui.add_space(4.0);
+            k::slider(ui, "Weight", &mut t.weight, 100.0..=900.0, d.weight, Fmt::Px);
+            k::slider(ui, "Italic", &mut t.italic, -1.0..=1.0, 0.0, Fmt::Signed);
+            field_label(ui, "Align");
+            let mut a = t.align.min(2) as usize;
+            if k::segmented(ui, "text_align", &mut a, &["Left", "Center", "Right"]) {
+                t.align = a as u8;
+            }
+            ui.add_space(6.0);
+            k::slider(ui, "Letter Spacing", &mut t.tracking, -0.2..=1.0, 0.0, Fmt::Signed);
+            k::slider(ui, "Line Height", &mut t.leading, 0.5..=3.0, d.leading, Fmt::Num);
+            ui.add_space(2.0);
+        }) {
+            t = crate::text::TextSpec { text: t.text.clone(), fill: t.fill, gradient: t.gradient, fill2: t.fill2, gradient_angle: t.gradient_angle, outline: t.outline, outline_color: t.outline_color, shadow: t.shadow, shadow_color: t.shadow_color, shadow_distance: t.shadow_distance, shadow_angle: t.shadow_angle, shadow_blur: t.shadow_blur, shape: t.shape, bend: t.bend, waves: t.waves, ..d.clone() };
+        }
+        let color_modified = t.fill != d.fill || t.gradient || t.outline > 0.0 || t.shadow > 0.0;
+        if k::section(ui, "Text Color", color_modified, |ui| {
+            color_row(ui, "Fill", &mut t.fill);
+            k::switch_row(ui, "Gradient", &mut t.gradient);
+            if t.gradient {
+                color_row(ui, "Second Color", &mut t.fill2);
+                k::slider(ui, "Gradient Angle", &mut t.gradient_angle, 0.0..=360.0, d.gradient_angle, Fmt::Deg);
+            }
+            ui.add_space(4.0);
+            k::slider(ui, "Outline", &mut t.outline, 0.0..=0.3, 0.0, Fmt::Amount);
+            if t.outline > 0.0 {
+                color_row(ui, "Outline Color", &mut t.outline_color);
+            }
+            ui.add_space(4.0);
+            k::slider(ui, "Shadow", &mut t.shadow, 0.0..=1.0, 0.0, Fmt::Amount);
+            if t.shadow > 0.0 {
+                color_row(ui, "Shadow Color", &mut t.shadow_color);
+                k::slider(ui, "Shadow Distance", &mut t.shadow_distance, 0.0..=0.5, d.shadow_distance, Fmt::Amount);
+                k::slider(ui, "Shadow Angle", &mut t.shadow_angle, 0.0..=360.0, d.shadow_angle, Fmt::Deg);
+                k::slider(ui, "Shadow Softness", &mut t.shadow_blur, 0.0..=0.3, d.shadow_blur, Fmt::Amount);
+            }
+            ui.add_space(2.0);
+        }) {
+            t.fill = d.fill;
+            t.gradient = false;
+            t.fill2 = d.fill2;
+            t.gradient_angle = d.gradient_angle;
+            t.outline = 0.0;
+            t.outline_color = d.outline_color;
+            t.shadow = 0.0;
+            t.shadow_color = d.shadow_color;
+            t.shadow_distance = d.shadow_distance;
+            t.shadow_angle = d.shadow_angle;
+            t.shadow_blur = d.shadow_blur;
+        }
+        if k::section(ui, "Text Shape", t.shape != 0, |ui| {
+            let mut sh = t.shape.min(2) as usize;
+            if k::segmented(ui, "text_shape", &mut sh, &["Straight", "Arc", "Wave"]) {
+                t.shape = sh as u8;
+            }
+            ui.add_space(4.0);
+            match t.shape {
+                1 => {
+                    k::slider(ui, "Bend", &mut t.bend, -1.0..=1.0, d.bend, Fmt::Signed);
+                    k::caption(ui, "100 bends the line into half a circle; type 200 for a full circle, or a negative number to bend it the other way.");
+                }
+                2 => {
+                    k::slider(ui, "Wave Height", &mut t.bend, -2.0..=2.0, d.bend, Fmt::Signed);
+                    k::slider(ui, "Waves", &mut t.waves, 0.25..=6.0, d.waves, Fmt::Num);
+                }
+                _ => k::caption(ui, "Bend the line of text into an arc or a wave. For any other shape, use Perspective or Mesh under Transform."),
+            }
+            ui.add_space(2.0);
+        }) {
+            t.shape = 0;
+            t.bend = d.bend;
+            t.waves = d.waves;
+        }
+        if t != spec {
+            self.set_text(i, t);
+        }
+        if add_font {
+            self.pick_font(&ctx);
+        }
+    }
+
     /// Fit (false) or fill (true) the visible canvas with the selected layer.
     fn fit_layer(&mut self, i: usize, fill: bool) {
         let (fw, fh) = self.frame_dims();
@@ -3063,8 +3700,28 @@ impl App {
 
     fn layer_begin(&mut self, o: Pos2, ctx: &egui::Context) {
         let map = self.mask_map(self.last_img_rect);
+        // bending: grab a perspective corner or a mesh point
+        if self.warp_mode != 0
+            && let Some(i) = self.selected_layer().filter(|&i| !self.params.layers[i].locked)
+        {
+            let l = &self.params.layers[i];
+            let hit = warp_handles(l, &map, self.warp_mode)
+                .into_iter()
+                .enumerate()
+                .map(|(k, p)| (k, p.distance(o)))
+                .filter(|h| h.1 < 13.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((k, _)) = hit {
+                self.warp_drag = Some((k, l.clone()));
+                return;
+            }
+            if layer_contains(l, &map, o) {
+                self.layer_drag = Some(LayerDrag { kind: 0, start: l.clone(), origin: o, anchor: Vec2::ZERO });
+                return;
+            }
+        }
         // grab a handle of the selected layer first
-        if let Some(i) = self.selected_layer().filter(|&i| !self.params.layers[i].locked) {
+        if let Some(i) = self.selected_layer().filter(|&i| !self.params.layers[i].locked && self.warp_mode == 0) {
             let l = &self.params.layers[i];
             let (_, corners, knob) = layer_frame(l, &map);
             let edge = layer_edges(l, &map).into_iter().find(|(_, p)| p.distance(o) < 12.0).map(|e| e.0);
@@ -3121,6 +3778,30 @@ impl App {
     fn layer_overlay(&mut self, ui: &mut Ui, resp: &egui::Response, clip: Rect, img: Rect) {
         let ctx = ui.ctx().clone();
         let map = self.mask_map(img);
+        if let Some((k, start)) = self.warp_drag.clone() {
+            if let (Some(i), Some(p)) = (self.selected_layer(), ctx.input(|inp| inp.pointer.latest_pos())) {
+                let q = screen_to_unit(&start, &map, p);
+                let w = &mut self.params.layers[i].warp;
+                match self.warp_mode {
+                    1 if k < 4 => {
+                        let base = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]][k];
+                        w.corners[k] = [q[0] - base[0], q[1] - base[1]];
+                    }
+                    2 if k < w.mesh.len() => {
+                        // the mesh moves points before the perspective: undo the perspective first
+                        if let Some(inv) = crate::layers::Homography::square_to_quad(start.warp.quad()).invert() {
+                            let r = inv.map(q[0], q[1]);
+                            let rest = w.mesh_rest(k);
+                            w.mesh[k] = [r[0] - rest[0], r[1] - rest[1]];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !resp.dragged() || resp.drag_stopped() {
+                self.warp_drag = None;
+            }
+        }
         if let Some(d) = self.layer_drag.clone() {
             if let (Some(i), Some(p)) = (self.selected_layer(), ctx.input(|inp| inp.pointer.latest_pos())) {
                 let (shift, no_snap) = ctx.input(|inp| (inp.modifiers.shift, inp.modifiers.command));
@@ -3260,18 +3941,75 @@ impl App {
         let shadow = Color32::from_black_alpha(110);
         let mut outline = corners.to_vec();
         outline.push(corners[0]);
+        // the bent outline, when there is a bend
+        let bent: Option<Vec<Pos2>> = (!l.warp.is_identity()).then(|| {
+            let (s, co) = l.rotation.to_radians().sin_cos();
+            let mut v: Vec<Pos2> = l.outline(map.long(), 16).into_iter().map(|q| c + vec2(q[0] * co - q[1] * s, q[0] * s + q[1] * co)).collect();
+            v.push(v[0]);
+            v
+        });
         if l.locked {
             // a locked layer only shows where it is, without handles
-            painter.add(egui::Shape::dashed_line(&outline, Stroke::new(1.2, Color32::from_white_alpha(170)), 6.0, 4.0));
+            painter.add(egui::Shape::dashed_line(bent.as_ref().unwrap_or(&outline), Stroke::new(1.2, Color32::from_white_alpha(170)), 6.0, 4.0));
             return;
         }
-        painter.add(egui::Shape::line(outline.clone(), Stroke::new(3.0, Color32::from_black_alpha(70))));
-        painter.add(egui::Shape::line(outline, Stroke::new(1.2, Color32::WHITE)));
-        let top_mid = corners[0] + (corners[1] - corners[0]) * 0.5;
-        painter.line_segment([top_mid, knob], Stroke::new(1.2, Color32::from_white_alpha(200)));
-        // only while the canvas itself is under the pointer, not a sheet or menu above it
         let over_canvas = resp.hovered() || resp.dragged();
         let hover = ctx.input(|inp| inp.pointer.hover_pos()).filter(|p| over_canvas && clip.contains(*p));
+        if self.warp_mode != 0 {
+            let line = bent.clone().unwrap_or_else(|| outline.clone());
+            painter.add(egui::Shape::line(line.clone(), Stroke::new(3.0, Color32::from_black_alpha(70))));
+            painter.add(egui::Shape::line(line, Stroke::new(1.2, Color32::WHITE)));
+            let handles = warp_handles(l, &map, self.warp_mode);
+            if self.warp_mode == 2 && l.warp.has_mesh() {
+                // the mesh grid between its points
+                let (cols, rows) = (l.warp.cols.max(1) as usize, l.warp.rows.max(1) as usize);
+                let st = Stroke::new(1.0, Color32::from_rgba_unmultiplied(10, 132, 255, 200));
+                for r in 0..=rows {
+                    for cidx in 0..=cols {
+                        let k = r * (cols + 1) + cidx;
+                        if cidx < cols {
+                            painter.line_segment([handles[k], handles[k + 1]], st);
+                        }
+                        if r < rows {
+                            painter.line_segment([handles[k], handles[k + cols + 1]], st);
+                        }
+                    }
+                }
+            } else if self.warp_mode == 1 {
+                let mut q = handles.clone();
+                q.push(handles[0]);
+                painter.add(egui::Shape::dashed_line(&q, Stroke::new(1.0, k::ACCENT), 5.0, 4.0));
+            }
+            let active = self.warp_drag.as_ref().map(|d| d.0);
+            for (k, p) in handles.iter().enumerate() {
+                let hot = active == Some(k) || hover.map(|h| h.distance(*p) < 13.0).unwrap_or(false);
+                let r = if hot { 6.5 } else if self.warp_mode == 2 { 4.5 } else { 5.5 };
+                painter.circle_filled(*p + vec2(0.0, 1.0), r + 1.5, shadow);
+                painter.circle_filled(*p, r, Color32::WHITE);
+                painter.circle_stroke(*p, r, Stroke::new(1.5, k::ACCENT));
+            }
+            if active.is_some() {
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if let Some(h) = hover {
+                if handles.iter().any(|p| p.distance(h) < 13.0) {
+                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                } else if layer_contains(l, &map, h) {
+                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                }
+            }
+            return;
+        }
+        if let Some(b) = &bent {
+            // bent: the outline as it is, and the frame that the handles act on
+            painter.add(egui::Shape::line(b.clone(), Stroke::new(3.0, Color32::from_black_alpha(70))));
+            painter.add(egui::Shape::line(b.clone(), Stroke::new(1.2, Color32::WHITE)));
+            painter.add(egui::Shape::dashed_line(&outline, Stroke::new(1.0, Color32::from_white_alpha(150)), 5.0, 4.0));
+        } else {
+            painter.add(egui::Shape::line(outline.clone(), Stroke::new(3.0, Color32::from_black_alpha(70))));
+            painter.add(egui::Shape::line(outline, Stroke::new(1.2, Color32::WHITE)));
+        }
+        let top_mid = corners[0] + (corners[1] - corners[0]) * 0.5;
+        painter.line_segment([top_mid, knob], Stroke::new(1.2, Color32::from_white_alpha(200)));
         let active = self.layer_drag.as_ref().map(|d| d.kind);
         for p in corners {
             let big = active == Some(1) || hover.map(|h| h.distance(p) < 14.0).unwrap_or(false);
@@ -3345,14 +4083,21 @@ impl App {
         let ctx = ui.ctx().clone();
         k::caption(ui, "Place other photos on the canvas. Drag to move, corners to scale, side handles to stretch, the blue knob to rotate. Edges snap to the canvas and, with the magnet, to other layers (hold Ctrl to place freely); arrow keys nudge. You can also drop photos onto the canvas or paste an image with Ctrl+V. Double-click a layer to rename it.");
         ui.add_space(8.0);
+        let mut add_text = false;
         ui.horizontal(|ui| {
             if k::button(ui, "Add Photo…", Btn::Secondary, true).clicked() {
                 self.pick_layer_photos(&ctx);
+            }
+            if k::button(ui, "Add Text", Btn::Secondary, true).on_hover_text("A text layer: any font, colour, outline, shadow, arc or wave").clicked() {
+                add_text = true;
             }
             if self.layers_loading > 0 {
                 ui.spinner();
             }
         });
+        if add_text {
+            self.add_text_layer();
+        }
         ui.add_space(10.0);
 
         // keep each group's layers together, and the selection on the same layer
@@ -3518,8 +4263,9 @@ impl App {
                             },
                             _ => {
                                 let tag = format!(
-                                    "{}{}{}",
+                                    "{}{}{}{}",
                                     if l.locked { "Locked · " } else { "" },
+                                    if l.text.is_some() { "Text · " } else { "" },
                                     l.blend.label(),
                                     if l.opacity < 0.999 { format!(" · {:.0}%", l.opacity * 100.0) } else { String::new() }
                                 );
@@ -3726,9 +4472,16 @@ impl App {
             }
             return;
         }
+        if self.params.layers[i].text.is_some() {
+            self.text_sections(ui, i);
+        }
         let mut fit = None;
         let mut stretch_full = false;
         let has_cutout = self.params.masks.iter().any(|m| m.enabled && m.transparent);
+        if self.warp_mode == 2 && !self.params.layers[i].warp.has_mesh() {
+            self.params.layers[i].warp.set_grid(3, 3);
+        }
+        let warp_mode = &mut self.warp_mode;
         let magnet_before = (self.prefs.magnet, self.prefs.magnet_pivot);
         let l = &mut self.params.layers[i];
         let prefs = &mut self.prefs;
@@ -3766,7 +4519,39 @@ impl App {
             l.graded = d.graded;
             l.behind = d.behind;
         }
-        if k::section(ui, "Transform", l.rotation != 0.0 || l.flip || l.stretch != 1.0, |ui| {
+        if k::section(ui, "Transform", l.rotation != 0.0 || l.flip || l.stretch != 1.0 || !l.warp.is_identity(), |ui| {
+            field_label(ui, "Handles");
+            let mut m = (*warp_mode).min(2) as usize;
+            if k::segmented(ui, "warp_mode", &mut m, &["Transform", "Perspective", "Mesh"]) {
+                *warp_mode = m as u8;
+                if m == 2 && !l.warp.has_mesh() {
+                    l.warp.set_grid(3, 3);
+                }
+            }
+            ui.add_space(2.0);
+            k::caption(ui, match *warp_mode {
+                1 => "Drag the four corners to put the layer in perspective: tilt it back, lay it on a wall or a screen.",
+                2 => "Drag the points of the mesh to bend the layer into any shape. Perspective and mesh work together.",
+                _ => "Drag to move, corners to scale, side handles to stretch, the blue knob to turn.",
+            });
+            if *warp_mode == 2 {
+                let mut cols = l.warp.cols.max(1) as f32;
+                let mut rows = l.warp.rows.max(1) as f32;
+                k::slider(ui, "Mesh Columns", &mut cols, 1.0..=8.0, 3.0, Fmt::Px);
+                k::slider(ui, "Mesh Rows", &mut rows, 1.0..=8.0, 3.0, Fmt::Px);
+                let (c, r) = (cols.round().clamp(1.0, 12.0) as u8, rows.round().clamp(1.0, 12.0) as u8);
+                if (c, r) != (l.warp.cols, l.warp.rows) {
+                    l.warp.set_grid(c, r);
+                }
+            }
+            if !l.warp.is_identity() && k::button(ui, "Reset Bend", Btn::Plain, true).on_hover_text("Undo the perspective and mesh").clicked() {
+                let (cols, rows, mesh) = (l.warp.cols, l.warp.rows, l.warp.has_mesh());
+                l.warp = crate::layers::Warp::default();
+                if mesh {
+                    l.warp.set_grid(cols, rows);
+                }
+            }
+            ui.add_space(6.0);
             k::slider(ui, "Position X", &mut l.x, -0.5..=1.5, 0.5, Fmt::Signed);
             k::slider(ui, "Position Y", &mut l.y, -0.5..=1.5, 0.5, Fmt::Signed);
             let mut pct = l.scale * 100.0;
@@ -3799,6 +4584,7 @@ impl App {
             l.rotation = 0.0;
             l.flip = false;
             l.stretch = 1.0;
+            l.warp = crate::layers::Warp::default();
         }
         if (self.prefs.magnet, self.prefs.magnet_pivot) != magnet_before {
             self.persist();
@@ -4469,6 +5255,7 @@ impl App {
         );
         let has_icc = doc.icc.is_some();
         let has_exif = doc.exif.is_some();
+        let frames = doc.anim.as_ref().map(|a| a.len());
         let long_max = (full_w.max(full_h) as f32 * 2.0).max(1000.0);
         let mut do_export = false;
         let mut cancel = false;
@@ -4493,8 +5280,11 @@ impl App {
                         let s = &mut self.export;
                         field_label(ui, "Format");
                         let mut fi = Format::ALL.iter().position(|f| *f == s.format).unwrap_or(0);
-                        if k::segmented(ui, "fmt", &mut fi, &["JPEG", "PNG", "TIFF", "WebP"]) {
+                        if k::segmented(ui, "fmt", &mut fi, &["JPEG", "PNG", "TIFF", "WebP", "GIF"]) {
                             s.format = Format::ALL[fi];
+                        }
+                        if frames.is_some() && s.format != Format::Gif {
+                            k::caption(ui, "Only the frame on screen is exported. Choose GIF to export the whole animation.");
                         }
                         ui.add_space(8.0);
                         match s.format {
@@ -4511,6 +5301,27 @@ impl App {
                             }
                             Format::Webp => {
                                 k::caption(ui, "Lossless, 8-bit.");
+                                ui.add_space(8.0);
+                            }
+                            Format::Gif => {
+                                match frames {
+                                    Some(n) => {
+                                        k::caption(ui, &format!("Animated: all {n} frames, with the edit applied to each, looping."));
+                                        k::switch_row(ui, "New Seed Every Frame", &mut s.reseed_frames);
+                                        k::caption(ui, "Grain and glitches change from frame to frame, so they flicker like film.");
+                                    }
+                                    None => k::caption(ui, "256 colours per frame. Cut-out areas stay transparent."),
+                                }
+                                ui.add_space(4.0);
+                                field_label(ui, "Colors");
+                                let mut q = match s.gif_speed {
+                                    0..=4 => 0,
+                                    5..=15 => 1,
+                                    _ => 2,
+                                };
+                                if k::segmented(ui, "gif_q", &mut q, &["Best", "Balanced", "Fast"]) {
+                                    s.gif_speed = [1, 10, 25][q];
+                                }
                                 ui.add_space(8.0);
                             }
                         }
@@ -4566,6 +5377,7 @@ impl App {
                         let depth = if s.format.supports_16() && s.depth16 { "16-bit" } else { "8-bit" };
                         let detail = match s.format {
                             Format::Jpeg => format!("JPEG {}", (s.quality * 100.0).round()),
+                            Format::Gif => format!("GIF · {} frame{}", frames.unwrap_or(1), if frames.unwrap_or(1) == 1 { "" } else { "s" }),
                             f => format!("{} {depth}", f.label()),
                         };
                         let profile = if icc { "embedded profile" } else { "sRGB" };
@@ -4626,6 +5438,8 @@ impl App {
         let top = screen.top() + 64.0 - (1.0 - t) * 28.0;
         let before = self.prefs.clone();
         let (mut import, mut export_all, mut reveal) = (false, false, false);
+        let mut check_now = false;
+        let mut show_update: Option<crate::update::Release> = None;
         let max_h = (screen.height() - 90.0).max(300.0);
 
         egui::Area::new(Id::unique("settings_sheet"))
@@ -4650,7 +5464,7 @@ impl App {
                             });
                         });
                         ui.add_space(10.0);
-                        egui::ScrollArea::vertical().max_height(max_h - 70.0).auto_shrink([false, true]).show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(max_h - 70.0).min_scrolled_height((max_h - 70.0).min(620.0)).auto_shrink([false, true]).show(ui, |ui| {
                             let p = &mut self.prefs;
                             group(ui, "Preview");
                             field_label(ui, "Quality");
@@ -4673,7 +5487,15 @@ impl App {
                             k::segmented(ui, "pref_hist", &mut p.histogram, &["RGB", "Luminance"]);
                             ui.add_space(6.0);
                             k::switch_row(ui, "Show Render Time", &mut p.show_render_time);
-                            k::switch_row(ui, "Reduce Motion", &mut p.reduce_motion);
+                            ui.add_space(12.0);
+
+                            group(ui, "Pixels");
+                            k::switch_row(ui, "Pixel View", &mut p.pixel_view);
+                            k::caption(ui, "Zoomed in on a picture's real pixels (a 32 × 32 sprite, a screenshot, pixel art), show each pixel as a sharp square, like Paint, instead of smoothing it. Small pictures also fill the canvas in whole steps.");
+                            if p.pixel_view {
+                                k::switch_row(ui, "Pixel Grid", &mut p.pixel_grid);
+                                k::caption(ui, "Lines between the pixels once each one is at least 8 screen pixels big.");
+                            }
                             ui.add_space(12.0);
 
                             group(ui, "Guides");
@@ -4704,6 +5526,38 @@ impl App {
                             });
                             ui.add_space(12.0);
 
+                            group(ui, "Updates");
+                            k::switch_row(ui, "Check for Updates", &mut self.prefs.check_updates);
+                            k::caption(ui, "When Still starts, it asks GitHub whether a newer version is out and tells you.");
+                            k::switch_row(ui, "Install Updates Automatically", &mut self.prefs.auto_update);
+                            k::caption(ui, if crate::update::can_self_update() {
+                                "A new version downloads in the background and replaces this one; it starts the next time you open Still."
+                            } else {
+                                "This copy was built from source, so it can't replace itself: you'll get a notice and a link to the download instead."
+                            });
+                            ui.horizontal(|ui| {
+                                let busy = matches!(self.update, Upd::Checking | Upd::Downloading(..));
+                                if k::button(ui, "Check Now", Btn::Secondary, !busy).clicked() {
+                                    check_now = true;
+                                }
+                                let status = match &self.update {
+                                    Upd::Checking => "Checking…".to_string(),
+                                    Upd::UpToDate => format!("Still {} is the latest version.", crate::update::CURRENT),
+                                    Upd::Available(r) => format!("Still {} is available.", r.version),
+                                    Upd::Downloading(r, f) => format!("Downloading {}… {:.0}%", r.version, f * 100.0),
+                                    Upd::Ready(r, _) => format!("Still {} is installed; restart to use it.", r.version),
+                                    Upd::Failed(e) => e.clone(),
+                                    Upd::Idle => String::new(),
+                                };
+                                ui.label(egui::RichText::new(status).size(12.0).color(k::LABEL2));
+                            });
+                            if let Upd::Available(r) = &self.update
+                                && k::button(ui, "Show Update", Btn::Plain, true).clicked()
+                            {
+                                show_update = Some(r.clone());
+                            }
+                            ui.add_space(12.0);
+
                             group(ui, "About");
                             k::caption(ui, &format!("Still {} · settings in {}", env!("CARGO_PKG_VERSION"), io::config_dir().display()));
                             if k::button(ui, "Show Settings Folder", Btn::Plain, true).clicked() {
@@ -4718,7 +5572,21 @@ impl App {
             if self.prefs.preview_quality != before.preview_quality {
                 self.rebuild_preview(ctx);
             }
+            if self.prefs.pixel_view != before.pixel_view {
+                // re-make the textures with the other filtering
+                self.last_sent = None;
+                if let Some(doc) = &self.doc {
+                    self.orig_tex = Some(ctx.load_texture("original", to_color_image(&doc.preview), tex_options(self.orig_true_px, self.prefs.pixel_view)));
+                }
+            }
             self.persist();
+        }
+        if check_now {
+            self.check_updates(ctx, true);
+        }
+        if show_update.is_some() {
+            self.update_hidden = false;
+            self.settings_open = false;
         }
         if import {
             self.settings_open = false;
@@ -4865,6 +5733,85 @@ fn rename_field(ui: &mut Ui, r: Rect, buf: &mut String, focus: &mut bool) -> Ren
     } else {
         RenameOutcome::Editing
     }
+}
+
+/// A labelled colour swatch that opens a colour picker.
+fn color_row(ui: &mut Ui, label: &str, c: &mut [u8; 4]) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(30.0);
+        ui.label(egui::RichText::new(label).color(k::LABEL2).size(13.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut col = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+            if egui::color_picker::color_edit_button_srgba(ui, &mut col, egui::color_picker::Alpha::OnlyBlend).changed() {
+                *c = col.to_srgba_unmultiplied();
+            }
+            ui.label(egui::RichText::new(format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2])).font(k::font_mono(11.5)).color(k::LABEL3));
+        });
+    });
+}
+
+/// A seed: type one, roll a random one, copy it, paste one copied elsewhere.
+/// With `main` (an effect's own seed), 0 means "follow the main seed", shown
+/// greyed with its value; giving it any number pins the effect to that.
+fn seed_row(ui: &mut Ui, id: &str, seed: &mut u32, main: Option<u32>, clip: &mut Option<u32>) {
+    let follows = main.is_some() && *seed == 0;
+    let shown = if follows { main.unwrap_or(0) } else { *seed };
+    let fid = ui.make_persistent_id(("seed_field", id));
+    // label and number on one line, the buttons under them (the sidebar is narrow)
+    ui.horizontal(|ui| {
+        ui.set_min_height(30.0);
+        ui.label(egui::RichText::new(if main.is_some() { "Seed" } else { "Main Seed" }).size(13.0).color(k::LABEL2));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut buf = ui.data(|d| d.get_temp::<String>(fid)).unwrap_or_else(|| shown.to_string());
+            let te = egui::TextEdit::singleline(&mut buf)
+                .id(fid.with("te"))
+                .font(k::font_mono(12.0))
+                .text_color(if follows { k::LABEL3 } else { k::LABEL })
+                .align(egui::Align2::RIGHT_CENTER)
+                .desired_width(110.0)
+                .margin(egui::Margin::symmetric(6, 4));
+            let r = ui.add(te).on_hover_text(if follows { "Follows the main seed. Type a number to give this effect its own." } else { "Type any whole number" });
+            if r.has_focus() {
+                ui.data_mut(|d| d.insert_temp(fid, buf.clone()));
+            }
+            if r.lost_focus() {
+                ui.data_mut(|d| d.remove::<String>(fid));
+                let digits: String = buf.chars().filter(|c| c.is_ascii_digit()).collect();
+                if let Ok(v) = digits.parse::<u64>() {
+                    // for an effect, 0 means "follow the main seed"
+                    *seed = (v % (u32::MAX as u64 + 1)) as u32;
+                }
+            }
+            if follows {
+                ui.label(egui::RichText::new("main").size(11.0).color(k::LABEL3));
+            } else if main.is_some() && k::button(ui, "Use Main", Btn::Plain, true).on_hover_text("Follow the main seed again").clicked() {
+                *seed = 0;
+            }
+        });
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let paste = clip.filter(|v| *v != shown);
+            if k::button(ui, "Paste", Btn::Plain, paste.is_some())
+                .on_hover_text(match clip {
+                    Some(v) => format!("Use the copied seed {v}"),
+                    None => "Copy a seed first".into(),
+                })
+                .clicked()
+                && let Some(v) = paste
+            {
+                *seed = v;
+            }
+            if k::button(ui, "Copy", Btn::Plain, true).on_hover_text("Copy this seed (also to the clipboard)").clicked() {
+                *clip = Some(shown);
+                ui.ctx().copy_text(shown.to_string());
+            }
+            if k::button(ui, if main.is_some() { "Random" } else { "Shuffle" }, Btn::Secondary, true).on_hover_text("A new random seed").clicked() {
+                *seed = random_seed();
+            }
+        });
+    });
 }
 
 /// A small uppercase group heading inside a sheet.
@@ -5018,6 +5965,108 @@ mod tests {
         settle(&mut h, |a| !a.params.layers.is_empty());
         settle(&mut h, |a| a.tex_frame == Frame::Unbordered && rendered(a));
         h
+    }
+
+    #[test]
+    fn e2e_animated_gif_plays_and_steps_frames() {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        let dir = temp_dir("gif");
+        let gif = dir.join("anim.gif");
+        {
+            let mut enc = GifEncoder::new(std::fs::File::create(&gif).unwrap());
+            enc.set_repeat(Repeat::Infinite).unwrap();
+            for c in [[250u8, 10, 10, 255], [10, 250, 10, 255], [10, 10, 250, 255]] {
+                let img = image::RgbaImage::from_pixel(48, 32, image::Rgba(c));
+                enc.encode_frame(image::Frame::from_parts(img, 0, 0, image::Delay::from_numer_denom_ms(40, 1))).unwrap();
+            }
+        }
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_eframe(move |cc| App::new(cc, Some(gif)));
+        settle(&mut h, |a| a.doc.is_some());
+        assert!(h.state().playing, "an animation starts playing");
+        assert_eq!(h.state().doc.as_ref().unwrap().anim.as_ref().unwrap().len(), 3);
+        // it moves on by itself
+        settle(&mut h, |a| a.doc.as_ref().map(|d| d.frame != 0).unwrap_or(false));
+        // stepping by hand stops playback and shows that frame
+        h.state_mut().playing = false;
+        let ctx = h.ctx.clone();
+        h.state_mut().goto_frame(2, &ctx);
+        let d = h.state().doc.as_ref().unwrap();
+        assert_eq!(d.frame, 2);
+        assert!(d.preview.px[0][2] > 0.9 && d.preview.px[0][0] < 0.2, "the blue frame is the source");
+        settle(&mut h, rendered);
+        let img = h.state().last_image.clone().unwrap();
+        let px = img.pixels[img.size[0] * 3 + 3];
+        assert!(px.b() > 200 && px.r() < 60, "the blue frame was rendered: {px:?}");
+        // small: shown as real pixels, in whole steps
+        settle(&mut h, rendered);
+        assert!(h.state().tex_true_px, "the preview is the picture's own pixels");
+    }
+
+    #[test]
+    fn e2e_typing_a_slider_value_beyond_its_range() {
+        let dir = temp_dir("typed");
+        let photo = test_photo(&dir);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_eframe(move |cc| App::new(cc, Some(photo)));
+        settle(&mut h, |a| a.doc.is_some());
+        settle(&mut h, rendered);
+        // the Exposure readout sits at the right end of the first slider in Adjust
+        click(&mut h, pos2(1360.0, 301.0), egui::Modifiers::NONE);
+        h.event(egui::Event::Text("9,5".into()));
+        h.step();
+        h.key_press(egui::Key::Enter);
+        h.step();
+        h.step();
+        assert_eq!(h.state().params.exposure, 9.5, "typed past the slider's +3 end");
+        // Escape leaves the value alone
+        click(&mut h, pos2(1360.0, 301.0), egui::Modifiers::NONE);
+        h.event(egui::Event::Text("1".into()));
+        h.step();
+        h.key_press(egui::Key::Escape);
+        h.step();
+        h.step();
+        assert_eq!(h.state().params.exposure, 9.5);
+        settle(&mut h, rendered);
+    }
+
+    #[test]
+    fn e2e_text_layer_keeps_its_letter_size_while_typing() {
+        let mut h = open_with_layer("text");
+        h.state_mut().add_text_layer();
+        let i = h.state().params.layers.len() - 1;
+        let (s0, a0) = (h.state().params.layers[i].scale, h.state().params.layers[i].aspect);
+        assert_eq!(h.state().params.layers[i].name, "Text");
+        let mut t = h.state().params.layers[i].text.clone().unwrap();
+        t.text = "Text Text".into();
+        h.state_mut().set_text(i, t);
+        let l = &h.state().params.layers[i];
+        assert!(l.scale > s0 * 1.6, "the layer widened with the text: {} vs {s0}", l.scale);
+        assert!(l.aspect > a0 * 1.6);
+        assert_eq!(l.name, "Text Text", "the name follows the text");
+        // letters stay the same height on the canvas
+        let (h0, h1) = (s0 / a0, l.scale / l.aspect);
+        assert!((h0 - h1).abs() / h0 < 0.05, "height {h0} vs {h1}");
+        settle(&mut h, rendered);
+    }
+
+    #[test]
+    fn e2e_perspective_corner_drag_bends_the_layer() {
+        let mut h = open_with_layer("warp");
+        let tab = TABS.iter().position(|t| t.0 == Tab::Layers).unwrap();
+        h.state_mut().tab = tab;
+        h.state_mut().layer_sel = Some(0);
+        h.state_mut().warp_mode = 1;
+        h.step();
+        let map = h.state().mask_map(h.state().last_img_rect);
+        let corner = warp_handles(&h.state().params.layers[0], &map, 1)[1];
+        drag(&mut h, corner, corner + vec2(-30.0, 25.0));
+        let w = &h.state().params.layers[0].warp;
+        assert!(w.corners[1][0] < -0.05 && w.corners[1][1] > 0.05, "top-right corner moved in and down: {:?}", w.corners[1]);
+        assert!(w.corners[0] == [0.0, 0.0], "the others stay");
+        // inside the trapezoid still picks the layer; the cut-away corner doesn't
+        let map = h.state().mask_map(h.state().last_img_rect);
+        let l = &h.state().params.layers[0];
+        assert!(layer_contains(l, &map, unit_to_screen(l, &map, [0.5, 0.5])));
+        assert!(!layer_contains(l, &map, unit_to_screen(l, &map, [0.98, 0.02])));
     }
 
     #[test]

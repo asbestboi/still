@@ -44,13 +44,14 @@ pub fn font_mono(size: f32) -> FontId {
 // Fonts: prefer a neo-grotesque close to SF Pro, from the system.
 // ---------------------------------------------------------------------------
 
+/// Bundled so the interface looks the same on every system (Adwaita Sans,
+/// an Inter derivative, SIL Open Font License: see assets/fonts/OFL.txt).
+/// It is also the default font of text layers.
+pub static UI_FONT: &[u8] = include_bytes!("../assets/fonts/AdwaitaSans-Regular.ttf");
+
 pub fn setup_fonts(ctx: &egui::Context) {
     use egui::epaint::text::{FontData, FontDefinitions, VariationCoords};
     use std::sync::Arc;
-
-    // Bundled so the interface looks the same on every system (Adwaita Sans,
-    // an Inter derivative, SIL Open Font License: see assets/fonts/OFL.txt).
-    static UI_FONT: &[u8] = include_bytes!("../assets/fonts/AdwaitaSans-Regular.ttf");
 
     let mut defs = FontDefinitions::default();
     let fallbacks = defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
@@ -144,18 +145,7 @@ struct SpringState {
 /// Animate towards `target` with a spring described by Apple's two designer
 /// parameters: `damping` (1.0 = critically damped) and `response` (seconds).
 /// Always continues from the current on-screen value, so it is interruptible.
-static REDUCE_MOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// With Reduce Motion on, springs jump straight to their target.
-pub fn set_reduce_motion(on: bool) {
-    REDUCE_MOTION.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
 pub fn spring(ctx: &egui::Context, id: Id, target: f32, damping: f32, response: f32) -> f32 {
-    if REDUCE_MOTION.load(std::sync::atomic::Ordering::Relaxed) {
-        ctx.data_mut(|d| d.insert_temp(id, SpringState { pos: target, vel: 0.0 }));
-        return target;
-    }
     let dt = ctx.input(|i| i.stable_dt).min(1.0 / 20.0);
     let mut s = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || SpringState { pos: target, vel: 0.0 }));
     let k = (std::f32::consts::TAU / response.max(0.01)).powi(2);
@@ -199,21 +189,83 @@ pub enum Fmt {
     Deg,
     /// integer pixels
     Px,
+    /// a plain number with two decimals
+    Num,
 }
 
 fn format_value(v: f32, fmt: Fmt) -> String {
     match fmt {
         Fmt::Signed => {
-            let n = (v * 100.0).round() as i32;
+            let n = (v as f64 * 100.0).round() as i64;
             if n > 0 { format!("+{n}") } else { format!("{n}") }
         }
-        Fmt::Amount => format!("{}", (v * 100.0).round() as i32),
+        Fmt::Amount => format!("{}", (v as f64 * 100.0).round() as i64),
         Fmt::Ev => {
             if v.abs() < 0.005 { "0.00".into() } else { format!("{v:+.2}") }
         }
         Fmt::Deg => format!("{v:.1}°"),
-        Fmt::Px => format!("{}", v.round() as i32),
+        Fmt::Px => format!("{}", v.round() as i64),
+        Fmt::Num => format!("{v:.2}"),
     }
+}
+
+/// The number as it appears in the text field when typing a value.
+fn edit_text(v: f32, fmt: Fmt) -> String {
+    let shown = match fmt {
+        Fmt::Signed | Fmt::Amount => v as f64 * 100.0,
+        _ => v as f64,
+    };
+    let s = format!("{:.2}", shown);
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" { "0".into() } else { s.to_string() }
+}
+
+/// The largest number (as shown) that may be typed into a slider.
+pub const TYPED_LIMIT: f64 = 1e9;
+
+/// A typed value back to the slider's units. Accepts a comma for the decimal
+/// point, and ignores `+`, `%` and `°`. Any finite number is allowed: typing
+/// is how values beyond the slider's range are reached.
+pub fn parse_typed(s: &str, fmt: Fmt) -> Option<f32> {
+    let t: String = s.trim().chars().filter(|c| !matches!(c, '°' | '%' | '+' | ' ' | '\u{a0}')).map(|c| if c == ',' { '.' } else { c }).collect();
+    let n: f64 = t.parse().ok()?;
+    if !n.is_finite() {
+        return None;
+    }
+    let n = n.clamp(-TYPED_LIMIT, TYPED_LIMIT);
+    Some(match fmt {
+        Fmt::Signed | Fmt::Amount => n / 100.0,
+        _ => n,
+    } as f32)
+}
+
+/// A small text field for typing a number. Returns `Some(text)` once Enter is
+/// pressed or the field loses focus, `None` while editing; Escape cancels
+/// (`Some(None)` from the outer option).
+fn number_field(ui: &mut Ui, rect: Rect, id: Id, buf: &mut String, first: bool) -> Option<Option<String>> {
+    let te = egui::TextEdit::singleline(buf)
+        .id(id)
+        .font(font_mono(11.5))
+        .align(egui::Align2::RIGHT_CENTER)
+        .margin(egui::Margin::symmetric(4, 2))
+        .desired_width(rect.width());
+    let out = ui.put(rect, te);
+    if first {
+        out.request_focus();
+        // start with the whole number selected, so typing replaces it
+        if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), id) {
+            let n = buf.chars().count();
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(n))));
+            st.store(ui.ctx(), id);
+        }
+    }
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) && (out.has_focus() || out.lost_focus()) {
+        return Some(None);
+    }
+    if out.lost_focus() {
+        return Some(Some(buf.clone()));
+    }
+    None
 }
 
 pub fn slider(
@@ -230,8 +282,45 @@ pub fn slider(
     let id = resp.id;
     let ctx = ui.ctx().clone();
 
+    // The number on the right: click it to type any value, also far beyond
+    // the slider's range. Registered after the slider, so it takes the click.
+    let shown = format_value(*value, fmt);
+    let text_w = ui.painter().layout_no_wrap(shown.clone(), font_mono(11.5), LABEL).size().x;
+    let val_rect = Rect::from_min_max(pos2(rect.right() - text_w.max(30.0) - 8.0, rect.top()), pos2(rect.right() + 2.0, rect.top() + 22.0));
+    let edit_id = id.with("typed");
+    let mut editing: Option<String> = ctx.data(|d| d.get_temp::<String>(edit_id));
+    let mut first = false;
+    // it also takes drags, or egui would hand a press here to the slider underneath
+    let val_resp = ui.interact(val_rect, id.with("value"), Sense::click_and_drag());
+    if editing.is_none() && val_resp.clicked() {
+        editing = Some(edit_text(*value, fmt));
+        first = true;
+    }
+    if val_resp.hovered() && editing.is_none() {
+        ctx.set_cursor_icon(egui::CursorIcon::Text);
+    }
+    if let Some(mut buf) = editing {
+        let field = Rect::from_min_max(pos2(rect.right() - 86.0, rect.top() + 1.0), pos2(rect.right() + 2.0, rect.top() + 21.0));
+        match number_field(ui, field, edit_id.with("field"), &mut buf, first) {
+            None => ctx.data_mut(|d| {
+                d.insert_temp(edit_id, buf);
+            }),
+            Some(done) => {
+                ctx.data_mut(|d| d.remove::<String>(edit_id));
+                if let Some(v) = done.and_then(|t| parse_typed(&t, fmt))
+                    && v != *value
+                {
+                    *value = v;
+                    resp.mark_changed();
+                }
+            }
+        }
+    }
+    let editing = ctx.data(|d| d.get_temp::<String>(edit_id)).is_some();
+
     let track = Rect::from_min_max(pos2(rect.left() + 2.0, rect.top() + 28.0), pos2(rect.right() - 2.0, rect.top() + 32.0));
-    let to_x = |v: f32| track.left() + (v - lo) / (hi - lo) * track.width();
+    // a typed value past either end parks the knob at that end
+    let to_x = |v: f32| track.left() + ((v - lo) / (hi - lo)).clamp(0.0, 1.0) * track.width();
     let from_x = |x: f32| lo + ((x - track.left()) / track.width()).clamp(0.0, 1.0) * (hi - lo);
 
     let fine = ui.input(|i| i.modifiers.shift);
@@ -242,7 +331,9 @@ pub fn slider(
         if let Some(p) = resp.interact_pointer_pos() {
             if fine {
                 let dx = ui.input(|i| i.pointer.delta().x);
-                *value = (*value + dx / track.width() * (hi - lo) * 0.1).clamp(lo, hi);
+                // fine steps keep a typed out-of-range value instead of snapping it back
+                let v = *value + dx / track.width() * (hi - lo) * 0.1;
+                *value = if (lo..=hi).contains(value) { v.clamp(lo, hi) } else { v };
             } else {
                 // direct manipulation: the knob is glued to the pointer
                 let nv = from_x(p.x);
@@ -256,6 +347,7 @@ pub fn slider(
 
     let active = resp.is_pointer_button_down_on();
     let modified = (*value - default).abs() > 1e-4;
+    let beyond = *value < lo - 1e-6 || *value > hi + 1e-6;
     let painter = ui.painter_at(rect.expand(6.0));
 
     // label + value
@@ -266,13 +358,20 @@ pub fn slider(
         font(13.0),
         if modified || active { LABEL } else { LABEL2 },
     );
-    painter.text(
-        pos2(rect.right() - 2.0, rect.top() + 11.0),
-        Align2::RIGHT_CENTER,
-        format_value(*value, fmt),
-        font_mono(11.5),
-        if active { LABEL } else if modified { LABEL2 } else { LABEL3 },
-    );
+    if !editing {
+        if val_resp.hovered() {
+            painter.rect_filled(val_rect.shrink2(vec2(2.0, 2.0)), CornerRadius::same(5), FILL);
+        }
+        painter.text(
+            pos2(rect.right() - 2.0, rect.top() + 11.0),
+            Align2::RIGHT_CENTER,
+            format_value(*value, fmt),
+            font_mono(11.5),
+            // beyond the slider's range (typed in): shown in the accent colour
+            if beyond { ACCENT } else if active { LABEL } else if modified { LABEL2 } else { LABEL3 },
+        );
+    }
+    val_resp.on_hover_text_at_pointer("Click to type a value (any number, also beyond the slider)");
 
     // track
     let r = CornerRadius::same(2);
@@ -527,4 +626,24 @@ pub fn chip(ui: &mut Ui, size: egui::Vec2, label: &str, selected: bool) -> Respo
         if selected { LABEL } else { LABEL2 },
     );
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_values_go_beyond_the_slider() {
+        assert_eq!(parse_typed("250", Fmt::Amount), Some(2.5));
+        assert_eq!(parse_typed("-1000", Fmt::Signed), Some(-10.0));
+        assert_eq!(parse_typed("+12,5", Fmt::Ev), Some(12.5));
+        assert_eq!(parse_typed("720°", Fmt::Deg), Some(720.0));
+        assert_eq!(parse_typed("1e4", Fmt::Px), Some(10000.0));
+        assert_eq!(parse_typed("1e99", Fmt::Px), Some(TYPED_LIMIT as f32));
+        assert_eq!(parse_typed("nan", Fmt::Px), None);
+        assert_eq!(parse_typed("abc", Fmt::Px), None);
+        assert_eq!(edit_text(0.25, Fmt::Amount), "25");
+        assert_eq!(edit_text(1.5, Fmt::Ev), "1.5");
+        assert_eq!(format_value(250.0, Fmt::Amount), "25000");
+    }
 }

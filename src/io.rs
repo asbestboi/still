@@ -12,12 +12,64 @@ pub const THUMB_EDGE: u32 = 220;
 pub struct Doc {
     pub path: PathBuf,
     pub name: String,
+    /// The picture being edited: for an animation, the frame on screen.
     pub full: Arc<DynamicImage>,
     pub preview: Arc<Img>,
     pub thumb_src: Arc<Img>,
     pub icc: Option<Vec<u8>>,
     pub exif: Option<Vec<u8>>,
     pub source_desc: String,
+    /// Every frame of an animated GIF (or WebP / APNG); the edit applies to all.
+    pub anim: Option<Arc<Anim>>,
+    /// Which frame `full` and `preview` show.
+    pub frame: usize,
+}
+
+/// The frames of an animation, composited to full size, with their delays.
+pub struct Anim {
+    pub frames: Vec<Arc<DynamicImage>>,
+    /// Milliseconds each frame stays on screen.
+    pub delays: Vec<u32>,
+}
+
+impl Anim {
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+    pub fn delay(&self, i: usize) -> u32 {
+        // browsers show anything under 20 ms as 100 ms; match them
+        self.delays.get(i).copied().filter(|&d| d >= 20).unwrap_or(100)
+    }
+}
+
+impl Doc {
+    /// Another handle on the same photo (the pixels are shared, not copied).
+    pub fn share(&self) -> Doc {
+        Doc {
+            path: self.path.clone(),
+            name: self.name.clone(),
+            full: self.full.clone(),
+            preview: self.preview.clone(),
+            thumb_src: self.thumb_src.clone(),
+            icc: self.icc.clone(),
+            exif: self.exif.clone(),
+            source_desc: self.source_desc.clone(),
+            anim: self.anim.clone(),
+            frame: self.frame,
+        }
+    }
+
+    /// Show frame `i` of an animation (builds its working preview).
+    pub fn show_frame(&mut self, i: usize, preview_edge: u32) {
+        let Some(anim) = &self.anim else { return };
+        let i = i % anim.len().max(1);
+        if i == self.frame {
+            return;
+        }
+        self.frame = i;
+        self.full = anim.frames[i].clone();
+        self.preview = Arc::new(downsized(&self.full, preview_edge));
+    }
 }
 
 pub const RAW_EXTS: &[&str] = &[
@@ -33,7 +85,7 @@ pub fn dialog_exts(exts: &[&str]) -> Vec<String> {
 }
 
 /// Ordinary image formats Still opens (RAW formats are in `RAW_EXTS`).
-pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp", "gif", "tga", "exr", "hdr", "qoi", "pnm"];
+pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "apng", "tif", "tiff", "webp", "bmp", "gif", "tga", "exr", "hdr", "qoi", "pnm"];
 
 /// A photo Still can open, judging by its extension (RAW included).
 pub fn is_openable(path: &Path) -> bool {
@@ -82,13 +134,24 @@ pub fn load(path: &Path, preview_edge: u32) -> Result<Doc, String> {
         let preview = Arc::new(downsized(&full, preview_edge));
         let thumb_src = Arc::new(downsized(&full, THUMB_EDGE));
         let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        return Ok(Doc { path: path.to_path_buf(), name, full: Arc::new(full), preview, thumb_src, icc: None, exif: None, source_desc });
+        return Ok(Doc { path: path.to_path_buf(), name, full: Arc::new(full), preview, thumb_src, icc: None, exif: None, source_desc, anim: None, frame: 0 });
     }
     let reader = ImageReader::open(path)
         .map_err(|e| e.to_string())?
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
     let fmt = reader.format();
+    // an animation opens with every frame, not just the first
+    if let Some(anim) = fmt.and_then(|f| decode_animation(path, f)) {
+        let full = anim.frames[0].clone();
+        let fmt_name = fmt.map(|f| format!("{f:?}").to_uppercase()).unwrap_or_default();
+        let total: u32 = (0..anim.len()).map(|i| anim.delay(i)).sum();
+        let source_desc = format!("{} × {} · {fmt_name} · {} frames · {:.1} s", full.width(), full.height(), anim.len(), total as f32 / 1000.0);
+        let preview = Arc::new(downsized(&full, preview_edge));
+        let thumb_src = Arc::new(downsized(&full, THUMB_EDGE));
+        let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        return Ok(Doc { path: path.to_path_buf(), name, full, preview, thumb_src, icc: None, exif: None, source_desc, anim: Some(Arc::new(anim)), frame: 0 });
+    }
     let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
     let icc = decoder.icc_profile().ok().flatten();
     let mut exif = decoder.exif_metadata().ok().flatten();
@@ -118,7 +181,45 @@ pub fn load(path: &Path, preview_edge: u32) -> Result<Doc, String> {
     let preview = Arc::new(downsized(&full, preview_edge));
     let thumb_src = Arc::new(downsized(&full, THUMB_EDGE));
     let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    Ok(Doc { path: path.to_path_buf(), name, full: Arc::new(full), preview, thumb_src, icc, exif, source_desc })
+    Ok(Doc { path: path.to_path_buf(), name, full: Arc::new(full), preview, thumb_src, icc, exif, source_desc, anim: None, frame: 0 })
+}
+
+/// All frames of an animated GIF, WebP or PNG (APNG). `None` for a still
+/// picture (one frame), so it opens the usual way.
+pub fn decode_animation(path: &Path, fmt: image::ImageFormat) -> Option<Anim> {
+    use image::AnimationDecoder;
+    use std::io::BufReader;
+    let open = || std::fs::File::open(path).ok().map(BufReader::new);
+    let frames: Vec<image::Frame> = match fmt {
+        image::ImageFormat::Gif => image::codecs::gif::GifDecoder::new(open()?).ok()?.into_frames().collect_frames().ok()?,
+        image::ImageFormat::WebP => {
+            let d = image::codecs::webp::WebPDecoder::new(open()?).ok()?;
+            if !d.has_animation() {
+                return None;
+            }
+            d.into_frames().collect_frames().ok()?
+        }
+        image::ImageFormat::Png => {
+            let d = image::codecs::png::PngDecoder::new(open()?).ok()?;
+            if !d.is_apng().ok()? {
+                return None;
+            }
+            d.apng().ok()?.into_frames().collect_frames().ok()?
+        }
+        _ => return None,
+    };
+    if frames.len() < 2 {
+        return None;
+    }
+    let delays = frames
+        .iter()
+        .map(|f| {
+            let (n, d) = f.delay().numer_denom_ms();
+            if d == 0 { 100 } else { (n as f32 / d as f32).round() as u32 }
+        })
+        .collect();
+    let frames = frames.into_iter().map(|f| Arc::new(DynamicImage::ImageRgba8(f.into_buffer()))).collect();
+    Some(Anim { frames, delays })
 }
 
 /// Decode any supported image (RAW included), upright, keeping its alpha.
@@ -155,16 +256,18 @@ pub enum Format {
     Png,
     Tiff,
     Webp,
+    Gif,
 }
 
 impl Format {
-    pub const ALL: [Format; 4] = [Format::Jpeg, Format::Png, Format::Tiff, Format::Webp];
+    pub const ALL: [Format; 5] = [Format::Jpeg, Format::Png, Format::Tiff, Format::Webp, Format::Gif];
     pub fn label(self) -> &'static str {
         match self {
             Format::Jpeg => "JPEG",
             Format::Png => "PNG",
             Format::Tiff => "TIFF",
             Format::Webp => "WebP",
+            Format::Gif => "GIF",
         }
     }
     pub fn ext(self) -> &'static str {
@@ -173,6 +276,18 @@ impl Format {
             Format::Png => "png",
             Format::Tiff => "tif",
             Format::Webp => "webp",
+            Format::Gif => "gif",
+        }
+    }
+    /// The format for a file name's extension.
+    pub fn from_ext(ext: &str) -> Option<Format> {
+        match ext.to_lowercase().as_str() {
+            "jpg" | "jpeg" => Some(Format::Jpeg),
+            "png" => Some(Format::Png),
+            "tif" | "tiff" => Some(Format::Tiff),
+            "webp" => Some(Format::Webp),
+            "gif" => Some(Format::Gif),
+            _ => None,
         }
     }
     pub fn supports_16(self) -> bool {
@@ -198,6 +313,10 @@ pub struct ExportSettings {
     pub keep_metadata: bool,
     pub keep_icc: bool,
     pub suffix: String,
+    /// Animated GIF: give every frame a new arrangement of grain and glitches.
+    pub reseed_frames: bool,
+    /// GIF colour quality: 1 (best, slow) to 30 (fast).
+    pub gif_speed: u8,
 }
 
 impl Default for ExportSettings {
@@ -213,22 +332,30 @@ impl Default for ExportSettings {
             keep_metadata: true,
             keep_icc: true,
             suffix: "-still".into(),
+            reseed_frames: false,
+            gif_speed: 10,
         }
     }
 }
+
+/// The longest edge an export may have. Sizes can be typed freely; past
+/// this the file would not fit in memory.
+pub const MAX_EXPORT_EDGE: f32 = 30000.0;
 
 impl ExportSettings {
     pub fn scale_for(&self, w: u32, h: u32) -> f32 {
-        match self.size_mode {
+        let s = match self.size_mode {
             1 => self.long_edge / w.max(h) as f32,
             2 => self.percent,
             _ => 1.0,
-        }
+        };
+        let long = w.max(h).max(1) as f32;
+        if !s.is_finite() || s <= 0.0 { 1.0 } else { s.clamp(1.0 / long, MAX_EXPORT_EDGE / long) }
     }
 }
 
-pub fn export(doc: &Doc, params: &Params, s: &ExportSettings, path: &Path) -> Result<PathBuf, String> {
-    let full = &doc.full;
+/// Render one source picture through the edit at the export size.
+fn render_for_export(full: &DynamicImage, params: &Params, s: &ExportSettings) -> pipeline::Rendered {
     let scale = s.scale_for(full.width(), full.height());
     let src = if (scale - 1.0).abs() > 1e-3 {
         let nw = ((full.width() as f32 * scale).round() as u32).max(1);
@@ -237,10 +364,57 @@ pub fn export(doc: &Doc, params: &Params, s: &ExportSettings, path: &Path) -> Re
     } else {
         full.to_rgb32f()
     };
-    let r = pipeline::process_ext(&Img::from_rgb32f(&src), params, None);
-    drop(src);
+    let mut r = pipeline::process_ext(&Img::from_rgb32f(&src), params, None);
+    pipeline::output_sharpen(&mut r.img, [0.0, 0.25, 0.5, 0.9][s.sharpen.min(3)]);
+    r
+}
+
+/// A GIF: every frame of an animation through the edit (or the one picture),
+/// looping forever. Cut-out areas become transparent.
+fn export_gif(doc: &Doc, params: &Params, s: &ExportSettings, out: &mut impl Write) -> Result<(), String> {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    let sources: Vec<(Arc<DynamicImage>, u32)> = match &doc.anim {
+        Some(a) => a.frames.iter().enumerate().map(|(i, f)| (f.clone(), a.delay(i))).collect(),
+        None => vec![(doc.full.clone(), 100)],
+    };
+    let mut enc = GifEncoder::new_with_speed(out, s.gif_speed.clamp(1, 30) as i32);
+    enc.set_repeat(Repeat::Infinite).map_err(|e| e.to_string())?;
+    for (i, (src, delay)) in sources.iter().enumerate() {
+        let p = if s.reseed_frames { params.reseeded(i as u32) } else { params.clone() };
+        let r = render_for_export(src, &p, s);
+        let (w, h) = (r.img.w as u32, r.img.h as u32);
+        let mut rgba = to_u8(&r.img, Some(r.alpha.as_deref().unwrap_or(&vec![1.0; r.img.w * r.img.h])));
+        // GIF transparency is on or off
+        for px in rgba.chunks_mut(4) {
+            px[3] = if px[3] >= 128 { 255 } else { 0 };
+        }
+        let buf = image::RgbaImage::from_raw(w, h, rgba).ok_or("frame size mismatch")?;
+        let frame = image::Frame::from_parts(buf, 0, 0, image::Delay::from_numer_denom_ms(*delay, 1));
+        enc.encode_frame(frame).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn export(doc: &Doc, params: &Params, s: &ExportSettings, path: &Path) -> Result<PathBuf, String> {
+    if s.format == Format::Gif {
+        let tmp = path.with_extension("gif.part");
+        let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        let mut out = BufWriter::new(file);
+        let r = export_gif(doc, params, s, &mut out).and_then(|_| out.flush().map_err(|e| e.to_string()));
+        drop(out);
+        return match r {
+            Ok(()) => {
+                std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+                Ok(path.to_path_buf())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        };
+    }
+    let r = render_for_export(&doc.full, params, s);
     let (mut img, alpha) = (r.img, r.alpha);
-    pipeline::output_sharpen(&mut img, [0.0, 0.25, 0.5, 0.9][s.sharpen.min(3)]);
     // JPEG has no transparency: cut-out areas become white
     let alpha = match (alpha, s.format) {
         (Some(a), Format::Jpeg) => {
@@ -304,6 +478,7 @@ pub fn export(doc: &Doc, params: &Params, s: &ExportSettings, path: &Path) -> Re
             Format::Webp => image::codecs::webp::WebPEncoder::new_lossless(&mut out)
                 .write_image(&to_u8(&img, a), w, h, c8)
                 .map_err(|e| e.to_string()),
+            Format::Gif => unreachable!("GIFs are written by export_gif"),
         }
     })();
 
@@ -393,6 +568,17 @@ pub fn config_dir() -> PathBuf {
     base.unwrap_or_else(|| PathBuf::from(".")).join(if cfg!(windows) { "Still" } else { "still" })
 }
 
+/// Open a web page in the default browser.
+pub fn open_url(url: &str) {
+    if cfg!(windows) {
+        let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    } else if cfg!(target_os = "macos") {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    } else {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
 /// Show a folder in the system file manager.
 pub fn reveal(dir: &Path) {
     let cmd = if cfg!(windows) {
@@ -418,7 +604,6 @@ pub struct Prefs {
     /// 0 RGB, 1 Luminance
     pub histogram: usize,
     pub show_render_time: bool,
-    pub reduce_motion: bool,
     pub keep_look: bool,
     /// Linux: talk to Wayland directly. Off runs through XWayland, which is
     /// what makes drag and drop work (winit has no Wayland drag and drop yet).
@@ -428,6 +613,17 @@ pub struct Prefs {
     /// The magnet also turns a layer to its neighbour's angle, and scaling
     /// keeps the side touching a neighbour in place.
     pub magnet_pivot: bool,
+    /// Zoomed in on a picture's real pixels, show them as crisp squares
+    /// (like Paint) instead of smoothing them.
+    pub pixel_view: bool,
+    /// A grid between pixels once they are big enough.
+    pub pixel_grid: bool,
+    /// Look for a newer Still on GitHub at startup.
+    pub check_updates: bool,
+    /// Download and install a newer Still by itself (it applies on restart).
+    pub auto_update: bool,
+    /// A version the user chose to skip.
+    pub skip_version: String,
 }
 
 impl Default for Prefs {
@@ -438,11 +634,15 @@ impl Default for Prefs {
             overlay_color: 0,
             histogram: 0,
             show_render_time: true,
-            reduce_motion: false,
             keep_look: true,
             native_wayland: false,
             magnet: true,
             magnet_pivot: false,
+            pixel_view: true,
+            pixel_grid: true,
+            check_updates: true,
+            auto_update: false,
+            skip_version: String::new(),
         }
     }
 }
@@ -616,6 +816,60 @@ mod tests {
         export(&doc, &params, &ExportSettings { format: Format::Jpeg, keep_metadata: false, ..Default::default() }, &jpg).unwrap();
         assert!(image::open(&jpg).unwrap().to_rgb8().get_pixel(16, 16)[0] > 240);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn animated_gifs_open_with_every_frame_and_export_animated() {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        let dir = std::env::temp_dir().join(format!("still-gif-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("anim.gif");
+        {
+            let mut enc = GifEncoder::new(std::fs::File::create(&src).unwrap());
+            enc.set_repeat(Repeat::Infinite).unwrap();
+            for (i, c) in [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]].into_iter().enumerate() {
+                let img = image::RgbaImage::from_pixel(32, 16, image::Rgba(c));
+                enc.encode_frame(image::Frame::from_parts(img, 0, 0, image::Delay::from_numer_denom_ms(80 + 20 * i as u32, 1))).unwrap();
+            }
+        }
+        let mut doc = load(&src, 64).unwrap();
+        let anim = doc.anim.clone().expect("animated");
+        assert_eq!(anim.len(), 3);
+        assert_eq!(anim.delays, vec![80, 100, 120]);
+        assert!(doc.preview.px[0][0] > 0.9, "first frame is red");
+        doc.show_frame(2, 64);
+        assert!(doc.preview.px[0][2] > 0.9 && doc.preview.px[0][0] < 0.1, "third frame is blue");
+        // export: still three frames, the edit applied to each
+        let out = dir.join("out.gif");
+        let params = Params { mono: true, ..Params::default() };
+        let settings = ExportSettings { format: Format::Gif, ..Default::default() };
+        export(&doc, &params, &settings, &out).unwrap();
+        let back = load(&out, 64).unwrap();
+        let back_anim = back.anim.expect("exported animated");
+        assert_eq!(back_anim.len(), 3);
+        let px = back_anim.frames[0].to_rgb8().get_pixel(4, 4).0;
+        assert!(px[0].abs_diff(px[1]) < 6 && px[1].abs_diff(px[2]) < 6, "black and white applied: {px:?}");
+        // a still picture exports as a one-frame GIF
+        let still_png = dir.join("p.png");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([200, 100, 50])).save(&still_png).unwrap();
+        let still = load(&still_png, 64).unwrap();
+        assert!(still.anim.is_none());
+        let still_gif = dir.join("p.gif");
+        export(&still, &Params::default(), &settings, &still_gif).unwrap();
+        let g = load(&still_gif, 64).unwrap();
+        assert!(g.anim.is_none() && g.full.width() == 8);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn export_sizes_stay_within_reach() {
+        let mut s = ExportSettings { size_mode: 1, long_edge: 1e12, ..Default::default() };
+        assert!(s.scale_for(4000, 3000) * 4000.0 <= MAX_EXPORT_EDGE + 1.0);
+        s.long_edge = f32::NAN;
+        assert_eq!(s.scale_for(4000, 3000), 1.0);
+        s.size_mode = 2;
+        s.percent = -3.0;
+        assert_eq!(s.scale_for(4000, 3000), 1.0);
     }
 
     #[test]

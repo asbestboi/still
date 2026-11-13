@@ -252,6 +252,14 @@ pub struct Params {
     pub border_white: bool,
 
     pub seed: u32,
+    /// Seeds of the seeded effects. 0 follows `seed`, so one Shuffle moves
+    /// them all; any other value pins that effect to its own arrangement.
+    pub seed_sort: u32,
+    pub seed_streaks: u32,
+    pub seed_slices: u32,
+    pub seed_blocks: u32,
+    /// Film grain and CCD noise.
+    pub seed_grain: u32,
 
     /// Local adjustments, applied in order.
     pub masks: Vec<crate::masks::Mask>,
@@ -329,6 +337,11 @@ impl Default for Params {
             border: 0.0,
             border_white: true,
             seed: 1,
+            seed_sort: 0,
+            seed_streaks: 0,
+            seed_slices: 0,
+            seed_blocks: 0,
+            seed_grain: 0,
             masks: Vec::new(),
             layers: Vec::new(),
             layer_groups: Vec::new(),
@@ -354,6 +367,32 @@ impl Params {
         p.layer_groups = self.layer_groups.clone();
         p.retouch = self.retouch.clone();
         p
+    }
+
+    /// The seed an effect actually uses: its own, or the main one when it follows it.
+    pub fn seed_of(&self, own: u32) -> u32 {
+        if own == 0 { self.seed } else { own }
+    }
+
+    /// The same edit with every seed moved on by `step` (a new arrangement of
+    /// grain and glitches, e.g. for each frame of an animation).
+    pub fn reseeded(&self, step: u32) -> Params {
+        let bump = |s: u32| if s == 0 { 0 } else { s.wrapping_add(step.wrapping_mul(7919)).max(1) };
+        Params {
+            seed: self.seed.wrapping_add(step.wrapping_mul(7919)).max(1),
+            seed_sort: bump(self.seed_sort),
+            seed_streaks: bump(self.seed_streaks),
+            seed_slices: bump(self.seed_slices),
+            seed_blocks: bump(self.seed_blocks),
+            seed_grain: bump(self.seed_grain),
+            ..self.clone()
+        }
+    }
+
+    /// The border width as a fraction used for rendering. Typed values may go
+    /// far past the slider; this keeps the output a sane size.
+    pub fn border_amount(&self) -> f32 {
+        if self.border.is_finite() { self.border.clamp(0.0, 3.0) } else { 0.0 }
     }
 
     /// The layers as they render: members of a hidden group count as hidden.
@@ -742,7 +781,7 @@ fn limited(img: &mut Img, a: Option<&Vec<f32>>, f: impl FnOnce(&mut Img)) {
 /// colour. `glow_a` limits the glow to the Effects tab's mask.
 fn look(img: &mut Img, p: &Params, u: f32, glow_a: Option<&[f32]>) {
     // --- Linear-light stage: exposure, white balance, bloom, halation -------
-    let gain = 2f32.powf(p.exposure);
+    let gain = 2f32.powf(p.exposure.clamp(-30.0, 30.0));
     let wb = [
         (1.0 + p.temperature * 0.30) * (1.0 + p.tint * 0.10),
         1.0 - p.tint * 0.18,
@@ -1155,7 +1194,7 @@ fn finish(
     }
 
     // --- Frame -------------------------------------------------------------
-    if p.border > 0.001 {
+    if p.border_amount() > 0.001 {
         let (iw, ih) = (img.w, img.h);
         img = border(&img, p);
         // the border itself is always opaque
@@ -1181,8 +1220,9 @@ fn blocks(img: &mut Img, p: &Params, u: f32) {
     let bh = h.div_ceil(bs);
     // choose blocks, clustered in horizontal runs like real stream corruption
     let mut chosen = vec![false; bw * bh];
-    let mut rng = Rng::new(p.seed, 77);
-    let runs = (p.blocks * p.blocks * (bw * bh) as f32 * 0.08).ceil() as usize;
+    let mut rng = Rng::new(p.seed_of(p.seed_blocks), 77);
+    // typed amounts can be huge: past a few passes over every block nothing changes
+    let runs = ((p.blocks * p.blocks * (bw * bh) as f32 * 0.08).ceil().max(0.0) as usize).min(bw * bh * 3);
     for _ in 0..runs {
         let by = (rng.next() * bh as f32) as usize;
         let bx = (rng.next() * bw as f32) as usize;
@@ -1234,7 +1274,7 @@ fn pixel_sort(img: &mut Img, p: &Params) {
     let mut work = if p.sort_vertical { img.transpose() } else { img.clone() };
     let (w, lo, hi) = (work.w, p.sort_low.min(p.sort_high), p.sort_high.max(p.sort_low));
     let density = p.sort_amount;
-    let seed = p.seed;
+    let seed = p.seed_of(p.seed_sort);
     let rev = p.sort_reverse;
     work.px.par_chunks_mut(w).enumerate().for_each(|(line, row)| {
         // lines are picked in small coherent bands so the result stays calm
@@ -1267,8 +1307,8 @@ fn pixel_sort(img: &mut Img, p: &Params) {
 }
 
 fn slices(img: &mut Img, p: &Params, u: f32) {
-    let n = (p.slices * 14.0).ceil() as usize;
-    let mut rng = Rng::new(p.seed, 31);
+    let n = ((p.slices * 14.0).ceil().max(0.0) as usize).min(4000);
+    let mut rng = Rng::new(p.seed_of(p.seed_slices), 31);
     let w = img.w;
     for _ in 0..n {
         let y0 = (rng.next() * img.h as f32) as usize;
@@ -1283,8 +1323,9 @@ fn slices(img: &mut Img, p: &Params, u: f32) {
 }
 
 fn streaks(img: &mut Img, p: &Params, u: f32) {
-    let n = (p.streaks * 6.0).ceil() as usize;
-    let mut rng = Rng::new(p.seed, 5);
+    let n = ((p.streaks * 6.0).ceil().max(0.0) as usize).min(400);
+    let seed = p.seed_of(p.seed_streaks);
+    let mut rng = Rng::new(seed, 5);
     let (w, h) = (img.w, img.h);
     for s in 0..n {
         let bw = ((2.0 + p.streak_width * 30.0) * u * rng.range(0.5, 1.3)).max(1.0) as usize;
@@ -1299,16 +1340,16 @@ fn streaks(img: &mut Img, p: &Params, u: f32) {
             // smear a row from elsewhere in the frame, so displaced content shows through
             let src_row = if rng.next() < 0.7 { (rng.next() * h as f32) as usize % h } else { y };
             // mostly faithful smears; an occasional segment drifts red or green
-            let cast = if hashf(seg, s as u32 + 9, p.seed) < 0.18 {
+            let cast = if hashf(seg, s as u32 + 9, seed) < 0.18 {
                 if rng.next() < 0.5 { [1.25, 0.9, 0.9] } else { [0.9, 1.15, 0.92] }
             } else {
                 [1.0, 1.0, 1.0]
             };
-            let dark = hashf(seg, s as u32, p.seed) < 0.06;
+            let dark = hashf(seg, s as u32, seed) < 0.06;
             for yy in y..(y + len).min(y_end) {
                 for x in x0..(x0 + bw).min(w) {
                     // per-column jitter of the source column, like a broken readout
-                    let jx = if hashf(x as u32, seg, p.seed) < 0.2 { x.saturating_sub(1) } else { x };
+                    let jx = if hashf(x as u32, seg, seed) < 0.2 { x.saturating_sub(1) } else { x };
                     let mut c = img.px[src_row * w + jx];
                     for i in 0..3 {
                         c[i] = (c[i] * cast[i]).clamp(0.0, 1.0);
@@ -1358,7 +1399,7 @@ fn texture(img: &mut Img, p: &Params, u: f32) {
     let period = ((1.5 + p.scanline_spacing * 8.0) * u).max(2.0);
     let gsize = ((0.4 + p.grain_size * 3.0) * u).max(0.6);
     let nsize = (0.9 * u).max(1.0);
-    let seed = p.seed;
+    let seed = p.seed_of(p.seed_grain);
     let w = img.w;
 
     // value noise sampled on a lattice of `size` pixels
@@ -1446,7 +1487,7 @@ fn vignette(img: &mut Img, p: &Params) {
 }
 
 fn border(img: &Img, p: &Params) -> Img {
-    let b = (p.border * 0.12 * img.w.min(img.h) as f32).round() as usize;
+    let b = (p.border_amount() * 0.12 * img.w.min(img.h) as f32).round() as usize;
     let col = if p.border_white { [0.96, 0.96, 0.95] } else { [0.02, 0.02, 0.02] };
     let (w, h) = (img.w + 2 * b, img.h + 2 * b);
     let mut out = Img { w, h, px: vec![col; w * h] };
@@ -1464,8 +1505,8 @@ pub fn output_size(w: usize, h: usize, p: &Params) -> (usize, usize) {
     let (mut w, mut h) = if p.rotate % 2 == 1 { (h, w) } else { (w, h) };
     let (_, _, cw, ch) = crop_px(w, h, p.crop);
     (w, h) = (cw, ch);
-    if p.border > 0.001 {
-        let b = (p.border * 0.12 * w.min(h) as f32).round() as usize;
+    if p.border_amount() > 0.001 {
+        let b = (p.border_amount() * 0.12 * w.min(h) as f32).round() as usize;
         w += 2 * b;
         h += 2 * b;
     }
@@ -1875,6 +1916,47 @@ mod tests {
 
     /// Cached and uncached renders agree through misses and hits, with and
     /// without layers (whose masks are judged in the cached stage).
+    #[test]
+    fn effects_follow_the_main_seed_until_given_their_own() {
+        let src = gradient(160, 100);
+        let base = Params { slices: 0.8, slice_shift: 0.8, grain: 0.6, ..Params::default() };
+        let a = process(&src, &base);
+        // a different main seed moves everything that follows it
+        let b = process(&src, &Params { seed: 99, ..base.clone() });
+        assert_ne!(a.px, b.px);
+        // pinning both effects to the old main seed brings the old picture back
+        let pinned = Params { seed: 99, seed_slices: 1, seed_grain: 1, ..base.clone() };
+        assert_eq!(process(&src, &pinned).px, a.px);
+        // reseeding gives a new arrangement, and pinned seeds move too
+        assert_ne!(process(&src, &pinned.reseeded(1)).px, a.px);
+        assert_eq!(base.reseeded(0), base);
+    }
+
+    #[test]
+    fn typed_extremes_render_without_running_away() {
+        let src = gradient(120, 80);
+        let wild = Params {
+            exposure: 1e6,
+            border: 1e6,
+            blocks: 1e6,
+            slices: 1e7,
+            streaks: 1e7,
+            bloom: 50.0,
+            bloom_radius: 1e5,
+            astig: 3.0,
+            astig_length: 1e6,
+            lowres: 40.0,
+            grain_size: -50.0,
+            ..Params::default()
+        };
+        let t = std::time::Instant::now();
+        let out = process(&src, &wild);
+        assert!(t.elapsed().as_secs_f32() < 20.0);
+        // the border is capped, so the picture stays a sane size
+        assert!(out.w <= 120 * 3 && out.h <= 80 * 3, "{} x {}", out.w, out.h);
+        assert!(out.px.iter().all(|p| p.iter().all(|v| (0.0..=1.0).contains(v))), "every value is a real colour");
+    }
+
     #[test]
     fn cached_render_matches_uncached() {
         let src = Arc::new(gradient(64, 48));
