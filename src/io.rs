@@ -423,6 +423,11 @@ pub struct Prefs {
     /// Linux: talk to Wayland directly. Off runs through XWayland, which is
     /// what makes drag and drop work (winit has no Wayland drag and drop yet).
     pub native_wayland: bool,
+    /// Layers snap flush against other layers while dragged.
+    pub magnet: bool,
+    /// The magnet also turns a layer to its neighbour's angle, and scaling
+    /// keeps the side touching a neighbour in place.
+    pub magnet_pivot: bool,
 }
 
 impl Default for Prefs {
@@ -436,6 +441,8 @@ impl Default for Prefs {
             reduce_motion: false,
             keep_look: true,
             native_wayland: false,
+            magnet: true,
+            magnet_pivot: false,
         }
     }
 }

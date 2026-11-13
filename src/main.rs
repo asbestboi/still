@@ -6,6 +6,7 @@
 mod app;
 mod io;
 mod layers;
+mod magnet;
 mod masks;
 mod pipeline;
 mod retouch;

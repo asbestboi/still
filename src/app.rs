@@ -188,6 +188,17 @@ struct LayerDrag {
     kind: u8,
     start: Layer,
     origin: Pos2,
+    /// Scaling: the point (in the layer's own frame, -1..1) that stays put.
+    anchor: Vec2,
+}
+
+/// How close (screen pixels) the magnet starts pulling.
+const MAGNET_PX: f32 = 10.0;
+
+/// A layer's rectangle on screen, for the magnet.
+fn layer_box(l: &Layer, map: &Map) -> crate::magnet::Box2 {
+    let (w, h) = l.size(map.long());
+    crate::magnet::Box2 { c: map.n2s([l.x, l.y]), half: vec2(w, h) * 0.5, rot: l.rotation.to_radians() }
 }
 
 /// Screen-space outline of a layer: centre, the four corners, and the rotate knob.
@@ -443,6 +454,8 @@ pub struct App {
     layer_drag: Option<LayerDrag>,
     /// Guides shown while a layer is snapped (screen x / y).
     snap_lines: (Option<f32>, Option<f32>),
+    /// Guides along the edges the magnet pulled a layer onto.
+    magnet_lines: Vec<[Pos2; 2]>,
     /// Layer being dragged in the list, for reordering.
     list_drag: Option<usize>,
     /// Inline rename in the mask / layer list: target, text, focus on next frame.
@@ -537,6 +550,7 @@ impl App {
             layer_sel: None,
             layer_drag: None,
             snap_lines: (None, None),
+            magnet_lines: Vec::new(),
             list_drag: None,
             renaming: None,
             recent: saved.recent.clone(),
@@ -3066,14 +3080,20 @@ impl App {
                 None
             };
             if let Some(kind) = kind {
-                self.layer_drag = Some(LayerDrag { kind, start: l.clone(), origin: o });
+                // scaling a layer stuck to a neighbour keeps the touching side in place
+                let anchor = if kind == 1 && self.prefs.magnet && self.prefs.magnet_pivot {
+                    crate::magnet::touching_anchor(layer_box(l, &map), &self.magnet_targets(i, &map), 1.5)
+                } else {
+                    Vec2::ZERO
+                };
+                self.layer_drag = Some(LayerDrag { kind, start: l.clone(), origin: o, anchor });
                 return;
             }
         }
         // otherwise pick the topmost visible layer under the pointer and move it
         if let Some(i) = (0..self.params.layers.len()).rev().find(|&i| self.layer_pickable(i) && layer_contains(&self.params.layers[i], &map, o)) {
             self.layer_sel = Some(i);
-            self.layer_drag = Some(LayerDrag { kind: 0, start: self.params.layers[i].clone(), origin: o });
+            self.layer_drag = Some(LayerDrag { kind: 0, start: self.params.layers[i].clone(), origin: o, anchor: Vec2::ZERO });
         }
         let _ = ctx;
     }
@@ -3082,6 +3102,12 @@ impl App {
         let map = self.mask_map(self.last_img_rect);
         let hit = (0..self.params.layers.len()).rev().find(|&i| self.layer_pickable(i) && layer_contains(&self.params.layers[i], &map, o));
         self.layer_sel = hit;
+    }
+
+    /// The other layers the magnet pulls layer `i` toward: every one that is shown.
+    fn magnet_targets(&self, i: usize, map: &Map) -> Vec<crate::magnet::Box2> {
+        let shown = self.params.shown_layers();
+        shown.iter().enumerate().filter(|(j, l)| *j != i && l.visible && l.opacity > 0.001).map(|(_, l)| layer_box(l, map)).collect()
     }
 
     /// Can the layer be picked on the canvas? Not when hidden (itself or its group) or locked.
@@ -3100,15 +3126,29 @@ impl App {
                 let (shift, no_snap) = ctx.input(|inp| (inp.modifiers.shift, inp.modifiers.command));
                 let s = &d.start;
                 let c = map.n2s([s.x, s.y]);
+                let magnet = self.prefs.magnet && !no_snap;
+                let pivot = self.prefs.magnet_pivot;
+                let others = if magnet { self.magnet_targets(i, &map) } else { Vec::new() };
+                let start_box = layer_box(s, &map);
                 let l = &mut self.params.layers[i];
                 let upright = (s.rotation.rem_euclid(90.0)).min(90.0 - s.rotation.rem_euclid(90.0)) < 0.01;
                 self.snap_lines = (None, None);
+                self.magnet_lines.clear();
                 match d.kind {
                     0 => {
                         let dl = p - d.origin;
                         let mut nc = c + dl;
-                        // snap edges and centre to the canvas sides and centre
-                        if upright && !no_snap {
+                        let mut rotation = s.rotation;
+                        // the magnet pulls it flush against a neighbouring layer
+                        let caught = magnet.then(|| crate::magnet::snap_move(crate::magnet::Box2 { c: nc, ..start_box }, &others, MAGNET_PX, pivot)).flatten();
+                        if let Some(sn) = caught {
+                            nc = sn.center;
+                            if let Some(r) = sn.rot {
+                                rotation = (r.to_degrees() + 180.0).rem_euclid(360.0) - 180.0;
+                            }
+                            self.magnet_lines = sn.lines;
+                        } else if upright && !no_snap {
+                            // snap edges and centre to the canvas sides and centre
                             let (w, h) = s.size(map.long());
                             let (hw, hh) = if (s.rotation.rem_euclid(180.0) - 90.0).abs() < 1.0 { (h / 2.0, w / 2.0) } else { (w / 2.0, h / 2.0) };
                             let xs = [img.left(), img.center().x, img.right()];
@@ -3127,6 +3167,7 @@ impl App {
                         let n = map.s2n(nc);
                         l.x = n[0];
                         l.y = n[1];
+                        l.rotation = rotation;
                     }
                     3..=6 => {
                         // stretch one side; the opposite side stays where it is
@@ -3140,8 +3181,20 @@ impl App {
                             _ => (ay, -1.0, h0),
                         };
                         let mut len = (len0 + (p - d.origin).dot(axis) * sign).max(4.0);
-                        // snap the moving side to the canvas sides when upright
-                        if upright && !no_snap {
+                        // the magnet pulls the moving side onto a neighbour's edge
+                        let caught = magnet
+                            .then(|| {
+                                let edge = c + axis * sign * (len - len0 / 2.0);
+                                let half = if d.kind <= 4 { vec2(len, h0) } else { vec2(w0, len) } * 0.5;
+                                let b = crate::magnet::Box2 { c: c + axis * sign * (len - len0) / 2.0, half, rot: start_box.rot };
+                                crate::magnet::snap_edge(edge, axis * sign, b, &others, MAGNET_PX)
+                            })
+                            .flatten();
+                        if let Some((dd, line)) = caught {
+                            len = (len + dd).max(4.0);
+                            self.magnet_lines.push(line);
+                        } else if upright && !no_snap {
+                            // snap the moving side to the canvas sides when upright
                             let edge = c + axis * sign * (len - len0 / 2.0);
                             let horizontal = axis.x.abs() > 0.5;
                             let (v, targets) = if horizontal { (edge.x, [img.left(), img.center().x, img.right()]) } else { (edge.y, [img.top(), img.center().y, img.bottom()]) };
@@ -3163,8 +3216,20 @@ impl App {
                         l.y = n[1];
                     }
                     1 => {
-                        let r0 = (d.origin - c).length().max(1.0);
-                        l.scale = (s.scale * (p - c).length() / r0).clamp(0.005, 20.0);
+                        // scale about the centre, or about the side touching a neighbour
+                        let (ax, ay) = start_box.axes();
+                        let fixed = c + ax * (d.anchor.x * start_box.half.x) + ay * (d.anchor.y * start_box.half.y);
+                        let r0 = (d.origin - fixed).length().max(1.0);
+                        let mut k = (p - fixed).length() / r0;
+                        if magnet && let Some((ks, line)) = crate::magnet::snap_scale(start_box, d.anchor, k, &others, MAGNET_PX) {
+                            k = ks;
+                            self.magnet_lines.push(line);
+                        }
+                        l.scale = (s.scale * k).clamp(0.005, 20.0);
+                        let b = crate::magnet::scaled(start_box, d.anchor, l.scale / s.scale.max(1e-6));
+                        let n = map.s2n(b.c);
+                        l.x = n[0];
+                        l.y = n[1];
                     }
                     _ => {
                         let a0 = (d.origin - c).y.atan2((d.origin - c).x);
@@ -3173,6 +3238,9 @@ impl App {
                         deg = (deg + 180.0).rem_euclid(360.0) - 180.0;
                         if shift {
                             deg = (deg / 15.0).round() * 15.0;
+                        } else if magnet && let Some(r) = crate::magnet::snap_rotation(deg.to_radians(), &others, 3f32.to_radians()) {
+                            // line up with a neighbouring layer's angle
+                            deg = (r.to_degrees() + 180.0).rem_euclid(360.0) - 180.0;
                         }
                         l.rotation = deg;
                     }
@@ -3181,6 +3249,7 @@ impl App {
             if !resp.dragged() || resp.drag_stopped() {
                 self.layer_drag = None;
                 self.snap_lines = (None, None);
+                self.magnet_lines.clear();
             }
         }
 
@@ -3223,6 +3292,9 @@ impl App {
         }
         if let Some(y) = self.snap_lines.1 {
             painter.line_segment([pos2(img.left(), y), pos2(img.right(), y)], guide);
+        }
+        for line in &self.magnet_lines {
+            painter.line_segment(*line, Stroke::new(1.5, Color32::from_rgb(255, 214, 10)));
         }
         let kb = active == Some(2) || hover.map(|h| h.distance(knob) < 14.0).unwrap_or(false);
         painter.circle_filled(knob + vec2(0.0, 1.0), 8.5, shadow);
@@ -3271,7 +3343,7 @@ impl App {
             return;
         }
         let ctx = ui.ctx().clone();
-        k::caption(ui, "Place other photos on the canvas. Drag to move, corners to scale, side handles to stretch, the blue knob to rotate. Edges snap to the canvas (hold Ctrl to place freely); arrow keys nudge. You can also drop photos onto the canvas or paste an image with Ctrl+V. Double-click a layer to rename it.");
+        k::caption(ui, "Place other photos on the canvas. Drag to move, corners to scale, side handles to stretch, the blue knob to rotate. Edges snap to the canvas and, with the magnet, to other layers (hold Ctrl to place freely); arrow keys nudge. You can also drop photos onto the canvas or paste an image with Ctrl+V. Double-click a layer to rename it.");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if k::button(ui, "Add Photo…", Btn::Secondary, true).clicked() {
@@ -3657,7 +3729,9 @@ impl App {
         let mut fit = None;
         let mut stretch_full = false;
         let has_cutout = self.params.masks.iter().any(|m| m.enabled && m.transparent);
+        let magnet_before = (self.prefs.magnet, self.prefs.magnet_pivot);
         let l = &mut self.params.layers[i];
+        let prefs = &mut self.prefs;
         let d = Layer::default();
         if k::section(ui, "Blending", l.opacity < 1.0 || l.blend != Blend::Normal || !l.graded || l.behind, |ui| {
             k::slider(ui, "Opacity", &mut l.opacity, 0.0..=1.0, 1.0, Fmt::Amount);
@@ -3702,6 +3776,13 @@ impl App {
             k::slider(ui, "Rotation", &mut l.rotation, -180.0..=180.0, 0.0, Fmt::Deg);
             k::switch_row(ui, "Flip Horizontal", &mut l.flip);
             ui.add_space(4.0);
+            k::switch_row(ui, "Magnet", &mut prefs.magnet);
+            k::caption(ui, "Pulls the layer flush against other layers as you move, scale, stretch or turn it. Hold Ctrl to place freely.");
+            if prefs.magnet {
+                k::switch_row(ui, "Auto Pivot", &mut prefs.magnet_pivot);
+                k::caption(ui, "The layer turns to match the one it snaps to, and scaling keeps the side touching it in place.");
+            }
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if k::button(ui, "Fit", Btn::Secondary, true).clicked() {
                     fit = Some(false);
@@ -3718,6 +3799,9 @@ impl App {
             l.rotation = 0.0;
             l.flip = false;
             l.stretch = 1.0;
+        }
+        if (self.prefs.magnet, self.prefs.magnet_pivot) != magnet_before {
+            self.persist();
         }
         if let Some(fill) = fit {
             self.fit_layer(i, fill);
@@ -4991,6 +5075,72 @@ mod tests {
         let c = map.n2s([l.x, l.y]);
         assert!((c.x - w3 / 2.0 - img.left()).abs() < 1.0 && (c.x + w3 / 2.0 - img.right()).abs() < 1.0);
         assert!((c.y - h3 / 2.0 - img.top()).abs() < 1.0 && (c.y + h3 / 2.0 - img.bottom()).abs() < 1.0);
+    }
+
+    #[test]
+    fn e2e_magnet_pulls_layers_together() {
+        let mut h = open_with_layer("magnet");
+        {
+            let a = h.state_mut();
+            a.prefs.magnet = true;
+            a.prefs.magnet_pivot = false;
+            let mut b = a.params.layers[0].clone();
+            a.params.layers[0].x = 0.3;
+            a.params.layers[0].y = 0.5;
+            a.params.layers[0].scale = 0.2;
+            b.x = 0.75;
+            b.y = 0.52;
+            b.scale = 0.12;
+            a.params.layers.push(b);
+            a.layer_sel = Some(1);
+        }
+        h.step();
+        let img = h.state().last_img_rect;
+        let map = h.state().mask_map(img);
+        let right_of = |l: &Layer| map.n2s([l.x, l.y]).x + l.size(map.long()).0 / 2.0;
+        let left_of = |l: &Layer| map.n2s([l.x, l.y]).x - l.size(map.long()).0 / 2.0;
+        let a_right = right_of(&h.state().params.layers[0]);
+
+        // drag B so its left side ends 6 px short of A's right side: pulled flush
+        let b = h.state().params.layers[1].clone();
+        let from = map.n2s([b.x, b.y]);
+        let to = from + vec2(a_right + 6.0 - left_of(&b), 0.0);
+        drag(&mut h, from, to);
+        let b = h.state().params.layers[1].clone();
+        assert!((left_of(&b) - a_right).abs() < 0.5, "flush: {} vs {a_right}", left_of(&b));
+
+        // with Ctrl held, the magnet lets go
+        h.state_mut().params.layers[1].x += 0.1;
+        let b = h.state().params.layers[1].clone();
+        let from = map.n2s([b.x, b.y]);
+        let to = from + vec2(a_right + 6.0 - left_of(&b), 0.0);
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
+        drag(&mut h, from, to);
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        h.step();
+        let b = h.state().params.layers[1].clone();
+        assert!((left_of(&b) - (a_right + 6.0)).abs() < 1.0, "Ctrl places freely: {}", left_of(&b));
+
+        // auto pivot: a slightly turned layer turns square to its neighbour when caught
+        h.state_mut().prefs.magnet_pivot = true;
+        h.state_mut().params.layers[1].rotation = 7.0;
+        h.state_mut().params.layers[1].x += 0.1;
+        h.step();
+        let b = h.state().params.layers[1].clone();
+        let from = map.n2s([b.x, b.y]);
+        let to = from + vec2(a_right + 5.0 - left_of(&b), 0.0);
+        drag(&mut h, from, to);
+        let b = h.state().params.layers[1].clone();
+        assert!(b.rotation.abs() < 1e-3, "turned to match: {}", b.rotation);
+        assert!((left_of(&b) - a_right).abs() < 0.5, "and flush: {} vs {a_right}", left_of(&b));
+
+        // auto pivot: scaling keeps the side touching the neighbour in place
+        let (_, corners, _) = layer_frame(&b, &map);
+        let w0 = b.size(map.long()).0;
+        drag(&mut h, corners[2], corners[2] + vec2(60.0, 40.0));
+        let b = h.state().params.layers[1].clone();
+        assert!(b.size(map.long()).0 > w0 + 20.0, "it grew");
+        assert!((left_of(&b) - a_right).abs() < 0.5, "the touching side stayed: {} vs {a_right}", left_of(&b));
     }
 
     #[test]
