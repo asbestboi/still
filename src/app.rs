@@ -2,6 +2,7 @@ use crate::io::{self, Doc, ExportSettings, Format};
 use crate::layers::{Blend, Layer};
 use crate::masks::{self, BrushStroke, Local, Mask, Refine, Seed, Shape};
 use crate::pipeline::{self, Aspect, Histogram, Img, Params};
+use crate::retouch::CloneStroke;
 use crate::ui_kit::{self as k, Btn, Fmt};
 use egui::{Align2, Color32, CornerRadius, Id, Pos2, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use std::path::PathBuf;
@@ -56,6 +57,21 @@ fn to_color_image(img: &Img) -> egui::ColorImage {
     egui::ColorImage::from_rgb([img.w, img.h], &rgb)
 }
 
+/// The picture over a grey checkerboard where masks have cut it out.
+fn to_color_image_cutout(img: &Img, alpha: &[f32]) -> egui::ColorImage {
+    let cell = (img.w.max(img.h) / 90).max(4);
+    let mut rgb = Vec::with_capacity(img.w * img.h * 3);
+    for (i, p) in img.px.iter().enumerate() {
+        let (x, y) = (i % img.w, i / img.w);
+        let check = if (x / cell + y / cell).is_multiple_of(2) { 0.42 } else { 0.30 };
+        let a = alpha[i].clamp(0.0, 1.0);
+        for c in p {
+            rgb.push(((c.clamp(0.0, 1.0) * a + check * (1.0 - a)) * 255.0 + 0.5) as u8);
+        }
+    }
+    egui::ColorImage::from_rgb([img.w, img.h], &rgb)
+}
+
 /// The mask as a translucent red wash, like a rubylith.
 fn overlay_image(a: &[f32], w: usize, h: usize, c: u32) -> egui::ColorImage {
     let mut rgba = Vec::with_capacity(w * h * 4);
@@ -99,10 +115,14 @@ fn spawn_worker(ctx: egui::Context, jobs: Receiver<Job>, out: Sender<Msg>) {
                     src
                 };
                 let scale = full_w / src.w.max(1) as f32;
-                let (img, alpha) = pipeline::process_cached(&src, &params, overlay.map(|o| o.0), &mut cache);
-                let overlay = alpha.zip(overlay).map(|(a, (_, rgb))| overlay_image(&a, img.w, img.h, rgb));
-                let hist = pipeline::histogram(&img);
-                let image = Arc::new(to_color_image(&img));
+                let r = pipeline::process_cached(&src, &params, overlay.map(|o| o.0), &mut cache);
+                let img = &r.img;
+                let overlay = r.overlay.zip(overlay).map(|(a, (_, rgb))| overlay_image(&a, img.w, img.h, rgb));
+                let hist = pipeline::histogram(img);
+                let image = Arc::new(match &r.alpha {
+                    Some(a) => to_color_image_cutout(img, a),
+                    None => to_color_image(img),
+                });
                 let ms = t.elapsed().as_secs_f32() * 1000.0;
                 let _ = out.send(Msg::Preview { generation, image, hist, ms, frame, overlay, scale, draft });
                 ctx.request_repaint();
@@ -123,18 +143,20 @@ fn spawn_worker(ctx: egui::Context, jobs: Receiver<Job>, out: Sender<Msg>) {
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
-    Looks,
+    Presets,
     Adjust,
     Masks,
+    Retouch,
     Layers,
     Effects,
     Glitch,
     Crop,
 }
-const TABS: [(Tab, &str); 7] = [
-    (Tab::Looks, "Presets"),
+const TABS: [(Tab, &str); 8] = [
+    (Tab::Presets, "Presets"),
     (Tab::Adjust, "Adjust"),
     (Tab::Masks, "Masks"),
+    (Tab::Retouch, "Retouch"),
     (Tab::Layers, "Layers"),
     (Tab::Effects, "Effects"),
     (Tab::Glitch, "Glitch"),
@@ -288,6 +310,18 @@ fn drag_handle(start: &Shape, id: u8, p: Pos2, delta: Vec2, map: &Map) -> Shape 
     }
 }
 
+/// Index of the object-selection point under `p`, if any.
+fn seed_at(shape: &Shape, map: &Map, p: Pos2) -> Option<usize> {
+    let Shape::Object { seeds, .. } = shape else { return None };
+    seeds
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i, map.n2s(s.p).distance(p)))
+        .filter(|(_, d)| *d < 10.0)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
 /// Composition guides over `r`.
 fn draw_guides(painter: &egui::Painter, r: Rect, thirds: f32, golden: bool) {
     if thirds > 0.01 {
@@ -307,6 +341,35 @@ fn draw_guides(painter: &egui::Painter, r: Rect, thirds: f32, golden: bool) {
             painter.line_segment([pos2(r.min.x, y), pos2(r.max.x, y)], st);
         }
     }
+}
+
+/// A guide line on the crop view for levelling the horizon: its centre as a
+/// fraction of the uncropped preview, and its angle on screen (radians).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Horizon {
+    c: [f32; 2],
+    angle: f32,
+}
+
+impl Horizon {
+    /// Centre and the two end handles on screen.
+    fn points(&self, img: Rect) -> (Pos2, Pos2, Pos2) {
+        let c = img.lerp_inside(vec2(self.c[0], self.c[1]));
+        let d = vec2(self.angle.cos(), self.angle.sin()) * (img.width().min(img.height()) * 0.42).max(60.0);
+        (c, c - d, c + d)
+    }
+    /// 0 centre, 1 / 2 ends.
+    fn hit(&self, img: Rect, p: Pos2) -> Option<u8> {
+        let (c, a, b) = self.points(img);
+        [(0u8, c), (1, a), (2, b)].into_iter().map(|(id, q)| (id, q.distance(p))).filter(|h| h.1 < 14.0).min_by(|x, y| x.1.total_cmp(&y.1)).map(|h| h.0)
+    }
+}
+
+/// Keep a line angle within (-90°, 90°]: a line has no direction.
+fn line_angle(a: f32) -> f32 {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let a = a.rem_euclid(PI);
+    if a > FRAC_PI_2 { a - PI } else { a }
 }
 
 /// Which part of the crop rectangle is being dragged.
@@ -336,8 +399,8 @@ pub struct App {
     hist: Histogram,
     generation: u64,
     shown_gen: u64,
-    /// What the last preview job rendered: params, overlay, draft, detail edge (0 none).
-    last_sent: Option<(Params, Option<(usize, u32)>, bool, u32)>,
+    /// What the last preview job rendered: params, overlay, draft, detail edge (0 none), frame (0 none).
+    last_sent: Option<(Params, Option<(usize, u32)>, bool, u32, Frame)>,
     /// Long edge the current zoom needs to look sharp, in source pixels.
     detail_need: f32,
     /// The sharper source for zooming in, and the edge being built.
@@ -358,12 +421,16 @@ pub struct App {
     mask_sel: Option<usize>,
     mask_drag: Option<MaskDrag>,
     show_overlay: bool,
-    overlay_until: Option<Instant>,
+    /// Keep the red overlay up while a mask is being shaped; it goes away
+    /// once its adjustments are touched.
+    overlay_hold: bool,
     brush_size: f32,
     brush_feather: f32,
     brush_flow: f32,
     brush_erase: bool,
     picking_hue: bool,
+    /// Object selections: clicks place − (remove) points instead of + points.
+    seed_remove: bool,
     guide_thirds: bool,
     guide_golden: bool,
     prefs: io::Prefs,
@@ -384,6 +451,18 @@ pub struct App {
     recent: Vec<PathBuf>,
     layers_loading: usize,
     crop_drag: Option<(Grip, [f32; 4], Pos2)>,
+    horizon: Option<Horizon>,
+    horizon_drag: Option<(u8, Horizon, Pos2)>,
+    /// Clone tool: where to copy from (normalised frame point), and the
+    /// source-minus-brush offset, fixed by the first stroke after choosing it.
+    clone_source: Option<[f32; 2]>,
+    clone_offset: Option<[f32; 2]>,
+    clone_painting: bool,
+    /// The next click on the photo chooses the source.
+    clone_pick_source: bool,
+    clone_size: f32,
+    clone_feather: f32,
+    clone_opacity: f32,
 
     builtin: Vec<(String, Params)>,
     user_presets: Vec<(String, Params)>,
@@ -441,12 +520,13 @@ impl App {
             mask_sel: None,
             mask_drag: None,
             show_overlay: false,
-            overlay_until: None,
+            overlay_hold: false,
             brush_size: 0.45,
             brush_feather: 0.6,
             brush_flow: 1.0,
             brush_erase: false,
             picking_hue: false,
+            seed_remove: false,
             guide_thirds: saved.guide_thirds,
             guide_golden: saved.guide_golden,
             prefs: saved.prefs.clone(),
@@ -462,6 +542,15 @@ impl App {
             recent: saved.recent.clone(),
             layers_loading: 0,
             crop_drag: None,
+            horizon: None,
+            horizon_drag: None,
+            clone_source: None,
+            clone_offset: None,
+            clone_painting: false,
+            clone_pick_source: false,
+            clone_size: 0.35,
+            clone_feather: 0.5,
+            clone_opacity: 1.0,
             builtin: pipeline::builtin_presets(),
             user_presets: saved.presets,
             thumbs: Vec::new(),
@@ -854,6 +943,7 @@ impl App {
                     self.params.masks.clear();
                     self.params.layers.clear();
                     self.params.layer_groups.clear();
+                    self.params.retouch.clear();
                     self.layer_sel = None;
                     self.mask_sel = None;
                     match self.pending_project.take() {
@@ -950,7 +1040,7 @@ impl App {
     fn render_frame(&self) -> Frame {
         match TABS[self.tab].0 {
             Tab::Crop => Frame::Uncropped,
-            Tab::Masks | Tab::Layers => Frame::Unbordered,
+            Tab::Masks | Tab::Retouch | Tab::Layers => Frame::Unbordered,
             _ => Frame::Output,
         }
     }
@@ -959,28 +1049,22 @@ impl App {
         self.mask_sel.filter(|i| *i < self.params.masks.len())
     }
 
-    /// The red mask overlay shows while shaping a mask, briefly after adding
-    /// one, while O is held, or always when switched on.
+    /// The red mask overlay shows while shaping a mask (from adding or
+    /// selecting it until its adjustments are touched), while O is held, or
+    /// always when switched on.
     fn overlay_wanted(&self, ctx: &egui::Context) -> Option<(usize, u32)> {
         let i = self.selected_mask()?;
         if TABS[self.tab].0 != Tab::Masks {
             return None;
         }
         let text_focus = ctx.memory(|m| m.focused().is_some());
-        let flash = self.overlay_until.map(|t| Instant::now() < t).unwrap_or(false);
         let key = !text_focus && ctx.input(|inp| inp.key_down(egui::Key::O));
         // a mask with its own label colour shows its wash in that colour
         let rgb = label_rgb(self.params.masks[i].color).unwrap_or(OVERLAY_COLORS[self.prefs.overlay_color.min(2)]);
-        (self.show_overlay || self.mask_drag.is_some() || flash || key).then_some((i, rgb))
+        (self.show_overlay || self.mask_drag.is_some() || self.overlay_hold || key).then_some((i, rgb))
     }
 
     fn send_preview(&mut self, ctx: &egui::Context) {
-        if let Some(t) = self.overlay_until {
-            let now = Instant::now();
-            if now < t {
-                ctx.request_repaint_after(t - now);
-            }
-        }
         let overlay = self.overlay_wanted(ctx);
         let Some(doc) = &self.doc else { return };
         let frame = self.render_frame();
@@ -1048,16 +1132,17 @@ impl App {
         let detail = detail.filter(|_| !interacting);
         let detail_edge = if detail.is_some() { want.unwrap_or(0) } else { 0 };
 
-        if let Some((p, o, was_draft, de)) = &self.last_sent
+        if let Some((p, o, was_draft, de, f)) = &self.last_sent
             && *p == params
             && *o == overlay
             && *de == detail_edge
+            && *f == frame
             && (!*was_draft || interacting)
         {
             return;
         }
         self.generation += 1;
-        self.last_sent = Some((params.clone(), overlay, interacting, detail_edge));
+        self.last_sent = Some((params.clone(), overlay, interacting, detail_edge, frame));
         self.sent_at = Some(Instant::now());
         let src = detail.unwrap_or_else(|| doc.preview.clone());
         let logical_w = doc.preview.w;
@@ -1123,12 +1208,15 @@ impl App {
         if self.export_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.export_open = false;
         }
+        if self.picking_hue && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.picking_hue = false;
+        }
         if self.settings_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.settings_open = false;
             self.persist();
         }
         if !text_focus {
-            for (i, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7].into_iter().enumerate() {
+            for (i, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8].into_iter().enumerate() {
                 if ctx.input(|inp| inp.key_pressed(key) && inp.modifiers.is_none()) {
                     self.tab = i;
                 }
@@ -1172,6 +1260,17 @@ impl App {
                 }
                 if ctx.input(|inp| inp.key_pressed(Key::CloseBracket)) {
                     self.brush_size = (self.brush_size + 0.05).min(1.0);
+                }
+            }
+            if TABS[self.tab].0 == Tab::Retouch {
+                if ctx.input(|inp| inp.key_pressed(Key::OpenBracket)) {
+                    self.clone_size = (self.clone_size - 0.05).max(0.0);
+                }
+                if ctx.input(|inp| inp.key_pressed(Key::CloseBracket)) {
+                    self.clone_size = (self.clone_size + 0.05).min(1.0);
+                }
+                if self.clone_pick_source && ctx.input(|inp| inp.key_pressed(Key::Escape)) {
+                    self.clone_pick_source = false;
                 }
             }
         }
@@ -1498,6 +1597,7 @@ impl App {
         let cropping = self.crop_mode() && !compare;
         let masking = TABS[self.tab].0 == Tab::Masks && !compare && self.selected_mask().is_some();
         let layering = TABS[self.tab].0 == Tab::Layers && !compare && !self.params.layers.is_empty();
+        let retouching = TABS[self.tab].0 == Tab::Retouch && !compare;
         if cropping {
             self.view.zoom = 1.0;
             self.view.pan = Vec2::ZERO;
@@ -1568,6 +1668,11 @@ impl App {
             {
                 self.mask_click(o, &ctx);
             }
+            if resp.secondary_clicked()
+                && let Some(o) = click_pos(&resp)
+            {
+                self.mask_secondary_click(o);
+            }
         }
 
         if layering && !space_held && self.tex_frame == Frame::Unbordered {
@@ -1583,8 +1688,21 @@ impl App {
             }
         }
 
+        if retouching && !space_held && self.tex_frame == Frame::Unbordered {
+            if resp.drag_started()
+                && let Some(o) = ctx.input(|i| i.pointer.press_origin())
+            {
+                self.clone_begin(o, &ctx);
+            }
+            if resp.clicked()
+                && let Some(o) = click_pos(&resp)
+            {
+                self.clone_click(o, &ctx);
+            }
+        }
+
         // --- drag to pan: 1:1, rubber-banded past the edges, momentum on release
-        if resp.dragged() && self.view.zoom > 1.0 && self.mask_drag.is_none() && self.layer_drag.is_none() {
+        if resp.dragged() && self.view.zoom > 1.0 && self.mask_drag.is_none() && self.layer_drag.is_none() && !self.clone_painting {
             self.view.dragging = true;
             self.view.pan += resp.drag_delta();
         }
@@ -1625,6 +1743,11 @@ impl App {
         let img_rect = Rect::from_center_size(rect.center() + vec2(px, py), size);
         painter.image(tex_id, img_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         self.last_img_rect = img_rect;
+        // the hand for panning goes first, so a tool's own cursor (colour
+        // picker, brush, object crosshair) can replace it
+        if self.view.zoom > 1.0 && (resp.hovered() || resp.dragged()) {
+            ctx.set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        }
         if masking
             && self.tex_frame == Frame::Unbordered
             && let Some(o) = &self.overlay_tex
@@ -1643,9 +1766,8 @@ impl App {
         if layering && self.tex_frame == Frame::Unbordered {
             self.layer_overlay(ui, &resp, rect, img_rect);
         }
-
-        if self.view.zoom > 1.0 && (resp.hovered() || resp.dragged()) {
-            ctx.set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        if retouching && self.tex_frame == Frame::Unbordered {
+            self.clone_overlay(ui, &resp, rect, img_rect);
         }
 
         // status: a quiet activity indicator while a slow render is in flight
@@ -1683,7 +1805,38 @@ impl App {
         let ratio = self.params.aspect.ratio(fw, fh, self.params.aspect_portrait);
         let to_screen = |c: [f32; 4]| Rect::from_min_max(img.lerp_inside(vec2(c[0], c[1])), img.lerp_inside(vec2(c[2], c[3])));
 
+        // the horizon line's handles sit on top of the crop, so they win
         if resp.drag_started()
+            && let Some(o) = ctx.input(|i| i.pointer.press_origin())
+            && let Some(h) = self.horizon
+            && let Some(id) = h.hit(img, o)
+        {
+            self.horizon_drag = Some((id, h, o));
+        }
+        if let Some((id, start, origin)) = self.horizon_drag {
+            if let Some(p) = ctx.input(|i| i.pointer.latest_pos())
+                && let Some(h) = &mut self.horizon
+            {
+                if id == 0 {
+                    let d = p - origin;
+                    h.c = [(start.c[0] + d.x / img.width()).clamp(0.0, 1.0), (start.c[1] + d.y / img.height()).clamp(0.0, 1.0)];
+                } else {
+                    let (c, _, _) = start.points(img);
+                    let v = p - c;
+                    let mut a = line_angle(v.y.atan2(v.x));
+                    // settle onto level when close
+                    if a.abs() < 0.4f32.to_radians() {
+                        a = 0.0;
+                    }
+                    h.angle = a;
+                }
+            }
+            if !resp.dragged() || resp.drag_stopped() {
+                self.horizon_drag = None;
+            }
+        }
+        if resp.drag_started()
+            && self.horizon_drag.is_none()
             && let Some(o) = ctx.input(|i| i.pointer.press_origin())
             && let Some(g) = grip_at(to_screen(self.params.crop), o)
         {
@@ -1716,8 +1869,11 @@ impl App {
 
         let over_canvas = resp.hovered() || resp.dragged();
         let hover = ctx.input(|i| i.pointer.hover_pos()).filter(|p| over_canvas && clip.contains(*p));
+        let on_horizon = self.horizon_drag.is_some() || hover.zip(self.horizon).and_then(|(p, h)| h.hit(img, p)).is_some();
         let active = self.crop_drag.map(|d| d.0).or_else(|| hover.and_then(|h| grip_at(r, h)));
-        if let Some(g) = active {
+        if on_horizon {
+            ctx.set_cursor_icon(if self.horizon_drag.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        } else if let Some(g) = active {
             ctx.set_cursor_icon(match g {
                 Grip::Move => if dragging { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab },
                 Grip::Edge(0, _) => egui::CursorIcon::ResizeVertical,
@@ -1737,9 +1893,9 @@ impl App {
         ] {
             painter.rect_filled(s, CornerRadius::ZERO, shade);
         }
-        // rule of thirds, only while adjusting
+        // rule of thirds: always there while cropping, brighter while adjusting
         let grid_a = k::spring(&ctx, Id::unique("crop_grid"), if dragging { 1.0 } else { 0.0 }, 1.0, 0.25);
-        let thirds = if self.guide_thirds { 1.0 } else { grid_a * 0.8 };
+        let thirds = if self.guide_thirds { 1.0 } else { 0.55 + grid_a * 0.45 };
         draw_guides(&painter, r, thirds, self.guide_golden);
         painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0, Color32::from_white_alpha(210)), egui::StrokeKind::Inside);
         // corner brackets
@@ -1750,6 +1906,29 @@ impl App {
             painter.line_segment([c, c + vec2(sx * len, 0.0)], st);
             painter.line_segment([c, c + vec2(0.0, sy * len)], st);
         }
+        // horizon line
+        if let Some(h) = self.horizon {
+            let (c, a, b) = h.points(img);
+            let dir = (b - a).normalized() * (img.width() + img.height());
+            let ip = ui.painter_at(img);
+            let col = Color32::from_rgb(255, 214, 10);
+            ip.line_segment([c - dir, c + dir], Stroke::new(3.0, Color32::from_black_alpha(90)));
+            ip.line_segment([c - dir, c + dir], Stroke::new(1.5, col));
+            let hot = hover.and_then(|p| h.hit(img, p)).or(self.horizon_drag.map(|d| d.0));
+            for (id, q) in [(0u8, c), (1, a), (2, b)] {
+                let rad = if id == 0 { 7.0 } else { 5.5 } + if hot == Some(id) { 1.5 } else { 0.0 };
+                painter.circle_filled(q + vec2(0.0, 1.0), rad + 1.5, Color32::from_black_alpha(110));
+                painter.circle_filled(q, rad, col);
+                painter.circle_stroke(q, rad, Stroke::new(1.5, Color32::WHITE));
+            }
+            let label = format!("{:+.1}°", h.angle.to_degrees());
+            let g = painter.layout_no_wrap(label, k::font_mono(11.0), k::LABEL);
+            let pos = c + vec2(0.0, -22.0);
+            let bg = Rect::from_center_size(pos, g.size() + vec2(14.0, 6.0));
+            painter.rect_filled(bg, CornerRadius::same(9), Color32::from_black_alpha(170));
+            painter.galley(bg.center() - g.size() / 2.0, g, k::LABEL);
+        }
+
         // pixel size readout
         if dragging || hover.map(|h| r.contains(h)).unwrap_or(false) {
             if let Some(doc) = &self.doc {
@@ -1791,6 +1970,7 @@ impl App {
         let map = self.mask_map(self.last_img_rect);
         let erase = self.brush_erase ^ ctx.input(|inp| inp.modifiers.alt);
         let (radius, feather, flow) = (brush_radius(self.brush_size), self.brush_feather, self.brush_flow);
+        self.overlay_hold = true;
         let m = &mut self.params.masks[i];
         match &mut m.shape {
             Shape::Brush { strokes } => {
@@ -1828,7 +2008,7 @@ impl App {
                     m.hue = hue;
                 }
                 m.refine = Refine::Color;
-                self.overlay_until = Some(Instant::now() + std::time::Duration::from_millis(1400));
+                self.overlay_hold = true;
             }
             return;
         }
@@ -1837,12 +2017,32 @@ impl App {
             self.mask_drag = None;
         }
         if img.contains(o) {
-            let add = !ctx.input(|inp| inp.modifiers.alt);
+            // Alt flips between adding and removing
+            let add = !(self.seed_remove ^ ctx.input(|inp| inp.modifiers.alt));
             let map = self.mask_map(img);
+            let hit = seed_at(&self.params.masks[i].shape, &map, o);
             if let Shape::Object { seeds, .. } = &mut self.params.masks[i].shape {
-                seeds.push(Seed { p: map.s2n(o), add });
-                self.overlay_until = Some(Instant::now() + std::time::Duration::from_millis(1500));
+                // clicking an existing point takes it away again
+                match hit {
+                    Some(h) => {
+                        seeds.remove(h);
+                    }
+                    None => seeds.push(Seed { p: map.s2n(o), add }),
+                }
+                self.overlay_hold = true;
             }
+        }
+    }
+
+    /// Right-click: remove the object-selection point under the pointer.
+    fn mask_secondary_click(&mut self, o: Pos2) {
+        let Some(i) = self.selected_mask() else { return };
+        let map = self.mask_map(self.last_img_rect);
+        if let Some(h) = seed_at(&self.params.masks[i].shape, &map, o)
+            && let Shape::Object { seeds, .. } = &mut self.params.masks[i].shape
+        {
+            seeds.remove(h);
+            self.overlay_hold = true;
         }
     }
 
@@ -1938,15 +2138,32 @@ impl App {
             }
             Shape::Everything => {}
             Shape::Object { seeds, .. } => {
-                for sd in seeds {
+                let under = hover.and_then(|h| seed_at(&m.shape, &map, h));
+                for (si, sd) in seeds.iter().enumerate() {
                     let p = map.n2s(sd.p);
-                    painter.circle_filled(p + vec2(0.0, 1.0), 8.0, shadow);
-                    painter.circle_filled(p, 7.0, if sd.add { k::ACCENT } else { Color32::from_rgb(255, 69, 58) });
-                    painter.circle_stroke(p, 7.0, Stroke::new(1.5, white));
-                    painter.text(p, Align2::CENTER_CENTER, if sd.add { "+" } else { "−" }, k::font_semibold(11.0), white);
+                    // the point under the pointer shows that a click removes it
+                    let hot = under == Some(si);
+                    let r = if hot { 9.0 } else { 7.0 };
+                    painter.circle_filled(p + vec2(0.0, 1.0), r + 1.0, shadow);
+                    let fill = if hot { Color32::from_rgb(60, 60, 64) } else if sd.add { k::ACCENT } else { Color32::from_rgb(255, 69, 58) };
+                    painter.circle_filled(p, r, fill);
+                    painter.circle_stroke(p, r, Stroke::new(1.5, white));
+                    let glyph = if hot { "×" } else if sd.add { "+" } else { "−" };
+                    painter.text(p, Align2::CENTER_CENTER, glyph, k::font_semibold(if hot { 13.0 } else { 11.0 }), white);
                 }
-                if hover.map(|h| img.contains(h)).unwrap_or(false) && !space_or_zoom_pan(&ctx) {
-                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                if let Some(h) = hover.filter(|h| img.contains(*h))
+                    && !space_or_zoom_pan(&ctx)
+                {
+                    if under.is_some() {
+                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    } else {
+                        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                        // a small + or − next to the crosshair shows what a click places
+                        let add = !(self.seed_remove ^ ctx.input(|inp| inp.modifiers.alt));
+                        let tag = h + vec2(14.0, 14.0);
+                        painter.circle_filled(tag, 7.0, if add { k::ACCENT } else { Color32::from_rgb(255, 69, 58) });
+                        painter.text(tag, Align2::CENTER_CENTER, if add { "+" } else { "−" }, k::font_semibold(11.0), white);
+                    }
                 }
             }
         }
@@ -1973,6 +2190,127 @@ impl App {
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
         } else if hovered.is_some() {
             ctx.set_cursor_icon(egui::CursorIcon::Grab);
+        }
+    }
+
+    // --- clone tool ------------------------------------------------------------
+
+    /// Ctrl or Alt (or the sidebar button) turns a click into choosing the source.
+    fn clone_wants_source(&self, ctx: &egui::Context) -> bool {
+        self.clone_pick_source || ctx.input(|i| i.modifiers.command || i.modifiers.alt)
+    }
+
+    fn clone_set_source(&mut self, o: Pos2) {
+        let map = self.mask_map(self.last_img_rect);
+        self.clone_source = Some(map.s2n(o));
+        self.clone_offset = None;
+        self.clone_pick_source = false;
+    }
+
+    /// Start a stroke at `o` (or choose the source).
+    fn clone_begin(&mut self, o: Pos2, ctx: &egui::Context) {
+        if !self.last_img_rect.contains(o) {
+            return;
+        }
+        if self.clone_wants_source(ctx) {
+            self.clone_set_source(o);
+            return;
+        }
+        let Some(src) = self.clone_source else {
+            self.toast = Some(("Ctrl+click the spot to copy from first".into(), None, Instant::now()));
+            return;
+        };
+        let map = self.mask_map(self.last_img_rect);
+        let at = map.s2n(o);
+        // the first stroke fixes the distance between brush and source; later
+        // strokes keep it, so the source travels with the brush
+        let offset = *self.clone_offset.get_or_insert([src[0] - at[0], src[1] - at[1]]);
+        self.params.retouch.push(CloneStroke {
+            pts: vec![at],
+            radius: brush_radius(self.clone_size),
+            feather: self.clone_feather,
+            opacity: self.clone_opacity,
+            offset,
+        });
+        self.clone_painting = true;
+    }
+
+    /// A click without a drag: a single dab, or choosing the source.
+    fn clone_click(&mut self, o: Pos2, ctx: &egui::Context) {
+        if self.clone_wants_source(ctx) {
+            if self.last_img_rect.contains(o) {
+                self.clone_set_source(o);
+            }
+            return;
+        }
+        self.clone_begin(o, ctx);
+        self.clone_painting = false;
+    }
+
+    /// Extends the stroke being painted, and draws the brush and source circles.
+    fn clone_overlay(&mut self, ui: &mut Ui, resp: &egui::Response, clip: Rect, img: Rect) {
+        let ctx = ui.ctx().clone();
+        let map = self.mask_map(img);
+        if self.clone_painting {
+            if let Some(p) = ctx.input(|i| i.pointer.latest_pos())
+                && let Some(st) = self.params.retouch.last_mut()
+            {
+                let last = map.n2s(*st.pts.last().unwrap_or(&[0.0, 0.0]));
+                if last.distance(p) > 2.0 {
+                    st.pts.push(map.s2n(p));
+                }
+            }
+            if !resp.dragged() || resp.drag_stopped() {
+                self.clone_painting = false;
+            }
+        }
+
+        let painter = ui.painter_at(clip);
+        let white = Color32::WHITE;
+        let ring = |c: Pos2, r: f32, col: Color32| {
+            painter.circle_stroke(c, r, Stroke::new(2.5, Color32::from_black_alpha(80)));
+            painter.circle_stroke(c, r, Stroke::new(1.2, col));
+        };
+        let cross = |c: Pos2, col: Color32| {
+            for d in [vec2(6.0, 0.0), vec2(0.0, 6.0)] {
+                painter.line_segment([c - d, c + d], Stroke::new(2.5, Color32::from_black_alpha(80)));
+                painter.line_segment([c - d, c + d], Stroke::new(1.2, col));
+            }
+        };
+        let source_col = Color32::from_rgb(48, 209, 88);
+        let f = map.frame();
+        let r = brush_radius(self.clone_size) * map.long();
+        let hover = ctx.input(|i| i.pointer.hover_pos()).filter(|p| clip.contains(*p) && img.contains(*p));
+
+        // the source: where the brush copies from right now
+        let source_at = |h: Option<Pos2>| -> Option<Pos2> {
+            match (self.clone_offset, h, self.clone_source) {
+                (Some(off), Some(h), _) => Some(h + vec2(off[0] * f.x, off[1] * f.y)),
+                (None, _, Some(s)) => Some(map.n2s(s)),
+                _ => None,
+            }
+        };
+        let picking = self.clone_wants_source(&ctx);
+        if let Some(s) = source_at(hover).filter(|_| !picking) {
+            ring(s, r, source_col);
+            cross(s, source_col);
+        }
+        if let Some(h) = hover {
+            if space_or_zoom_pan(&ctx) {
+                return;
+            }
+            if picking {
+                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                ring(h, r, source_col);
+                painter.text(h + vec2(0.0, r + 12.0), Align2::CENTER_CENTER, "Copy from here", k::font(11.0), white);
+            } else {
+                ctx.set_cursor_icon(egui::CursorIcon::None);
+                ring(h, r, white);
+                ring(h, r * (1.0 - self.clone_feather), Color32::from_white_alpha(90));
+                if self.clone_source.is_none() {
+                    painter.text(h + vec2(0.0, r + 12.0), Align2::CENTER_CENTER, "Ctrl+click to choose a source", k::font(11.0), white);
+                }
+            }
         }
     }
 
@@ -2184,9 +2522,22 @@ impl App {
         self.histogram(ui);
         ui.add_space(12.0);
 
-        let labels: Vec<&str> = TABS.iter().map(|t| t.1).collect();
         let prev = self.tab;
-        k::segmented(ui, "tabs", &mut self.tab, &labels);
+        // two rows of four: eight labels don't fit one segmented control
+        let w = ui.available_width();
+        let cw = (w - 6.0 * 3.0) / 4.0;
+        for row in TABS.chunks(4).enumerate() {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (j, (_, label)) in row.1.iter().enumerate() {
+                    let i = row.0 * 4 + j;
+                    if k::chip(ui, vec2(cw, 28.0), label, self.tab == i).clicked() {
+                        self.tab = i;
+                    }
+                }
+            });
+            ui.add_space(2.0);
+        }
         // content cross-fades and settles in when switching tabs
         let fid = Id::unique("tab_fade");
         if prev != self.tab {
@@ -2199,13 +2550,14 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.multiply_opacity(fade);
             ui.add_space((1.0 - fade) * 8.0);
-            if !has_doc && TABS[self.tab].0 == Tab::Looks {
+            if !has_doc && TABS[self.tab].0 == Tab::Presets {
                 k::caption(ui, "Open a photo to preview presets.");
             }
             match TABS[self.tab].0 {
-                Tab::Looks => self.tab_looks(ui),
+                Tab::Presets => self.tab_presets(ui),
                 Tab::Adjust => self.tab_adjust(ui),
                 Tab::Masks => self.tab_masks(ui),
+                Tab::Retouch => self.tab_retouch(ui),
                 Tab::Layers => self.tab_layers(ui),
                 Tab::Effects => self.tab_effects(ui),
                 Tab::Glitch => self.tab_glitch(ui),
@@ -2253,7 +2605,7 @@ impl App {
         }
     }
 
-    fn tab_looks(&mut self, ui: &mut Ui) {
+    fn tab_presets(&mut self, ui: &mut Ui) {
         let looks = self.all_looks();
         let w = ui.available_width();
         let gap = 10.0;
@@ -2337,7 +2689,7 @@ impl App {
         }
         let mut changed = false;
         if let Some(i) = overwrite {
-            self.user_presets[i].1 = Params { masks: Vec::new(), layers: Vec::new(), ..self.params.clone() };
+            self.user_presets[i].1 = Params { masks: Vec::new(), layers: Vec::new(), retouch: Vec::new(), ..self.params.clone() };
             changed = true;
         }
         if let Some(i) = delete {
@@ -2358,7 +2710,7 @@ impl App {
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let ok = !self.new_preset.trim().is_empty();
                 if (k::button(ui, "Save", Btn::Secondary, ok).clicked() || enter) && ok {
-                    self.user_presets.push((self.new_preset.trim().to_string(), Params { masks: Vec::new(), layers: Vec::new(), ..self.params.clone() }));
+                    self.user_presets.push((self.new_preset.trim().to_string(), Params { masks: Vec::new(), layers: Vec::new(), retouch: Vec::new(), ..self.params.clone() }));
                     self.new_preset.clear();
                     changed = true;
                 }
@@ -2442,7 +2794,41 @@ impl App {
         }
     }
 
+    /// "Apply To": the whole photo, or only inside one mask. The choice is
+    /// stored on the mask (`pick` / `set`), so it survives reordering.
+    fn apply_to(&mut self, ui: &mut Ui, id: &str, what: &str, pick: fn(&Mask) -> bool, set: fn(&mut Mask, bool)) {
+        let masks = &mut self.params.masks;
+        let current = masks.iter().position(pick);
+        let mut choice = current;
+        let shown = current.map(|i| masks[i].name.clone()).unwrap_or_else(|| "Whole Photo".into());
+        ui.horizontal(|ui| {
+            ui.set_min_height(30.0);
+            ui.label(egui::RichText::new("Apply To").color(k::LABEL2).size(13.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::ComboBox::from_id_salt(id).selected_text(shown).width(170.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut choice, None, "Whole Photo");
+                    for (i, m) in masks.iter().enumerate() {
+                        ui.selectable_value(&mut choice, Some(i), &m.name);
+                    }
+                });
+            });
+        });
+        if choice != current {
+            for (i, m) in masks.iter_mut().enumerate() {
+                set(m, choice == Some(i));
+            }
+        }
+        match choice {
+            None if masks.is_empty() => k::caption(ui, &format!("To use {what} on part of the photo, add a mask in the Masks tab first.")),
+            Some(i) if !masks[i].enabled => k::caption(ui, "That mask is hidden, so these apply to the whole photo."),
+            Some(_) => k::caption(ui, &format!("{what} only show inside the mask.")),
+            None => {}
+        }
+        ui.add_space(8.0);
+    }
+
     fn tab_effects(&mut self, ui: &mut Ui) {
+        self.apply_to(ui, "fx_mask", "Effects", |m| m.effects, |m, on| m.effects = on);
         let p = &mut self.params;
         if k::section(ui, "Optics", modified!(p, bloom, bloom_radius, bloom_threshold, halation, aberration, vignette, vignette_feather), |ui| {
             k::slider(ui, "Bloom", &mut p.bloom, 0.0..=1.0, 0.0, Fmt::Amount);
@@ -2505,6 +2891,7 @@ impl App {
     }
 
     fn tab_glitch(&mut self, ui: &mut Ui) {
+        self.apply_to(ui, "glitch_mask", "Glitches", |m| m.glitch, |m, on| m.glitch = on);
         let p = &mut self.params;
         k::caption(ui, "Glitches are placed by a seed. Shuffle for a new arrangement.");
         ui.add_space(4.0);
@@ -3269,9 +3656,10 @@ impl App {
         }
         let mut fit = None;
         let mut stretch_full = false;
+        let has_cutout = self.params.masks.iter().any(|m| m.enabled && m.transparent);
         let l = &mut self.params.layers[i];
         let d = Layer::default();
-        if k::section(ui, "Blending", l.opacity < 1.0 || l.blend != Blend::Normal || !l.graded, |ui| {
+        if k::section(ui, "Blending", l.opacity < 1.0 || l.blend != Blend::Normal || !l.graded || l.behind, |ui| {
             k::slider(ui, "Opacity", &mut l.opacity, 0.0..=1.0, 1.0, Fmt::Amount);
             ui.add_space(2.0);
             let w = ui.available_width();
@@ -3291,10 +3679,18 @@ impl App {
             k::switch_row(ui, "Apply Preset to Layer", &mut l.graded);
             k::caption(ui, "On: the layer is graded with the photo. Off: it sits on top of the finished edit, good for light leaks and textures (try Screen).");
             ui.add_space(4.0);
+            k::switch_row(ui, "Behind Photo", &mut l.behind);
+            if l.behind && !has_cutout {
+                k::caption(ui, "Nothing is cut out of the photo yet, so this layer is hidden. Cut out an area in the Masks tab (Cut Out → Make Transparent) to let it show through.");
+            } else {
+                k::caption(ui, "Puts the layer under the photo, where it shows through areas cut out with a mask. Use it to replace a sky or background.");
+            }
+            ui.add_space(4.0);
         }) {
             l.opacity = d.opacity;
             l.blend = d.blend;
             l.graded = d.graded;
+            l.behind = d.behind;
         }
         if k::section(ui, "Transform", l.rotation != 0.0 || l.flip || l.stretch != 1.0, |ui| {
             k::slider(ui, "Position X", &mut l.x, -0.5..=1.5, 0.5, Fmt::Signed);
@@ -3353,7 +3749,7 @@ impl App {
         let n = self.params.masks.iter().filter(|m| m.name.starts_with(name)).count() + 1;
         self.params.masks.push(Mask { name: format!("{name} {n}"), shape, refine, ..Mask::default() });
         self.mask_sel = Some(self.params.masks.len() - 1);
-        self.overlay_until = Some(Instant::now() + std::time::Duration::from_millis(1600));
+        self.overlay_hold = true;
         self.picking_hue = false;
     }
 
@@ -3439,8 +3835,23 @@ impl App {
                         RenameOutcome::Cancel => renamed = Some((i, None)),
                     },
                     _ => {
-                        let edited = !m.adj.is_identity();
-                        let tag = format!("{}{}", if m.invert { "Inverted · " } else { "" }, if edited { "Edited" } else { "No edits" });
+                        let mut uses: Vec<&str> = Vec::new();
+                        if m.invert {
+                            uses.push("Inverted");
+                        }
+                        if m.transparent {
+                            uses.push("Cut Out");
+                        }
+                        if !m.adj.is_identity() {
+                            uses.push("Edited");
+                        }
+                        if m.effects {
+                            uses.push("Effects");
+                        }
+                        if m.glitch {
+                            uses.push("Glitch");
+                        }
+                        let tag = if uses.is_empty() { "No edits".to_string() } else { uses.join(" · ") };
                         let tag = ui.painter().layout_no_wrap(tag, k::font(11.0), k::LABEL3);
                         let tag_x = r.right() - 10.0 - tag.size().x;
                         ui.painter().galley(pos2(tag_x, r.center().y - tag.size().y / 2.0), tag, k::LABEL3);
@@ -3488,7 +3899,7 @@ impl App {
         match act {
             Some(Act::Select(i)) => {
                 if self.mask_sel != Some(i) {
-                    self.overlay_until = Some(Instant::now() + std::time::Duration::from_millis(900));
+                    self.overlay_hold = true;
                 }
                 self.mask_sel = Some(i);
                 self.picking_hue = false;
@@ -3497,6 +3908,9 @@ impl App {
             Some(Act::Duplicate(i)) => {
                 let mut m = masks[i].clone();
                 m.name = format!("{} copy", m.name);
+                // one mask holds the Effects / Glitch tabs; the copy starts plain
+                m.effects = false;
+                m.glitch = false;
                 masks.insert(i + 1, m);
                 self.mask_sel = Some(i + 1);
             }
@@ -3568,7 +3982,13 @@ impl App {
                     k::caption(ui, "Covers the whole photo, narrowed by the range below.");
                 }
                 Shape::Object { seeds, threshold, connected, smooth, feather } => {
-                    k::caption(ui, "Click the subject on the photo. Click more spots to add to it, Alt+click to take areas away.");
+                    k::caption(ui, "Click the subject on the photo. + points add to the selection, − points mark where it should not go.");
+                    ui.add_space(4.0);
+                    let mut mi = self.seed_remove as usize;
+                    if k::segmented(ui, "obj_points", &mut mi, &["+ Add", "− Remove"]) {
+                        self.seed_remove = mi == 1;
+                    }
+                    k::caption(ui, "Alt+click places the other kind. Click a point (or right-click it) to delete it.");
                     ui.add_space(4.0);
                     let before = (*threshold, *connected, *smooth);
                     k::slider(ui, "Threshold", threshold, 0.0..=1.0, 0.25, Fmt::Amount);
@@ -3580,7 +4000,7 @@ impl App {
                     k::slider(ui, "Smooth Edges", smooth, 0.0..=1.0, 0.3, Fmt::Amount);
                     k::slider(ui, "Feather", feather, 0.0..=1.0, 0.15, Fmt::Amount);
                     if before != (*threshold, *connected, *smooth) {
-                        self.overlay_until = Some(Instant::now() + std::time::Duration::from_millis(900));
+                        self.overlay_hold = true;
                     }
                     ui.horizontal(|ui| {
                         k::caption(ui, &format!("{} point{}", seeds.len(), if seeds.len() == 1 { "" } else { "s" }));
@@ -3599,8 +4019,13 @@ impl App {
             ui.add_space(4.0);
             k::slider(ui, "Amount", &mut m.amount, 0.0..=1.0, 1.0, Fmt::Amount);
             k::switch_row(ui, "Invert", &mut m.invert);
-            k::switch_row(ui, "Show Overlay", &mut self.show_overlay);
-            k::caption(ui, "Hold O to peek at the mask.");
+            // reflects what's on screen: switching it off also ends the hold
+            let mut visible = self.show_overlay || self.overlay_hold;
+            if k::switch_row(ui, "Show Overlay", &mut visible).changed() {
+                self.show_overlay = visible;
+                self.overlay_hold = false;
+            }
+            k::caption(ui, "The red overlay stays up while you shape the mask and hides when you adjust. Hold O to peek.");
             ui.add_space(4.0);
         }) {
             m.invert = false;
@@ -3617,7 +4042,7 @@ impl App {
             };
             if k::segmented(ui, "mask_refine", &mut idx, &["All", "Luminance", "Color"]) {
                 m.refine = [Refine::None, Refine::Luminance, Refine::Color][idx];
-                self.overlay_until = Some(Instant::now() + std::time::Duration::from_millis(1200));
+                self.overlay_hold = true;
             }
             ui.add_space(4.0);
             match m.refine {
@@ -3633,9 +4058,13 @@ impl App {
                     k::slider(ui, "Range", &mut m.hue_range, 0.0..=180.0, d.hue_range, Fmt::Deg);
                     k::slider(ui, "Smoothness", &mut m.hue_soft, 0.0..=90.0, d.hue_soft, Fmt::Deg);
                     ui.add_space(2.0);
-                    let label = if self.picking_hue { "Click the Photo…" } else { "Pick from Photo" };
-                    if k::button(ui, label, Btn::Secondary, true).clicked() {
+                    // turns blue while it waits for a click on the photo
+                    let (label, kind) = if self.picking_hue { ("Click a Colour on the Photo…", Btn::Primary) } else { ("Pick from Photo", Btn::Secondary) };
+                    if k::button(ui, label, kind, true).clicked() {
                         self.picking_hue = !self.picking_hue;
+                    }
+                    if self.picking_hue {
+                        k::caption(ui, "Esc cancels.");
                     }
                 }
             }
@@ -3650,8 +4079,18 @@ impl App {
             m.hue_soft = d.hue_soft;
         }
 
+        if k::section(ui, "Cut Out", m.transparent, |ui| {
+            k::switch_row(ui, "Make Transparent", &mut m.transparent);
+            k::caption(ui, "Removes this area from the picture. To remove a background, select the subject, turn on Invert, then this.");
+            k::caption(ui, "Export as PNG, TIFF or WebP to keep the transparency. JPEG fills it with white.");
+            ui.add_space(4.0);
+        }) {
+            m.transparent = false;
+        }
+
         let a = &mut m.adj;
-        if k::section(ui, "Adjustments", !a.is_identity(), |ui| {
+        let adj_before = a.clone();
+        let reset_adj = k::section(ui, "Adjustments", !a.is_identity(), |ui| {
             k::slider(ui, "Exposure", &mut a.exposure, -2.0..=2.0, 0.0, Fmt::Ev);
             k::slider(ui, "Contrast", &mut a.contrast, -1.0..=1.0, 0.0, Fmt::Signed);
             k::slider(ui, "Highlights", &mut a.highlights, -1.0..=1.0, 0.0, Fmt::Signed);
@@ -3666,8 +4105,13 @@ impl App {
                 hue_strip(ui);
             }
             ui.add_space(4.0);
-        }) {
+        });
+        if reset_adj {
             *a = Local { tone_hue: 35.0, ..Local::default() };
+        }
+        // adjusting means the shape is done: let the picture show through
+        if *a != adj_before {
+            self.overlay_hold = false;
         }
 
         ui.add_space(4.0);
@@ -3675,6 +4119,51 @@ impl App {
             self.params.masks.remove(i);
             self.mask_sel = None;
         }
+    }
+
+    fn tab_retouch(&mut self, ui: &mut Ui) {
+        if self.doc.is_none() {
+            k::caption(ui, "Open a photo to retouch it.");
+            return;
+        }
+        k::caption(ui, "Paint over something to cover it with another part of the photo.");
+        ui.add_space(8.0);
+        k::section(ui, "Clone", false, |ui| {
+            k::caption(ui, "1. Ctrl+click the spot to copy from (or use the button).");
+            k::caption(ui, "2. Paint over what you want to remove. The green circle shows what is being copied, and it follows the brush at the same distance.");
+            ui.add_space(6.0);
+            // the button grows while waiting for the click, so the status sits below it
+            let (label, kind) = if self.clone_pick_source { ("Click Where to Copy From…", Btn::Primary) } else { ("Choose Source", Btn::Secondary) };
+            if k::button(ui, label, kind, true).clicked() {
+                self.clone_pick_source = !self.clone_pick_source;
+            }
+            k::caption(
+                ui,
+                match (self.clone_pick_source, self.clone_source.is_some()) {
+                    (true, _) => "Esc cancels.",
+                    (false, true) => "Source set. Ctrl+click again to choose another.",
+                    (false, false) => "No source yet.",
+                },
+            );
+            ui.add_space(6.0);
+            k::slider(ui, "Size", &mut self.clone_size, 0.0..=1.0, 0.35, Fmt::Amount);
+            k::slider(ui, "Feather", &mut self.clone_feather, 0.0..=1.0, 0.5, Fmt::Amount);
+            k::slider(ui, "Opacity", &mut self.clone_opacity, 0.05..=1.0, 1.0, Fmt::Amount);
+            let n = self.params.retouch.len();
+            ui.horizontal(|ui| {
+                k::caption(ui, &format!("{n} stroke{}", if n == 1 { "" } else { "s" }));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if k::button(ui, "Clear", Btn::Plain, n > 0).clicked() {
+                        self.params.retouch.clear();
+                    }
+                    if k::button(ui, "Undo Stroke", Btn::Plain, n > 0).clicked() {
+                        self.params.retouch.pop();
+                    }
+                });
+            });
+            k::caption(ui, "[ and ] resize the brush. Hold Space to pan.");
+            ui.add_space(4.0);
+        });
     }
 
     fn tab_crop(&mut self, ui: &mut Ui) {
@@ -3734,7 +4223,27 @@ impl App {
         }
 
         if k::section(ui, "Orientation", modified!(p, rotate, flip_h, straighten), |ui| {
-            k::slider(ui, "Straighten", &mut p.straighten, -15.0..=15.0, 0.0, Fmt::Deg);
+            k::slider(ui, "Straighten", &mut p.straighten, -45.0..=45.0, 0.0, Fmt::Deg);
+            ui.add_space(4.0);
+            let mut line_on = self.horizon.is_some();
+            if k::switch_row(ui, "Horizon Line", &mut line_on).changed() {
+                self.horizon = line_on.then_some(Horizon { c: [0.5, 0.5], angle: 0.0 });
+            }
+            if let Some(h) = &mut self.horizon {
+                k::caption(ui, "Drag the middle of the yellow line to move it up or down, and its ends to tilt it. Lay it along the horizon, or at any angle you want level, then press Level Photo.");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let tilted = h.angle.abs() > 0.01f32.to_radians();
+                    if k::button(ui, "Level Photo", Btn::Primary, tilted).clicked() {
+                        // turning the photo by the line's tilt brings the line level
+                        p.straighten = (p.straighten - h.angle.to_degrees()).clamp(-45.0, 45.0);
+                        h.angle = 0.0;
+                    }
+                    if k::button(ui, "Reset Line", Btn::Plain, *h != Horizon { c: [0.5, 0.5], angle: 0.0 }).clicked() {
+                        *h = Horizon { c: [0.5, 0.5], angle: 0.0 };
+                    }
+                });
+            }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 // the crop rotates with the photo
@@ -3778,7 +4287,7 @@ impl App {
             if a || b {
                 self.persist();
             }
-            k::caption(ui, "Guides show over the photo in every tab. They are never exported.");
+            k::caption(ui, "The rule-of-thirds grid always shows while cropping. These switches show guides in every tab. Guides are never exported.");
             ui.add_space(4.0);
         }) {
             self.guide_thirds = false;
@@ -4346,13 +4855,15 @@ mod tests {
         ];
         for events in frames {
             let input = egui::RawInput { events, screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| {
+            let mut out = ctx.run_ui(input, |ui| {
                 let resp = ui.interact(ui.max_rect(), Id::unique("click_test"), Sense::click_and_drag());
                 if resp.clicked() {
                     seen = click_pos(&resp);
                     origin_on_click = ui.input(|i| i.pointer.press_origin());
                 }
             });
+            // nothing renders here; drop the font texture upload egui asks for
+            out.textures_delta.clear();
         }
         assert_eq!(seen, Some(at), "click position must be known when the click fires");
         assert_eq!(origin_on_click, None, "press_origin is gone on the click frame (the original bug)");
@@ -4392,7 +4903,8 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        panic!("app never settled");
+        let a = h.state();
+        panic!("app never settled: doc {} frame {:?} gen {}/{} rect {:?} tab {}", a.doc.is_some(), a.tex_frame, a.shown_gen, a.generation, a.last_img_rect, a.tab);
     }
 
     fn rendered(a: &App) -> bool {
@@ -4540,7 +5052,8 @@ mod tests {
         let mut h = open_with_layer("rename");
         h.state_mut().tab = TABS.iter().position(|t| t.0 == Tab::Masks).unwrap();
         h.state_mut().add_mask(1);
-        settle(&mut h, |a| a.tex_frame == Frame::Unbordered && rendered(a) && a.overlay_until.map(|t| Instant::now() > t).unwrap_or(true));
+        h.state_mut().overlay_hold = false;
+        settle(&mut h, |a| a.tex_frame == Frame::Unbordered && rendered(a));
         settle(&mut h, rendered);
         let generation = h.state().generation;
 
@@ -4638,5 +5151,127 @@ mod tests {
         h.state_mut().view.zoom = 1.0;
         settle(&mut h, |a| shown(a) == preview_w && rendered(a));
         assert!(h.state().detail_src.is_none());
+    }
+
+    fn click(h: &mut egui_kittest::Harness<'_, App>, at: Pos2, modifiers: egui::Modifiers) {
+        h.hover_at(at);
+        h.step();
+        h.event_modifiers(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers }, modifiers);
+        h.step();
+        h.event_modifiers(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers }, modifiers);
+        h.step();
+        h.step();
+    }
+
+    fn open_on(tag: &str, tab: Tab) -> egui_kittest::Harness<'static, App> {
+        let dir = temp_dir(tag);
+        let photo = test_photo(&dir);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_eframe(move |cc| App::new(cc, Some(photo)));
+        settle(&mut h, |a| a.doc.is_some());
+        h.state_mut().tab = TABS.iter().position(|t| t.0 == tab).unwrap();
+        let want = if tab == Tab::Crop { Frame::Uncropped } else { Frame::Unbordered };
+        settle(&mut h, move |a| a.tex_frame == want && rendered(a));
+        h
+    }
+
+    #[test]
+    fn e2e_colour_picker_keeps_its_crosshair_when_zoomed() {
+        let mut h = open_on("picker", Tab::Masks);
+        h.state_mut().add_mask(4);
+        h.state_mut().picking_hue = true;
+        h.state_mut().view.zoom = 2.5;
+        for _ in 0..30 {
+            h.step();
+        }
+        let c = h.state().last_img_rect.center();
+        h.hover_at(c);
+        h.step();
+        h.step();
+        assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::Crosshair);
+    }
+
+    #[test]
+    fn e2e_object_points_add_remove_and_delete() {
+        let mut h = open_on("object", Tab::Masks);
+        h.state_mut().add_mask(5);
+        h.step();
+        let r = h.state().last_img_rect;
+        let (a, b) = (r.lerp_inside(vec2(0.3, 0.5)), r.lerp_inside(vec2(0.7, 0.5)));
+        let seeds = |h: &egui_kittest::Harness<'_, App>| match &h.state().params.masks[0].shape {
+            Shape::Object { seeds, .. } => seeds.clone(),
+            _ => unreachable!(),
+        };
+        click(&mut h, a, egui::Modifiers::NONE);
+        assert_eq!(seeds(&h).len(), 1);
+        assert!(seeds(&h)[0].add);
+        // − mode places a point that marks where the selection should not go
+        h.state_mut().seed_remove = true;
+        click(&mut h, b, egui::Modifiers::NONE);
+        assert_eq!(seeds(&h).len(), 2);
+        assert!(!seeds(&h)[1].add);
+        // clicking a point deletes it
+        click(&mut h, a, egui::Modifiers::NONE);
+        let left = seeds(&h);
+        assert_eq!(left.len(), 1);
+        assert!(!left[0].add, "the + point was removed, the − point stays");
+    }
+
+    #[test]
+    fn e2e_overlay_stays_until_adjusting() {
+        let mut h = open_on("overlay", Tab::Masks);
+        h.state_mut().add_mask(1);
+        std::thread::sleep(std::time::Duration::from_millis(1800));
+        h.step();
+        let ctx = egui::Context::default();
+        assert!(h.state().overlay_wanted(&ctx).is_some(), "still showing long after adding");
+        h.state_mut().overlay_hold = false; // what touching an adjustment does
+        assert!(h.state().overlay_wanted(&ctx).is_none());
+    }
+
+    #[test]
+    fn e2e_clone_tool_copies_from_the_source() {
+        let mut h = open_on("clone", Tab::Retouch);
+        let r = h.state().last_img_rect;
+        let (src, dst) = (r.lerp_inside(vec2(0.8, 0.3)), r.lerp_inside(vec2(0.2, 0.6)));
+        // Ctrl+click picks the source
+        click(&mut h, src, egui::Modifiers::COMMAND);
+        assert!(h.state().clone_source.is_some());
+        assert!(h.state().params.retouch.is_empty());
+        drag(&mut h, dst, dst + vec2(60.0, 0.0));
+        let st = &h.state().params.retouch;
+        assert_eq!(st.len(), 1);
+        assert!(st[0].pts.len() > 3);
+        let map = h.state().mask_map(r);
+        let (ns, nd) = (map.s2n(src), map.s2n(dst));
+        assert!((st[0].offset[0] - (ns[0] - nd[0])).abs() < 0.01 && (st[0].offset[1] - (ns[1] - nd[1])).abs() < 0.01);
+        // the rendered preview changed where it was painted: the test photo's red
+        // grows to the right, so copying from the right makes the spot redder
+        settle(&mut h, rendered);
+        let im = h.state().last_image.clone().unwrap();
+        let at = |p: Pos2| {
+            let u = ((p.x - r.left()) / r.width() * im.size[0] as f32) as usize;
+            let v = ((p.y - r.top()) / r.height() * im.size[1] as f32) as usize;
+            im.pixels[v * im.size[0] + u]
+        };
+        let painted = at(dst + vec2(30.0, 0.0));
+        let below = at(dst + vec2(30.0, 120.0));
+        assert!(painted.r() as i32 > below.r() as i32 + 60, "painted {painted:?} vs untouched {below:?}");
+    }
+
+    #[test]
+    fn e2e_horizon_line_tilts_and_levels() {
+        let mut h = open_on("horizon", Tab::Crop);
+        h.state_mut().horizon = Some(Horizon { c: [0.5, 0.5], angle: 0.0 });
+        h.step();
+        let img = h.state().last_img_rect;
+        let (_, _, end) = h.state().horizon.unwrap().points(img);
+        drag(&mut h, end, end + vec2(0.0, 40.0));
+        let a = h.state().horizon.unwrap().angle;
+        assert!(a.to_degrees() > 5.0, "dragging the right end down tilts the line: {}", a.to_degrees());
+        assert_eq!(h.state().params.crop, pipeline::FULL_CROP, "the crop did not move");
+        // the middle moves it up and down
+        let (c, _, _) = h.state().horizon.unwrap().points(img);
+        drag(&mut h, c, c - vec2(0.0, 80.0));
+        assert!(h.state().horizon.unwrap().c[1] < 0.45);
     }
 }

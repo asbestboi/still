@@ -90,6 +90,12 @@ pub struct Mask {
     pub hue_range: f32,
     pub hue_soft: f32,
     pub adj: Local,
+    /// The Effects tab only applies inside this mask.
+    pub effects: bool,
+    /// The Glitch tab only applies inside this mask.
+    pub glitch: bool,
+    /// Cut this area out: it becomes transparent.
+    pub transparent: bool,
 }
 
 impl Default for Mask {
@@ -109,6 +115,9 @@ impl Default for Mask {
             hue_range: 30.0,
             hue_soft: 25.0,
             adj: Local { tone_hue: 35.0, ..Local::default() },
+            effects: false,
+            glitch: false,
+            transparent: false,
         }
     }
 }
@@ -375,7 +384,7 @@ fn object_alpha(img: &Img, seeds: &[Seed], threshold: f32, connected: bool, smoo
 
 /// Rasterise one stroke into a local buffer (max of its dabs, so a stroke
 /// never builds up over itself), then composite it onto the mask.
-fn stamp_stroke(a: &mut [f32], w: usize, h: usize, st: &BrushStroke, sp: &Space) {
+pub(crate) fn stamp_stroke(a: &mut [f32], w: usize, h: usize, st: &BrushStroke, sp: &Space) {
     if st.pts.is_empty() {
         return;
     }
@@ -595,46 +604,94 @@ fn adjust(c: Px, l: &Local, pr: &Prep) -> Px {
     c.map(|v| v.clamp(0.0, 1.0))
 }
 
-/// Apply every enabled mask in order. Returns the alpha of mask `overlay`
-/// (if asked) for drawing it on screen.
-pub fn apply(img: &mut Img, masks: &[Mask], sp: &Space, u: f32, overlay: Option<usize>) -> Option<Vec<f32>> {
-    let mut shown = None;
+/// What applying the masks leaves behind besides the adjusted picture.
+#[derive(Default)]
+pub struct Applied {
+    /// Opacity of the mask asked for, for drawing it on screen.
+    pub overlay: Option<Vec<f32>>,
+    /// Opacity of the picture (1 = kept), when any mask cuts areas out.
+    pub cutout: Option<Vec<f32>>,
+    /// The area of each mask that adjusts the picture, by index.
+    pub areas: Vec<Option<Vec<f32>>>,
+}
+
+/// One mask's adjustments over its area `a`.
+fn adjust_area(img: &mut Img, l: &Local, a: &[f32], u: f32) {
+    let pr = Prep::new(l);
+    img.px.par_iter_mut().zip(a.par_iter()).for_each(|(px, &w)| {
+        if w > 1e-4 {
+            let t = adjust(*px, l, &pr);
+            for c in 0..3 {
+                px[c] += (t[c] - px[c]) * w;
+            }
+        }
+    });
+    if l.sharpness.abs() > 0.001 {
+        let b = if l.sharpness > 0.0 { blur(img, (0.8 * u).max(0.8)) } else { blur(img, 6.0 * u) };
+        let s = l.sharpness;
+        img.px.par_iter_mut().zip(b.px.par_iter()).zip(a.par_iter()).for_each(|((px, b), &w)| {
+            for c in 0..3 {
+                px[c] = if s > 0.0 {
+                    (px[c] + (px[c] - b[c]) * s * 2.0 * w).clamp(0.0, 1.0)
+                } else {
+                    px[c] + (b[c] - px[c]) * (-s) * w
+                };
+            }
+        });
+    }
+}
+
+/// Apply every enabled mask in order. Each mask's area is judged on `img`
+/// as earlier masks left it.
+pub fn apply(img: &mut Img, masks: &[Mask], sp: &Space, u: f32, overlay: Option<usize>) -> Applied {
+    let mut out = Applied { areas: vec![None; masks.len()], ..Default::default() };
     for (i, m) in masks.iter().enumerate() {
         let want_overlay = overlay == Some(i);
-        if !(m.enabled && !m.adj.is_identity()) && !want_overlay {
+        let adjusts = m.enabled && !m.adj.is_identity();
+        let cuts = m.enabled && m.transparent;
+        if !adjusts && !cuts && !want_overlay {
             continue;
         }
         let a = alpha(img, m, sp);
-        if m.enabled && !m.adj.is_identity() {
-            let l = &m.adj;
-            let pr = Prep::new(l);
-            img.px.par_iter_mut().zip(a.par_iter()).for_each(|(px, &w)| {
-                if w > 1e-4 {
-                    let t = adjust(*px, l, &pr);
-                    for c in 0..3 {
-                        px[c] += (t[c] - px[c]) * w;
-                    }
-                }
-            });
-            if l.sharpness.abs() > 0.001 {
-                let b = if l.sharpness > 0.0 { blur(img, (0.8 * u).max(0.8)) } else { blur(img, 6.0 * u) };
-                let s = l.sharpness;
-                img.px.par_iter_mut().zip(b.px.par_iter()).zip(a.par_iter()).for_each(|((px, b), &w)| {
-                    for c in 0..3 {
-                        px[c] = if s > 0.0 {
-                            (px[c] + (px[c] - b[c]) * s * 2.0 * w).clamp(0.0, 1.0)
-                        } else {
-                            px[c] + (b[c] - px[c]) * (-s) * w
-                        };
-                    }
-                });
-            }
+        if adjusts {
+            adjust_area(img, &m.adj, &a, u);
+        }
+        if cuts {
+            let keep = out.cutout.get_or_insert_with(|| vec![1.0; img.w * img.h]);
+            keep.par_iter_mut().zip(a.par_iter()).for_each(|(k, &w)| *k *= 1.0 - w);
         }
         if want_overlay {
-            shown = Some(a);
+            out.overlay = Some(a.clone());
+        }
+        if adjusts {
+            out.areas[i] = Some(a);
         }
     }
-    shown
+    out
+}
+
+/// Apply the masks' adjustments to another picture using areas already judged
+/// by [`apply`] (on the photo alone, when layers are in the picture).
+pub fn adjust_with(img: &mut Img, masks: &[Mask], applied: &Applied, u: f32) {
+    for (m, a) in masks.iter().zip(&applied.areas) {
+        if let Some(a) = a {
+            adjust_area(img, &m.adj, a, u);
+        }
+    }
+}
+
+/// Combined area of the enabled masks that `pick` chooses (e.g. those that
+/// hold the Effects tab), or None when none is chosen.
+pub fn union_alpha(img: &Img, masks: &[Mask], sp: &Space, pick: fn(&Mask) -> bool) -> Option<Vec<f32>> {
+    let mut out: Option<Vec<f32>> = None;
+    for m in masks.iter().filter(|m| m.enabled && pick(m)) {
+        let a = alpha(img, m, sp);
+        match &mut out {
+            None => out = Some(a),
+            Some(o) => o.par_iter_mut().zip(a.par_iter()).for_each(|(o, &v)| *o = o.max(v)),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

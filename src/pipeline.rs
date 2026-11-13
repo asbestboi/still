@@ -260,6 +260,9 @@ pub struct Params {
     pub layers: Vec<crate::layers::Layer>,
     /// Folders in the layer list.
     pub layer_groups: Vec<crate::layers::LayerGroup>,
+
+    /// Clone-tool strokes, painted onto the frame before anything else.
+    pub retouch: Vec<crate::retouch::CloneStroke>,
 }
 
 impl Default for Params {
@@ -329,6 +332,7 @@ impl Default for Params {
             masks: Vec::new(),
             layers: Vec::new(),
             layer_groups: Vec::new(),
+            retouch: Vec::new(),
         }
     }
 }
@@ -348,6 +352,7 @@ impl Params {
         p.masks = self.masks.clone();
         p.layers = self.layers.clone();
         p.layer_groups = self.layer_groups.clone();
+        p.retouch = self.retouch.clone();
         p
     }
 
@@ -587,6 +592,9 @@ fn geometry(src: &Img, p: &Params) -> (Img, crate::masks::Space) {
     if p.straighten.abs() > 0.01 {
         img = straighten(&img, p.straighten.to_radians());
     }
+    if !p.retouch.is_empty() {
+        crate::retouch::apply(&mut img, &p.retouch);
+    }
     let (ox, oy, _, _) = crop_px(img.w, img.h, p.crop);
     let space = crate::masks::Space { fw: img.w as f32, fh: img.h as f32, ox: ox as f32, oy: oy as f32 };
     (crop(img, p.crop), space)
@@ -697,93 +705,42 @@ fn low_res(img: &Img, p: &Params) -> Img {
 // ---------------------------------------------------------------------------
 
 pub fn process(src: &Img, p: &Params) -> Img {
-    process_ext(src, p, None).0
+    process_ext(src, p, None).img
 }
 
-/// Full render; also returns the opacity of mask `overlay` for on-screen display.
-pub fn process_ext(src: &Img, p: &Params, overlay: Option<usize>) -> (Img, Option<Vec<f32>>) {
-    let (img, space) = base(src, p);
-    finish(img, &space, p, overlay)
+/// A finished render.
+pub struct Rendered {
+    pub img: Img,
+    /// Opacity of the mask asked for, for drawing it on screen.
+    pub overlay: Option<Vec<f32>>,
+    /// Opacity of the picture (1 = opaque) when masks cut areas out.
+    pub alpha: Option<Vec<f32>>,
 }
 
-/// Remembers the global-look stage of the last renders, so edits that only
-/// touch masks, detail, glitch, texture, vignette, top layers or the border
-/// (and showing a mask overlay) skip geometry, exposure, colour and bloom.
-#[derive(Default)]
-pub struct StageCache {
-    /// (source, upstream params) → base image. Two slots: draft and full preview.
-    slots: Vec<(Arc<Img>, Params, Arc<(Img, crate::masks::Space)>)>,
-}
-
-/// Only the fields `base` reads; everything else at its default.
-fn upstream_key(p: &Params) -> Params {
-    Params {
-        rotate: p.rotate,
-        flip_h: p.flip_h,
-        straighten: p.straighten,
-        crop: p.crop,
-        exposure: p.exposure,
-        contrast: p.contrast,
-        highlights: p.highlights,
-        shadows: p.shadows,
-        whites: p.whites,
-        blacks: p.blacks,
-        fade: p.fade,
-        temperature: p.temperature,
-        tint: p.tint,
-        saturation: p.saturation,
-        vibrance: p.vibrance,
-        mono: p.mono,
-        shadow_hue: p.shadow_hue,
-        shadow_tone: p.shadow_tone,
-        highlight_hue: p.highlight_hue,
-        highlight_tone: p.highlight_tone,
-        bloom: p.bloom,
-        bloom_radius: p.bloom_radius,
-        bloom_threshold: p.bloom_threshold,
-        astig: p.astig,
-        astig_length: p.astig_length,
-        astig_angle: p.astig_angle,
-        astig_rays: p.astig_rays,
-        halation: p.halation,
-        layers: p.shown_layers().iter().filter(|l| l.graded && l.visible).cloned().collect(),
-        ..Params::default()
-    }
-}
-
-/// `process_ext`, reusing the cached global-look stage when it still applies.
-pub fn process_cached(src: &Arc<Img>, p: &Params, overlay: Option<usize>, cache: &mut StageCache) -> (Img, Option<Vec<f32>>) {
-    let key = upstream_key(p);
-    let hit = cache.slots.iter().position(|(s, k, _)| Arc::ptr_eq(s, src) && *k == key);
-    let stage = match hit {
-        Some(i) => cache.slots[i].2.clone(),
-        None => {
-            let stage = Arc::new(base(src, p));
-            cache.slots.retain(|(s, _, _)| !Arc::ptr_eq(s, src));
-            cache.slots.push((src.clone(), key, stage.clone()));
-            if cache.slots.len() > 2 {
-                cache.slots.remove(0);
-            }
-            stage
+/// Blend `img` back toward `before` outside the area `a`.
+fn keep_inside(img: &mut Img, before: &Img, a: &[f32]) {
+    img.px.par_iter_mut().zip(before.px.par_iter()).zip(a.par_iter()).for_each(|((px, b), &w)| {
+        for c in 0..3 {
+            px[c] = b[c] + (px[c] - b[c]) * w;
         }
-    };
-    finish(stage.0.clone(), &stage.1, p, overlay)
+    });
 }
 
-/// Half-size copy of a preview, for fast drafts while a slider is dragged.
-pub fn half(img: &Img) -> Img {
-    downscale(img, 2)
-}
-
-/// Geometry, layers under the look, exposure, white balance, glow, tone and colour.
-fn base(src: &Img, p: &Params) -> (Img, crate::masks::Space) {
-    let (mut img, space) = geometry(src, p);
-    // layers that take on the look are part of the picture from here on
-    if !p.layers.is_empty() {
-        crate::layers::composite(&mut img, &p.shown_layers(), true, &space);
+/// Run `f` on the picture, limited to the area `a` when there is one.
+fn limited(img: &mut Img, a: Option<&Vec<f32>>, f: impl FnOnce(&mut Img)) {
+    match a {
+        Some(a) => {
+            let before = img.clone();
+            f(img);
+            keep_inside(img, &before, a);
+        }
+        None => f(img),
     }
-    let u = img.unit();
+}
 
+/// The look: exposure, white balance and glow in linear light, then tone and
+/// colour. `glow_a` limits the glow to the Effects tab's mask.
+fn look(img: &mut Img, p: &Params, u: f32, glow_a: Option<&[f32]>) {
     // --- Linear-light stage: exposure, white balance, bloom, halation -------
     let gain = 2f32.powf(p.exposure);
     let wb = [
@@ -816,21 +773,22 @@ fn base(src: &Img, p: &Params) -> (Img, crate::masks::Space) {
         let astig = (p.astig > 0.001).then(|| light_streaks(&bright, (20.0 + p.astig_length * 380.0) * u, p.astig_angle.to_radians(), p.astig_rays.clamp(1, 4)));
         let tint = [1.0, 0.22, 0.06];
         img.px.par_iter_mut().enumerate().for_each(|(i, px)| {
+            let w = glow_a.map(|a| a[i]).unwrap_or(1.0);
             if let Some(b) = &bloom {
                 for c in 0..3 {
-                    px[c] += b.px[i][c] * p.bloom * 0.9;
+                    px[c] += b.px[i][c] * p.bloom * 0.9 * w;
                 }
             }
             if let Some(a) = &astig {
                 for c in 0..3 {
-                    px[c] += a.px[i][c] * p.astig * 3.5;
+                    px[c] += a.px[i][c] * p.astig * 3.5 * w;
                 }
             }
             if let Some(h) = &hal {
                 // only the light that bleeds *past* the highlight edge
                 let l = (luma(h.px[i]) - luma(bright.px[i]) * 0.6).max(0.0);
                 for c in 0..3 {
-                    px[c] += l * tint[c] * p.halation * 3.0;
+                    px[c] += l * tint[c] * p.halation * 3.0 * w;
                 }
             }
         });
@@ -920,17 +878,198 @@ fn base(src: &Img, p: &Params) -> (Img, crate::masks::Space) {
         }
         *px = c;
     });
-    (img, space)
 }
 
-/// Masks and everything after them.
-fn finish(mut img: Img, space: &crate::masks::Space, p: &Params, overlay: Option<usize>) -> (Img, Option<Vec<f32>>) {
-    let space = *space;
+/// The expensive first part of a render: geometry, retouching, layers under
+/// the look, and the look itself. The preview keeps it between renders.
+struct Stage {
+    img: Img,
+    space: crate::masks::Space,
+    /// When layers are in the picture, masks are judged on the photo alone
+    /// and already applied here; otherwise they still run on `img`.
+    judged: Option<Judged>,
+}
+
+struct Judged {
+    fx_a: Option<Vec<f32>>,
+    gl_a: Option<Vec<f32>>,
+    overlay: Option<Vec<f32>>,
+    cut: Option<Vec<f32>>,
+}
+
+fn effects_mask(m: &crate::masks::Mask) -> bool {
+    m.effects
+}
+
+fn glitch_mask(m: &crate::masks::Mask) -> bool {
+    m.glitch
+}
+
+fn has_glow(p: &Params) -> bool {
+    p.bloom > 0.001 || p.halation > 0.001 || p.astig > 0.001
+}
+
+/// Masks are judged on the photo alone whenever layers are in the picture.
+fn judged_first(p: &Params) -> bool {
+    !p.masks.is_empty() && p.shown_layers().iter().any(|l| l.visible && l.opacity > 0.001)
+}
+
+fn base(src: &Img, p: &Params, overlay: Option<usize>) -> Stage {
+    let (photo, space) = geometry(src, p);
+    let u = photo.unit();
+    let layers = p.shown_layers();
+    let glow = has_glow(p);
+    // the glow is added before the tone stage, so its mask is judged on the photo as it comes in
+    let glow_mask = |img: &Img| if glow { crate::masks::union_alpha(img, &p.masks, &space, effects_mask) } else { None };
+
+    if judged_first(p) {
+        // Masks are judged on the photo alone, so moving a layer never changes
+        // a selection, and a cut-out removes only the photo.
+        let glow_a = glow_mask(&photo);
+        let mut judge = photo.clone();
+        look(&mut judge, p, u, glow_a.as_deref());
+        let areas = crate::masks::apply(&mut judge, &p.masks, &space, u, overlay);
+        let fx_a = crate::masks::union_alpha(&judge, &p.masks, &space, effects_mask);
+        let gl_a = crate::masks::union_alpha(&judge, &p.masks, &space, glitch_mask);
+        drop(judge);
+        let mut img = photo;
+        let mut cut = areas.cutout.clone();
+        if let Some(a) = &mut cut {
+            // layers placed behind the photo show through what was cut out
+            crate::layers::composite_behind(&mut img, a, &layers, true, &space);
+        }
+        crate::layers::composite(&mut img, &layers, true, &space, cut.as_deref_mut());
+        look(&mut img, p, u, glow_a.as_deref());
+        crate::masks::adjust_with(&mut img, &p.masks, &areas, u);
+        return Stage { img, space, judged: Some(Judged { fx_a, gl_a, overlay: areas.overlay, cut }) };
+    }
+    // no layers (or no masks): everything is judged on the picture itself
+    let mut img = photo;
+    if !layers.is_empty() {
+        crate::layers::composite(&mut img, &layers, true, &space, None);
+    }
+    let glow_a = glow_mask(&img);
+    look(&mut img, p, u, glow_a.as_deref());
+    Stage { img, space, judged: None }
+}
+
+/// Masks (unless already judged) and everything after them.
+fn from_stage(mut img: Img, space: &crate::masks::Space, judged: Option<Judged>, p: &Params, overlay: Option<usize>) -> Rendered {
     let u = img.unit();
+    match judged {
+        Some(j) => finish(img, p, u, space, j.fx_a, j.gl_a, j.overlay, j.cut),
+        None => {
+            let areas = if p.masks.is_empty() { Default::default() } else { crate::masks::apply(&mut img, &p.masks, space, u, overlay) };
+            let fx_a = crate::masks::union_alpha(&img, &p.masks, space, effects_mask);
+            let gl_a = crate::masks::union_alpha(&img, &p.masks, space, glitch_mask);
+            finish(img, p, u, space, fx_a, gl_a, areas.overlay, areas.cutout)
+        }
+    }
+}
 
-    // --- Local adjustments -------------------------------------------------
-    let mask_alpha = if p.masks.is_empty() { None } else { crate::masks::apply(&mut img, &p.masks, &space, u, overlay) };
+/// Full render; also returns the opacity of mask `overlay` for on-screen display.
+pub fn process_ext(src: &Img, p: &Params, overlay: Option<usize>) -> Rendered {
+    let s = base(src, p, overlay);
+    from_stage(s.img, &s.space, s.judged, p, overlay)
+}
 
+/// Remembers the first stage of the last renders, so edits that only touch
+/// detail, glitch, texture, vignette, top layers or the border (and, without
+/// layers, masks and the mask overlay) skip geometry, exposure, colour and bloom.
+#[derive(Default)]
+pub struct StageCache {
+    /// (source, key) → stage. Two slots: draft and full preview.
+    slots: Vec<(Arc<Img>, StageKey, Arc<Stage>)>,
+}
+
+type StageKey = (Params, bool, Option<usize>);
+
+/// Only what `base` reads; everything else at its default.
+fn stage_key(p: &Params, overlay: Option<usize>) -> StageKey {
+    let judged = judged_first(p);
+    let masks = if judged {
+        p.masks.clone()
+    } else if has_glow(p) {
+        p.masks.iter().filter(|m| m.enabled && m.effects).cloned().collect()
+    } else {
+        Vec::new()
+    };
+    let key = Params {
+        rotate: p.rotate,
+        flip_h: p.flip_h,
+        straighten: p.straighten,
+        crop: p.crop,
+        exposure: p.exposure,
+        contrast: p.contrast,
+        highlights: p.highlights,
+        shadows: p.shadows,
+        whites: p.whites,
+        blacks: p.blacks,
+        fade: p.fade,
+        temperature: p.temperature,
+        tint: p.tint,
+        saturation: p.saturation,
+        vibrance: p.vibrance,
+        mono: p.mono,
+        shadow_hue: p.shadow_hue,
+        shadow_tone: p.shadow_tone,
+        highlight_hue: p.highlight_hue,
+        highlight_tone: p.highlight_tone,
+        bloom: p.bloom,
+        bloom_radius: p.bloom_radius,
+        bloom_threshold: p.bloom_threshold,
+        astig: p.astig,
+        astig_length: p.astig_length,
+        astig_angle: p.astig_angle,
+        astig_rays: p.astig_rays,
+        halation: p.halation,
+        layers: p.shown_layers().iter().filter(|l| l.graded && l.visible).cloned().collect(),
+        retouch: p.retouch.clone(),
+        masks,
+        ..Params::default()
+    };
+    (key, judged, if judged { overlay } else { None })
+}
+
+/// `process_ext`, reusing the cached first stage when it still applies.
+pub fn process_cached(src: &Arc<Img>, p: &Params, overlay: Option<usize>, cache: &mut StageCache) -> Rendered {
+    let key = stage_key(p, overlay);
+    let hit = cache.slots.iter().position(|(s, k, _)| Arc::ptr_eq(s, src) && *k == key);
+    let stage = match hit {
+        Some(i) => cache.slots[i].2.clone(),
+        None => {
+            let stage = Arc::new(base(src, p, overlay));
+            cache.slots.retain(|(s, _, _)| !Arc::ptr_eq(s, src));
+            cache.slots.push((src.clone(), key, stage.clone()));
+            if cache.slots.len() > 2 {
+                cache.slots.remove(0);
+            }
+            stage
+        }
+    };
+    let judged = stage.judged.as_ref().map(|j| Judged { fx_a: j.fx_a.clone(), gl_a: j.gl_a.clone(), overlay: j.overlay.clone(), cut: j.cut.clone() });
+    from_stage(stage.img.clone(), &stage.space, judged, p, overlay)
+}
+
+/// Half-size copy of a preview, for fast drafts while a slider is dragged.
+pub fn half(img: &Img) -> Img {
+    downscale(img, 2)
+}
+
+/// Everything after the look and the masks: detail, effects, glitches, the
+/// layers on top, and the border. `alpha` is the picture's opacity, if any of
+/// it was cut out.
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    mut img: Img,
+    p: &Params,
+    u: f32,
+    space: &crate::masks::Space,
+    fx_a: Option<Vec<f32>>,
+    gl_a: Option<Vec<f32>>,
+    overlay: Option<Vec<f32>>,
+    mut alpha: Option<Vec<f32>>,
+) -> Rendered {
     // --- Detail ------------------------------------------------------------
     if p.softness > 0.001 {
         let b = blur(&img, p.softness * 6.0 * u);
@@ -952,44 +1091,87 @@ fn finish(mut img: Img, space: &crate::masks::Space, p: &Params, overlay: Option
 
     // --- Resolution --------------------------------------------------------
     if p.lowres > 0.001 {
-        img = low_res(&img, p);
+        let lo = low_res(&img, p);
+        match &fx_a {
+            Some(a) => {
+                let before = std::mem::replace(&mut img, lo);
+                keep_inside(&mut img, &before, a);
+            }
+            None => img = lo,
+        }
     }
 
     // --- Glitch ------------------------------------------------------------
-    if p.blocks > 0.001 {
-        blocks(&mut img, p, u);
+    let split = p.rgb_split > 0.001;
+    let aberration = p.aberration > 0.001;
+    // RGB split (Glitch) and aberration (Effects) share one pass unless
+    // either tab is limited to a mask
+    let separate = fx_a.is_some() || gl_a.is_some();
+    let any_glitch = p.blocks > 0.001 || p.sort_amount > 0.001 || p.slices > 0.001 || p.streaks > 0.001 || split;
+    if any_glitch {
+        limited(&mut img, gl_a.as_ref(), |img| {
+            if p.blocks > 0.001 {
+                blocks(img, p, u);
+            }
+            if p.sort_amount > 0.001 {
+                pixel_sort(img, p);
+            }
+            if p.slices > 0.001 {
+                slices(img, p, u);
+            }
+            if p.streaks > 0.001 {
+                streaks(img, p, u);
+            }
+            if split && separate {
+                *img = channel_shift(img, p.rgb_split, p.rgb_angle, 0.0, u);
+            }
+        });
     }
-    if p.sort_amount > 0.001 {
-        pixel_sort(&mut img, p);
-    }
-    if p.slices > 0.001 {
-        slices(&mut img, p, u);
-    }
-    if p.streaks > 0.001 {
-        streaks(&mut img, p, u);
-    }
-    if p.rgb_split > 0.001 || p.aberration > 0.001 {
-        img = channel_shift(&img, p, u);
+    if separate {
+        if aberration {
+            limited(&mut img, fx_a.as_ref(), |img| *img = channel_shift(img, 0.0, 0.0, p.aberration, u));
+        }
+    } else if split || aberration {
+        img = channel_shift(&img, p.rgb_split, p.rgb_angle, p.aberration, u);
     }
 
     // --- Texture -----------------------------------------------------------
-    texture(&mut img, p, u);
+    let textured = p.posterize > 0.001 || p.scanlines > 0.001 || p.sensor_noise > 0.001 || p.grain > 0.001;
+    if textured {
+        limited(&mut img, fx_a.as_ref(), |img| texture(img, p, u));
+    }
 
     // --- Vignette ----------------------------------------------------------
     if p.vignette.abs() > 0.001 {
-        vignette(&mut img, p);
+        limited(&mut img, fx_a.as_ref(), |img| vignette(img, p));
     }
 
     // --- Layers placed on top of the finished look ---------------------------
     if !p.layers.is_empty() {
-        crate::layers::composite(&mut img, &p.shown_layers(), false, &space);
+        crate::layers::composite(&mut img, &p.shown_layers(), false, space, alpha.as_deref_mut());
+        if let Some(a) = &mut alpha {
+            crate::layers::composite_behind(&mut img, a, &p.shown_layers(), false, space);
+        }
     }
 
     // --- Frame -------------------------------------------------------------
     if p.border > 0.001 {
+        let (iw, ih) = (img.w, img.h);
         img = border(&img, p);
+        // the border itself is always opaque
+        alpha = alpha.map(|a| pad_alpha(&a, iw, ih, img.w, img.h));
     }
-    (img, mask_alpha)
+    Rendered { img, overlay, alpha }
+}
+
+/// Centre a `w × h` opacity map in a fully opaque `ow × oh` one.
+fn pad_alpha(a: &[f32], w: usize, h: usize, ow: usize, oh: usize) -> Vec<f32> {
+    let (bx, by) = ((ow - w) / 2, (oh - h) / 2);
+    let mut out = vec![1.0; ow * oh];
+    for y in 0..h {
+        out[(y + by) * ow + bx..(y + by) * ow + bx + w].copy_from_slice(&a[y * w..(y + 1) * w]);
+    }
+    out
 }
 
 fn blocks(img: &mut Img, p: &Params, u: f32) {
@@ -1143,11 +1325,11 @@ fn streaks(img: &mut Img, p: &Params, u: f32) {
     }
 }
 
-fn channel_shift(img: &Img, p: &Params, u: f32) -> Img {
-    let a = p.rgb_angle.to_radians();
-    let d = p.rgb_split * 12.0 * u;
+fn channel_shift(img: &Img, split: f32, angle: f32, aberration: f32, u: f32) -> Img {
+    let a = angle.to_radians();
+    let d = split * 12.0 * u;
     let (dx, dy) = (a.cos() * d, a.sin() * d);
-    let k = p.aberration * 0.016;
+    let k = aberration * 0.016;
     let (cx, cy) = (img.w as f32 / 2.0, img.h as f32 / 2.0);
     let mut out = Img::new(img.w, img.h);
     out.px.par_chunks_mut(img.w).enumerate().for_each(|(y, row)| {
@@ -1563,6 +1745,124 @@ pub fn builtin_presets() -> Vec<(String, Params)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::masks::{Mask, Shape};
+
+    fn grey(w: usize, h: usize) -> Img {
+        Img { w, h, px: vec![[0.5; 3]; w * h] }
+    }
+
+    /// A radial mask over the left part of the frame.
+    fn left_spot() -> Mask {
+        Mask { shape: Shape::Radial { c: [0.25, 0.5], rx: 0.12, ry: 0.12, angle: 0.0, feather: 0.05 }, ..Mask::default() }
+    }
+
+    #[test]
+    fn effects_can_be_limited_to_a_mask() {
+        let src = grey(200, 100);
+        let p = Params { grain: 1.0, masks: vec![Mask { effects: true, ..left_spot() }], ..Params::default() };
+        let out = process(&src, &p);
+        let spread = |x0: usize, x1: usize| {
+            let v: Vec<f32> = (40..60).flat_map(|y| (x0..x1).map(move |x| (x, y))).map(|(x, y)| out.px[y * 200 + x][0]).collect();
+            v.iter().cloned().fold(f32::MIN, f32::max) - v.iter().cloned().fold(f32::MAX, f32::min)
+        };
+        assert!(spread(40, 60) > 0.05, "grain inside the mask");
+        assert!(spread(150, 170) < 1e-4, "no grain outside it");
+        // without the mask the same grain covers everything
+        let all = process(&src, &Params { grain: 1.0, ..Params::default() });
+        assert!((150..170).any(|x| (all.px[50 * 200 + x][0] - 0.5).abs() > 0.02));
+    }
+
+    #[test]
+    fn transparent_masks_cut_the_picture_out() {
+        let src = grey(200, 100);
+        let p = Params { masks: vec![Mask { transparent: true, ..left_spot() }], ..Params::default() };
+        let r = process_ext(&src, &p, None);
+        let a = r.alpha.expect("a cut-out gives an alpha channel");
+        assert!(a[50 * 200 + 50] < 0.01);
+        assert!(a[50 * 200 + 160] > 0.99);
+        // the border stays opaque and the alpha grows with it
+        let r = process_ext(&src, &Params { border: 0.5, ..p.clone() }, None);
+        let a = r.alpha.unwrap();
+        assert_eq!(a.len(), r.img.w * r.img.h);
+        assert!(a[0] > 0.99);
+        // no cut-out, no alpha
+        assert!(process_ext(&src, &Params::default(), None).alpha.is_none());
+    }
+
+    #[test]
+    fn levelling_by_the_line_angle_makes_it_horizontal() {
+        // a bright line tilted by +8° on screen (down to the right)
+        let (w, h) = (400usize, 300usize);
+        let t = 8f32.to_radians().tan();
+        let px = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as f32, (i / w) as f32);
+                let ly = 150.0 + (x - 200.0) * t;
+                if (y - ly).abs() < 2.0 { [1.0; 3] } else { [0.0; 3] }
+            })
+            .collect();
+        let src = Img { w, h, px };
+        // what the Level Photo button does: straighten by minus the tilt
+        let out = process(&src, &Params { straighten: -8.0, ..Params::default() });
+        let row_of_line = |x: usize| (0..out.h).max_by(|&a, &b| out.px[a * out.w + x][0].total_cmp(&out.px[b * out.w + x][0])).unwrap();
+        let (l, r) = (row_of_line(120), row_of_line(280));
+        assert!((l as i32 - r as i32).abs() <= 2, "line rows {l} and {r} should match");
+    }
+
+    fn solid_layer(name: &str, rgba: [u8; 4]) -> String {
+        let path = format!("test://{name}");
+        crate::layers::register(&path, &image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(8, 8, image::Rgba(rgba))));
+        path
+    }
+
+    /// Left half blue "sky", right half orange "subject"; the sky is selected
+    /// with an Object mask and cut out.
+    fn sky_and_subject() -> (Img, Params) {
+        let (w, h) = (200usize, 100usize);
+        let px = (0..w * h).map(|i| if i % w < 100 { [0.45, 0.65, 0.9] } else { [0.9, 0.5, 0.1] }).collect();
+        let seeds = vec![crate::masks::Seed { p: [0.2, 0.5], add: true }];
+        let shape = Shape::Object { seeds, threshold: 0.25, connected: true, smooth: 0.0, feather: 0.0 };
+        let p = Params { masks: vec![Mask { shape, transparent: true, ..Mask::default() }], ..Params::default() };
+        (Img { w, h, px }, p)
+    }
+
+    #[test]
+    fn layers_never_change_or_get_cut_by_a_mask() {
+        let (src, mut p) = sky_and_subject();
+        let alone = process_ext(&src, &p, None).alpha.unwrap();
+        assert!(alone[50 * 200 + 20] < 0.01 && alone[50 * 200 + 150] > 0.99);
+        // a sky-blue layer over the subject, right next to the cut-out sky, and
+        // another one covering the clicked point itself
+        let blue = solid_layer("pipeline-blue", [115, 166, 230, 255]);
+        let over_subject = crate::layers::Layer { path: blue.clone(), aspect: 1.0, x: 0.75, y: 0.5, scale: 0.2, ..Default::default() };
+        let over_seed = crate::layers::Layer { path: blue, aspect: 1.0, x: 0.2, y: 0.5, scale: 0.1, ..Default::default() };
+        p.layers = vec![over_subject, over_seed];
+        let r = process_ext(&src, &p, None);
+        let a = r.alpha.unwrap();
+        assert!(a[50 * 200 + 150] > 0.99, "the layer over the subject is not cut out");
+        assert!(a[50 * 200 + 40] > 0.99, "the layer over the clicked point is not cut out");
+        assert!(a[50 * 200 + 5] < 0.01, "the rest of the sky stays cut out");
+        assert!(a[50 * 200 + 190] > 0.99, "the subject stays");
+    }
+
+    #[test]
+    fn layers_behind_the_photo_fill_what_was_cut_out() {
+        let (src, mut p) = sky_and_subject();
+        let green = solid_layer("pipeline-green", [0, 255, 0, 255]);
+        p.layers = vec![crate::layers::Layer { path: green, aspect: 2.0, scale: 1.0, behind: true, ..Default::default() }];
+        let r = process_ext(&src, &p, None);
+        let a = r.alpha.unwrap();
+        assert!(a.iter().all(|&v| v > 0.99), "the frame is filled again");
+        let sky = r.img.px[50 * 200 + 20];
+        assert!(sky[1] > 0.9 && sky[0] < 0.1, "the new background shows where the sky was: {sky:?}");
+        let subject = r.img.px[50 * 200 + 160];
+        assert!(subject[0] > 0.8 && subject[1] < 0.6, "the subject stays in front: {subject:?}");
+        // with nothing cut out, a layer behind the photo is hidden
+        let plain = Params { masks: Vec::new(), ..p.clone() };
+        let r = process_ext(&src, &plain, None);
+        assert!(r.alpha.is_none());
+        assert_eq!(r.img.px[50 * 200 + 20], process(&src, &Params::default()).px[50 * 200 + 20]);
+    }
 
     fn gradient(w: usize, h: usize) -> Img {
         let mut img = Img::new(w, h);
@@ -1573,36 +1873,41 @@ mod tests {
         img
     }
 
+    /// Cached and uncached renders agree through misses and hits, with and
+    /// without layers (whose masks are judged in the cached stage).
     #[test]
     fn cached_render_matches_uncached() {
         let src = Arc::new(gradient(64, 48));
-        let mut cache = StageCache::default();
-        let mut p = Params { exposure: 0.4, bloom: 0.5, contrast: 0.3, ..Params::default() };
-        let mask = crate::masks::Mask { shape: crate::masks::Shape::Radial { c: [0.5, 0.5], rx: 0.2, ry: 0.2, angle: 0.0, feather: 0.5 }, ..Default::default() };
-        p.masks.push(mask);
-        // a miss, then a hit with only downstream edits, then a miss again
-        for step in 0..3 {
-            match step {
-                1 => {
-                    p.vignette = 0.5;
-                    p.masks[0].adj.exposure = 1.0;
-                }
-                2 => p.exposure = -0.2,
-                _ => {}
+        let red = solid_layer("cache-red", [255, 0, 0, 255]);
+        for layered in [false, true] {
+            let mut cache = StageCache::default();
+            let mut p = Params { exposure: 0.4, bloom: 0.5, contrast: 0.3, ..Params::default() };
+            p.masks.push(Mask { shape: Shape::Radial { c: [0.5, 0.5], rx: 0.2, ry: 0.2, angle: 0.0, feather: 0.5 }, ..Default::default() });
+            if layered {
+                p.layers.push(crate::layers::Layer { path: red.clone(), aspect: 1.0, x: 0.2, y: 0.3, scale: 0.2, ..Default::default() });
             }
-            let (a, oa) = process_cached(&src, &p, Some(0), &mut cache);
-            let (b, ob) = process_ext(&src, &p, Some(0));
-            assert_eq!(a.px, b.px, "step {step}");
-            assert_eq!(oa, ob, "step {step}");
+            for step in 0..5 {
+                match step {
+                    1 => p.vignette = 0.5,
+                    2 => p.masks[0].adj.exposure = 1.0,
+                    3 => p.masks[0].effects = true,
+                    4 => p.exposure = -0.2,
+                    _ => {}
+                }
+                let a = process_cached(&src, &p, Some(0), &mut cache);
+                let b = process_ext(&src, &p, Some(0));
+                assert_eq!(a.img.px, b.img.px, "layered {layered}, step {step}");
+                assert_eq!(a.overlay, b.overlay, "layered {layered}, step {step}");
+                assert_eq!(a.alpha, b.alpha, "layered {layered}, step {step}");
+            }
         }
     }
 
     #[test]
     fn hidden_group_hides_its_layers() {
-        let src = Arc::new(gradient(40, 30));
-        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255])));
-        crate::layers::register("test://group-red", &img);
-        let layer = crate::layers::Layer { path: "test://group-red".into(), scale: 1.5, group: 4, ..Default::default() };
+        let src = gradient(40, 30);
+        let red = solid_layer("group-red", [255, 0, 0, 255]);
+        let layer = crate::layers::Layer { path: red, scale: 1.5, group: 4, ..Default::default() };
         let mut p = Params { layers: vec![layer], ..Params::default() };
         p.layer_groups.push(crate::layers::LayerGroup { id: 4, ..Default::default() });
         let shown = process(&src, &p);

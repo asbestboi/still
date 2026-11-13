@@ -237,9 +237,24 @@ pub fn export(doc: &Doc, params: &Params, s: &ExportSettings, path: &Path) -> Re
     } else {
         full.to_rgb32f()
     };
-    let mut img = pipeline::process(&Img::from_rgb32f(&src), params);
+    let r = pipeline::process_ext(&Img::from_rgb32f(&src), params, None);
     drop(src);
+    let (mut img, alpha) = (r.img, r.alpha);
     pipeline::output_sharpen(&mut img, [0.0, 0.25, 0.5, 0.9][s.sharpen.min(3)]);
+    // JPEG has no transparency: cut-out areas become white
+    let alpha = match (alpha, s.format) {
+        (Some(a), Format::Jpeg) => {
+            flatten_on_white(&mut img, &a);
+            None
+        }
+        (a, _) => a,
+    };
+    let a = alpha.as_deref();
+    let (c8, c16) = if a.is_some() {
+        (image::ExtendedColorType::Rgba8, image::ExtendedColorType::Rgba16)
+    } else {
+        (image::ExtendedColorType::Rgb8, image::ExtendedColorType::Rgb16)
+    };
 
     let (w, h) = (img.w as u32, img.h as u32);
     let deep = s.depth16 && s.format.supports_16();
@@ -261,7 +276,7 @@ pub fn export(doc: &Doc, params: &Params, s: &ExportSettings, path: &Path) -> Re
                 if let Some(e) = exif {
                     let _ = enc.set_exif_metadata(e);
                 }
-                enc.write_image(&to_u8(&img), w, h, image::ExtendedColorType::Rgb8).map_err(|e| e.to_string())
+                enc.write_image(&to_u8(&img, None), w, h, image::ExtendedColorType::Rgb8).map_err(|e| e.to_string())
             }
             Format::Png => {
                 let mut enc = image::codecs::png::PngEncoder::new_with_quality(
@@ -275,27 +290,19 @@ pub fn export(doc: &Doc, params: &Params, s: &ExportSettings, path: &Path) -> Re
                 if let Some(e) = exif {
                     let _ = enc.set_exif_metadata(e);
                 }
-                if deep {
-                    enc.write_image(&to_u16_bytes(&img), w, h, image::ExtendedColorType::Rgb16)
-                } else {
-                    enc.write_image(&to_u8(&img), w, h, image::ExtendedColorType::Rgb8)
-                }
-                .map_err(|e| e.to_string())
+                if deep { enc.write_image(&to_u16_bytes(&img, a), w, h, c16) } else { enc.write_image(&to_u8(&img, a), w, h, c8) }
+                    .map_err(|e| e.to_string())
             }
             Format::Tiff => {
                 let mut enc = image::codecs::tiff::TiffEncoder::new(&mut out);
                 if let Some(i) = icc {
                     let _ = enc.set_icc_profile(i);
                 }
-                if deep {
-                    enc.write_image(&to_u16_bytes(&img), w, h, image::ExtendedColorType::Rgb16)
-                } else {
-                    enc.write_image(&to_u8(&img), w, h, image::ExtendedColorType::Rgb8)
-                }
-                .map_err(|e| e.to_string())
+                if deep { enc.write_image(&to_u16_bytes(&img, a), w, h, c16) } else { enc.write_image(&to_u8(&img, a), w, h, c8) }
+                    .map_err(|e| e.to_string())
             }
             Format::Webp => image::codecs::webp::WebPEncoder::new_lossless(&mut out)
-                .write_image(&to_u8(&img), w, h, image::ExtendedColorType::Rgb8)
+                .write_image(&to_u8(&img, a), w, h, c8)
                 .map_err(|e| e.to_string()),
         }
     })();
@@ -314,27 +321,44 @@ pub fn export(doc: &Doc, params: &Params, s: &ExportSettings, path: &Path) -> Re
     }
 }
 
-/// 8-bit quantisation with a tiny triangular dither, which prevents banding
-/// in skies and smooth gradients.
-fn to_u8(img: &Img) -> Vec<u8> {
+/// Composite cut-out areas onto white, for formats without transparency.
+fn flatten_on_white(img: &mut Img, a: &[f32]) {
     use rayon::prelude::*;
-    let mut out = vec![0u8; img.w * img.h * 3];
-    out.par_chunks_mut(img.w * 3).enumerate().for_each(|(y, row)| {
+    img.px.par_iter_mut().zip(a.par_iter()).for_each(|(p, &a)| {
+        for v in p.iter_mut() {
+            *v = *v * a + (1.0 - a);
+        }
+    });
+}
+
+/// 8-bit quantisation with a tiny triangular dither, which prevents banding
+/// in skies and smooth gradients. With `alpha`, writes RGBA.
+fn to_u8(img: &Img, alpha: Option<&[f32]>) -> Vec<u8> {
+    use rayon::prelude::*;
+    let ch = if alpha.is_some() { 4 } else { 3 };
+    let mut out = vec![0u8; img.w * img.h * ch];
+    out.par_chunks_mut(img.w * ch).enumerate().for_each(|(y, row)| {
         for x in 0..img.w {
-            let p = img.px[y * img.w + x];
+            let i = y * img.w + x;
+            let p = img.px[i];
             for c in 0..3 {
                 let n = tri_dither(x as u32, y as u32, c as u32);
-                row[x * 3 + c] = (p[c] * 255.0 + n).round().clamp(0.0, 255.0) as u8;
+                row[x * ch + c] = (p[c] * 255.0 + n).round().clamp(0.0, 255.0) as u8;
+            }
+            if let Some(a) = alpha {
+                row[x * ch + 3] = (a[i] * 255.0).round().clamp(0.0, 255.0) as u8;
             }
         }
     });
     out
 }
 
-fn to_u16_bytes(img: &Img) -> Vec<u8> {
-    let mut out = Vec::with_capacity(img.w * img.h * 6);
-    for p in &img.px {
-        for c in p {
+fn to_u16_bytes(img: &Img, alpha: Option<&[f32]>) -> Vec<u8> {
+    let ch = if alpha.is_some() { 4 } else { 3 };
+    let mut out = Vec::with_capacity(img.w * img.h * ch * 2);
+    for (i, p) in img.px.iter().enumerate() {
+        let a = alpha.map(|a| a[i]);
+        for c in p.iter().copied().chain(a) {
             let v = (c.clamp(0.0, 1.0) * 65535.0).round() as u16;
             out.extend_from_slice(&v.to_ne_bytes());
         }
@@ -558,6 +582,32 @@ mod tests {
         std::fs::write(&path, "{\"hello\": 1}").unwrap();
         assert!(read_looks(&path).is_err());
         assert_eq!(look_file_name("Field / Night"), "Field - Night.stillpreset");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cut_outs_export_with_transparency() {
+        let dir = std::env::temp_dir().join(format!("still-alpha-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("p.png");
+        image::RgbImage::from_pixel(64, 32, image::Rgb([120, 120, 120])).save(&photo).unwrap();
+        let doc = load(&photo, 64).unwrap();
+        let mask = crate::masks::Mask {
+            shape: crate::masks::Shape::Radial { c: [0.25, 0.5], rx: 0.1, ry: 0.1, angle: 0.0, feather: 0.05 },
+            transparent: true,
+            ..Default::default()
+        };
+        let params = Params { masks: vec![mask], ..Params::default() };
+        let png = dir.join("out.png");
+        let settings = ExportSettings { format: Format::Png, depth16: false, keep_metadata: false, ..Default::default() };
+        export(&doc, &params, &settings, &png).unwrap();
+        let back = image::open(&png).unwrap().to_rgba8();
+        assert_eq!(back.get_pixel(16, 16)[3], 0, "the masked spot is transparent");
+        assert_eq!(back.get_pixel(56, 16)[3], 255, "the rest stays opaque");
+        // JPEG has no alpha: the spot is filled with white
+        let jpg = dir.join("out.jpg");
+        export(&doc, &params, &ExportSettings { format: Format::Jpeg, keep_metadata: false, ..Default::default() }, &jpg).unwrap();
+        assert!(image::open(&jpg).unwrap().to_rgb8().get_pixel(16, 16)[0] > 240);
         let _ = std::fs::remove_dir_all(dir);
     }
 

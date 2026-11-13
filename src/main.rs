@@ -8,6 +8,7 @@ mod io;
 mod layers;
 mod masks;
 mod pipeline;
+mod retouch;
 mod ui_kit;
 
 /// Headless batch mode: `still --render <look> <input> <output>`
