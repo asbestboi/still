@@ -30,6 +30,7 @@ still --render "Overcast" in.RW2 out.tif
 ## What it does
 
 - **Opens** JPEG, PNG, TIFF (8/16-bit), WebP, EXR, and camera RAW (RW2, CR2/CR3, NEF, ARW, DNG, RAF, ORF…). Drop a photo on the window, open it from the **Recent** list on the start screen, or paste one with Ctrl+V
+- **Photos:** go through a whole folder before editing. Click **Photos** in the toolbar, choose a folder, and step through its photos with the arrow keys or the filmstrip. **Mark** (M) the keepers and **Move to Trash** (N or Delete) the rest; RAWs show the preview the camera stored inside them, so browsing is quick. A mark is part of the file name: `DSC00747.ARW` becomes `A_DSC00747.ARW`, so marks stay after closing Still and the keepers sort together in any file manager. Sidecar files from other editors (`.xmp`, `.pp3`, `.arp`) are renamed and binned along with their photo. **Show Marked** narrows the list to the keepers, and **Edit Photo** (Enter or double-click) opens one in the editor; click **Photos** again to go back
 - **Presets:** fifteen built-in presets with live thumbnails (including Pathologic, Deus Ex, MGS4 and Half-Life 2 “City 17” game presets), plus your own saved presets
 - **Adjust:** exposure, contrast, highlights/shadows, whites/blacks, fade, white balance, saturation/vibrance, B&W, split toning, sharpen/soften
 - **Masks:** local adjustments through **Object** selections (click a subject and it grows to its edges, with a threshold; place + points to add to it and − points where it should not go, and click a point to delete it), linear gradients, radial (elliptical) masks, a brush with feather, flow and erase, and luminance or colour ranges. You can refine any shape by a luminance or colour range, picking the colour from the photo. Each mask has its own exposure, contrast, highlights, shadows, temperature, tint, saturation, sharpness and colour wash, plus invert, amount, a visibility toggle, a red overlay that stays up while you shape the mask and hides once you adjust. Double-click a mask to rename it; right-click → **Change Color** gives it a label colour, which its overlay then uses. **Make Transparent** cuts a mask's area out of the picture (select a subject, invert, and the background is gone, or put a layer **Behind Photo** to replace it); PNG, TIFF and WebP exports keep the transparency. Masks stay attached to the picture when you re-crop, and they render the same in the preview and the export
@@ -39,7 +40,7 @@ still --render "Overcast" in.RW2 out.tif
 - **Effects:** bloom, halation, astigmatism (lights smear into streaks, crosses or stars), chromatic aberration, vignette, film grain, CCD noise, scanlines, posterize with ordered dither, downsample (blocky or soft low resolution). **Apply To** limits them to one mask
 - **Glitch:** pixel sort, data streaks, slice shift, RGB split, block compression. Each one is seeded, so **Shuffle** gives a new arrangement you can reproduce. **Apply To** limits them to one mask
 - **Crop:** drag the crop rectangle on the photo; Free, Original, Square, 5:4, 3:2, 4:3, 16:9, 2.39:1 and XPan presets in landscape or portrait; straighten (±45°), a horizon line you lay along the horizon (or any angle) and **Level Photo** to match, rotate, flip, border; a rule-of-thirds grid while cropping, and thirds or golden-ratio guides in every tab
-- **Export:** JPEG (quality), PNG/TIFF at 8 or 16 bits, WebP lossless; resize by long edge or percent (Lanczos); output sharpening; keeps EXIF metadata and the embedded colour profile; 8-bit output is dithered so gradients don't band; writes atomically
+- **Export:** JPEG (quality), PNG/TIFF at 8 or 16 bits, WebP lossless; resize by long edge or percent (Lanczos); output sharpening; keeps EXIF metadata and the embedded colour profile; 8-bit output is dithered so gradients don't band; writes atomically. Exported files are named after the photo with `-edited` added (`A_DSC00747-edited.jpg`), so edited copies are easy to search for and sit right after their photo; change the suffix in the Export sheet
 
 Effect sizes scale with image resolution, so the preview matches the full-size export. Zoom in past the preview's resolution and Still renders a sharper preview once the zoom settles. While you drag a slider on a large photo, the preview drafts at half size and sharpens when you let go.
 
@@ -89,6 +90,10 @@ still --render friend.stillpreset in.jpg out.jpg
 | Ctrl+0 / double-click | Fit / zoom |
 | Double-click a slider | Reset it |
 | Shift + drag a slider | Fine adjustment |
+| ← / → (Photos) | Previous / next photo |
+| M (Photos) | Mark or unmark the photo |
+| N or Delete (Photos) | Move the photo to the Trash |
+| Enter (Photos) | Edit the photo |
 
 Settings, saved presets and the Recent list are stored in `~/.config/still/settings.json` (Windows: `%APPDATA%\Still\settings.json`).
 

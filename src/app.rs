@@ -5,9 +5,11 @@ use crate::pipeline::{self, Aspect, Histogram, Img, Params};
 use crate::retouch::CloneStroke;
 use crate::ui_kit::{self as k, Btn, Fmt};
 use egui::{Align2, Color32, CornerRadius, Id, Pos2, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
+use crate::browse;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
@@ -38,6 +40,10 @@ enum Msg {
     LayerReady(Result<(PathBuf, f32), String>),
     /// A sharper source for zoomed-in viewing: photo, long edge, image.
     DetailReady(PathBuf, u32, Arc<Img>),
+    /// Photos browser: the folder to go through.
+    BrowseDir(PathBuf),
+    /// Photos browser: a photo's big view (if asked for) and thumbnail; no thumbnail when it couldn't be read.
+    BrowseLoaded { path: PathBuf, view: Option<egui::ColorImage>, thumb: Option<egui::ColorImage> },
 }
 
 /// Largest long edge used for the sharper zoomed-in preview.
@@ -135,6 +141,85 @@ fn spawn_worker(ctx: egui::Context, jobs: Receiver<Job>, out: Sender<Msg>) {
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Photos browser loading
+// ---------------------------------------------------------------------------
+
+/// Long edge of the big picture in the Photos browser.
+const BROWSE_VIEW_EDGE: u32 = 2000;
+/// Long edge of a filmstrip thumbnail.
+const BROWSE_THUMB_EDGE: u32 = 240;
+/// How many photos either side of the current one keep their big picture.
+const BROWSE_KEEP: usize = 2;
+/// The colour of a marked photo's badge.
+const MARK_COLOR: Color32 = Color32::from_rgb(255, 204, 0);
+
+/// A photo to load for the browser, and whether it needs the big picture.
+type LoadReq = (PathBuf, bool);
+
+/// What the browser wants loaded, most wanted first, and what's being loaded now.
+#[derive(Default)]
+struct LoadQueue {
+    want: Vec<LoadReq>,
+    busy: HashSet<LoadReq>,
+}
+
+type SharedQueue = Arc<(Mutex<LoadQueue>, Condvar)>;
+
+fn spawn_browse_loaders(ctx: egui::Context, queue: SharedQueue, out: Sender<Msg>) {
+    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 4) - 1;
+    for _ in 0..n {
+        let (ctx, queue, out) = (ctx.clone(), queue.clone(), out.clone());
+        std::thread::spawn(move || {
+            loop {
+                let req = {
+                    let (m, cv) = &*queue;
+                    let mut q = m.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        if let Some(i) = q.want.iter().position(|r| !q.busy.contains(r)) {
+                            let r = q.want.remove(i);
+                            q.busy.insert(r.clone());
+                            break r;
+                        }
+                        q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                    }
+                };
+                let rgb = |i: image::RgbImage| egui::ColorImage::from_rgb([i.width() as usize, i.height() as usize], i.as_raw());
+                let (view, thumb) = match browse::load(&req.0, req.1.then_some(BROWSE_VIEW_EDGE), BROWSE_THUMB_EDGE) {
+                    Ok((v, t)) => (v.map(rgb), Some(rgb(t))),
+                    Err(_) => (None, None),
+                };
+                queue.0.lock().unwrap_or_else(|e| e.into_inner()).busy.remove(&req);
+                if out.send(Msg::BrowseLoaded { path: req.0, view, thumb }).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+        });
+    }
+}
+
+/// The Photos browser: a folder of photos to go through, mark and bin.
+struct Browser {
+    dir: Option<PathBuf>,
+    /// The folder's photos in shooting order, with when each last changed.
+    files: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    cur: Option<PathBuf>,
+    /// 0 all, 1 only marked
+    show: usize,
+    thumbs: HashMap<PathBuf, egui::TextureHandle>,
+    views: HashMap<PathBuf, egui::TextureHandle>,
+    failed: HashSet<PathBuf>,
+    /// Plain stems of photos that have an edited copy in the folder.
+    edited: HashSet<String>,
+    queue: SharedQueue,
+    /// What was last put in the queue, so it is only rebuilt when something changed.
+    want_key: Option<(Option<PathBuf>, usize, usize, usize)>,
+    /// Filmstrip scroll position, and whether to bring the current photo into view.
+    strip_x: f32,
+    reveal: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +575,9 @@ pub struct App {
     exporting: bool,
     dialog_open: bool,
     toast: Option<(String, Option<PathBuf>, Instant)>,
+    /// The Photos browser is showing instead of the editor.
+    photos: bool,
+    browse: Browser,
 
     jobs: Sender<Job>,
     tx: Sender<Msg>,
@@ -503,6 +591,8 @@ impl App {
         let (jobs, jobs_rx) = channel();
         let (tx, rx) = channel();
         spawn_worker(cc.egui_ctx.clone(), jobs_rx, tx.clone());
+        let queue: SharedQueue = Arc::default();
+        spawn_browse_loaders(cc.egui_ctx.clone(), queue.clone(), tx.clone());
         let saved = io::load_saved();
         let mut app = Self {
             doc: None,
@@ -576,6 +666,21 @@ impl App {
             exporting: false,
             dialog_open: false,
             toast: None,
+            photos: false,
+            browse: Browser {
+                dir: saved.photos_dir.clone(),
+                files: Vec::new(),
+                cur: None,
+                show: 0,
+                thumbs: HashMap::new(),
+                views: HashMap::new(),
+                failed: HashSet::new(),
+                edited: HashSet::new(),
+                queue,
+                want_key: None,
+                strip_x: 0.0,
+                reveal: true,
+            },
             jobs,
             tx,
             rx,
@@ -599,6 +704,7 @@ impl App {
             guide_golden: self.guide_golden,
             prefs: self.prefs.clone(),
             recent: self.recent.clone(),
+            photos_dir: self.browse.dir.clone(),
         });
     }
 
@@ -935,6 +1041,7 @@ impl App {
                 }
                 Msg::Loaded(Ok(doc)) => {
                     self.loading = None;
+                    self.photos = false;
                     self.orig_tex = Some(ctx.load_texture("original", to_color_image(&doc.preview), egui::TextureOptions::LINEAR));
                     let portrait = doc.preview.h > doc.preview.w;
                     self.doc = Some(doc);
@@ -1010,6 +1117,27 @@ impl App {
                     }
                 }
                 Msg::Info(text, dir) => self.toast = Some((text, dir, Instant::now())),
+                Msg::BrowseDir(d) => {
+                    self.dialog_open = false;
+                    self.browse_open(d, None);
+                }
+                Msg::BrowseLoaded { path, view, thumb } => {
+                    let opts = egui::TextureOptions::LINEAR;
+                    match thumb {
+                        Some(t) => {
+                            self.browse.thumbs.insert(path.clone(), ctx.load_texture("browse_thumb", t, opts));
+                        }
+                        None => {
+                            self.browse.failed.insert(path.clone());
+                        }
+                    }
+                    // a big picture only matters while the photo is still near the current one
+                    if let Some(v) = view
+                        && self.browse_nearby().contains(&path)
+                    {
+                        self.browse.views.insert(path, ctx.load_texture("browse_view", v, opts));
+                    }
+                }
                 Msg::DetailReady(path, edge, img) => {
                     if self.doc.as_ref().map(|d| d.path == path).unwrap_or(false) && self.detail_req == Some(edge) {
                         self.detail_src = Some((path, edge, img));
@@ -1196,6 +1324,19 @@ impl App {
         if sc(Modifiers::COMMAND, Key::O) {
             self.pick_file(ctx);
         }
+        if self.photos {
+            if sc(Modifiers::COMMAND, Key::Comma) {
+                self.settings_open = !self.settings_open;
+            }
+            if self.settings_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.settings_open = false;
+                self.persist();
+            }
+            if !text_focus && !self.settings_open {
+                self.browse_keys(ctx);
+            }
+            return;
+        }
         if self.doc.is_some() && sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) {
             self.save(true, ctx);
         }
@@ -1341,6 +1482,17 @@ impl App {
     fn handle_drop(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        if self.photos {
+            // the browser goes through what was dropped: a folder, or a photo's folder
+            if let Some(p) = dropped.into_iter().next() {
+                if p.is_dir() {
+                    self.browse_open(p, None);
+                } else if let Some(d) = p.parent() {
+                    self.browse_open(d.to_path_buf(), Some(p.clone()));
+                }
+            }
+            return;
+        }
         let (looks, photos): (Vec<PathBuf>, Vec<PathBuf>) = dropped.into_iter().partition(|p| io::is_look_file(p));
         if !looks.is_empty() {
             self.import_look_files(&looks);
@@ -1384,14 +1536,17 @@ impl eframe::App for App {
             .frame(egui::Frame::NONE.fill(k::WINDOW).inner_margin(egui::Margin::symmetric(14, 0)))
             .show(ui, |ui| self.toolbar(ui));
 
+        let photos = self.photos;
         egui::Panel::right("sidebar")
             .exact_size(320.0)
             .resizable(false)
             .frame(egui::Frame::NONE.fill(k::SIDEBAR).inner_margin(egui::Margin { left: 14, right: 14, top: 14, bottom: 0 }))
-            .show(ui, |ui| self.sidebar(ui));
+            .show(ui, |ui| if photos { self.photos_sidebar(ui) } else { self.sidebar(ui) });
 
         let canvas_bg = CANVAS_COLORS[self.prefs.canvas.min(2)];
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(canvas_bg)).show(ui, |ui| self.canvas(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(canvas_bg))
+            .show(ui, |ui| if photos { self.photos_view(ui) } else { self.canvas(ui) });
 
         self.export_sheet(&ctx);
         self.settings_sheet(&ctx);
@@ -1415,19 +1570,29 @@ impl App {
         let rect = ui.max_rect();
         // how far the buttons reach on each side, so the title can stay clear of them
         let (mut left_end, mut right_start) = (rect.left(), rect.right());
+        let editing = !self.photos;
         ui.horizontal_centered(|ui| {
+            // blue while the browser is showing; click again to go back to editing
+            let (kind, tip) = if self.photos {
+                (Btn::Primary, "Back to editing")
+            } else {
+                (Btn::Secondary, "Go through a folder of photos: mark the keepers, bin the rest")
+            };
+            if k::button(ui, "Photos", kind, true).on_hover_text(tip).clicked() {
+                self.toggle_photos();
+            }
             if k::button(ui, "Open", Btn::Secondary, true).on_hover_text("Ctrl+O: a photo or a .still project").clicked() {
                 self.pick_file(&ctx);
             }
-            let has_doc = self.doc.is_some();
+            let has_doc = self.doc.is_some() && editing;
             if k::button(ui, "Save", Btn::Plain, has_doc).on_hover_text("Ctrl+S: save the edit as a .still project (Ctrl+Shift+S: Save As)").clicked() {
                 self.save(false, &ctx);
             }
             ui.add_space(4.0);
-            if k::button(ui, "Undo", Btn::Plain, !self.undo.is_empty()).on_hover_text("Ctrl+Z").clicked() {
+            if k::button(ui, "Undo", Btn::Plain, editing && !self.undo.is_empty()).on_hover_text("Ctrl+Z").clicked() {
                 self.do_undo();
             }
-            if k::button(ui, "Redo", Btn::Plain, !self.redo.is_empty()).on_hover_text("Ctrl+Shift+Z").clicked() {
+            if k::button(ui, "Redo", Btn::Plain, editing && !self.redo.is_empty()).on_hover_text("Ctrl+Shift+Z").clicked() {
                 self.do_redo();
             }
             left_end = ui.min_rect().right();
@@ -1440,6 +1605,10 @@ impl App {
                 if k::button(ui, "Settings", Btn::Plain, true).on_hover_text("Ctrl+,").clicked() {
                     self.settings_open = true;
                 }
+                if !editing {
+                    right_start = ui.min_rect().left();
+                    return;
+                }
                 let modified = self.params != Params { seed: self.params.seed, ..Params::default() };
                 if k::button(ui, "Revert", Btn::Plain, has_doc && modified).on_hover_text("Reset all edits").clicked() {
                     self.params = Params { seed: self.params.seed, ..Params::default() };
@@ -1451,6 +1620,7 @@ impl App {
         // centred title, independent of the button widths
         let painter = ui.painter();
         let (title, sub) = match (&self.doc, &self.loading) {
+            _ if self.photos => self.browse_title(),
             (_, Some(name)) => (name.clone(), "Opening…".to_string()),
             (Some(d), None) => {
                 let mut sub = d.source_desc.clone();
@@ -1485,6 +1655,548 @@ impl App {
             let r = Rect::from_center_size(pos2(cx, cy - if sub.is_empty() { 0.0 } else { 7.0 }), full.size());
             ui.interact(r, Id::unique("toolbar_title"), Sense::hover()).on_hover_text(title);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Photos browser
+// ---------------------------------------------------------------------------
+
+fn name_of(p: &std::path::Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+impl App {
+    /// Switch between the browser and the editor. The browser re-reads its
+    /// folder each time it opens, so new exports and outside changes show up.
+    fn toggle_photos(&mut self) {
+        self.photos = !self.photos;
+        if !self.photos {
+            return;
+        }
+        let dir = self.browse.dir.clone().or_else(|| self.doc.as_ref().and_then(|d| d.path.parent().map(|p| p.to_path_buf())));
+        // start on the photo being edited when it's in this folder
+        let select = self.doc.as_ref().map(|d| d.path.clone());
+        if let Some(d) = dir {
+            self.browse_open(d, select);
+        }
+    }
+
+    fn pick_browse_dir(&mut self, ctx: &egui::Context) {
+        if self.dialog_open {
+            return;
+        }
+        self.dialog_open = true;
+        let start = self.browse.dir.clone();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new().set_title("Choose a Folder of Photos");
+            if let Some(d) = start {
+                dlg = dlg.set_directory(d);
+            }
+            let _ = tx.send(match dlg.pick_folder() {
+                Some(d) => Msg::BrowseDir(d),
+                None => Msg::DialogClosed,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Read a folder's photos, keeping what's already loaded for files that
+    /// haven't changed. `select` picks the photo to show when it's there.
+    fn browse_open(&mut self, dir: PathBuf, select: Option<PathBuf>) {
+        let files = match browse::list(&dir) {
+            Ok(f) => f,
+            Err(e) => {
+                self.toast = Some((format!("Couldn't read the folder: {e}"), None, Instant::now()));
+                return;
+            }
+        };
+        let b = &mut self.browse;
+        if b.dir.as_ref() != Some(&dir) {
+            b.thumbs.clear();
+            b.views.clear();
+            b.failed.clear();
+            b.cur = None;
+            b.strip_x = 0.0;
+        }
+        let old: HashMap<PathBuf, Option<std::time::SystemTime>> = b.files.drain(..).collect();
+        b.files = files
+            .into_iter()
+            .map(|p| {
+                let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+                // a file that changed (an export written again) gets reloaded
+                if old.get(&p).is_some_and(|o| *o != t) {
+                    b.thumbs.remove(&p);
+                    b.views.remove(&p);
+                    b.failed.remove(&p);
+                }
+                (p, t)
+            })
+            .collect();
+        let have: HashSet<&PathBuf> = b.files.iter().map(|(p, _)| p).collect();
+        b.thumbs.retain(|p, _| have.contains(p));
+        b.views.retain(|p, _| have.contains(p));
+        if let Some(s) = select.filter(|s| have.contains(s)) {
+            b.cur = Some(s);
+        }
+        if b.cur.as_ref().is_some_and(|c| !have.contains(c)) {
+            b.cur = None;
+        }
+        b.dir = Some(dir);
+        b.reveal = true;
+        b.want_key = None;
+        self.browse_index();
+        self.browse_settle(0);
+        self.persist();
+    }
+
+    /// Which photos have an edited copy next to them.
+    fn browse_index(&mut self) {
+        let suffix = self.export.suffix.clone();
+        self.browse.edited = self.browse.files.iter().filter_map(|(p, _)| browse::original_stem(p, &suffix)).collect();
+    }
+
+    /// Indices (into `files`) of the photos the filter shows.
+    fn browse_visible(&self) -> Vec<usize> {
+        let b = &self.browse;
+        b.files.iter().enumerate().filter(|(_, (p, _))| b.show == 0 || browse::is_marked(p)).map(|(i, _)| i).collect()
+    }
+
+    fn browse_cur_pos(&self, vis: &[usize]) -> Option<usize> {
+        let cur = self.browse.cur.as_ref()?;
+        vis.iter().position(|&i| self.browse.files[i].0 == *cur)
+    }
+
+    /// Make sure a shown photo is selected: when the current one is gone or
+    /// filtered out, take the one now at position `near`.
+    fn browse_settle(&mut self, near: usize) {
+        let vis = self.browse_visible();
+        if self.browse_cur_pos(&vis).is_some() {
+            return;
+        }
+        self.browse.cur = vis.get(near.min(vis.len().saturating_sub(1))).map(|&i| self.browse.files[i].0.clone());
+        self.browse.reveal = true;
+    }
+
+    fn browse_step(&mut self, d: isize) {
+        let vis = self.browse_visible();
+        if vis.is_empty() {
+            return;
+        }
+        let at = self.browse_cur_pos(&vis).unwrap_or(0) as isize;
+        let to = (at + d).clamp(0, vis.len() as isize - 1) as usize;
+        self.browse.cur = Some(self.browse.files[vis[to]].0.clone());
+        self.browse.reveal = true;
+    }
+
+    /// The current photo and those either side of it, which keep their big picture.
+    fn browse_nearby(&self) -> Vec<PathBuf> {
+        let vis = self.browse_visible();
+        let Some(at) = self.browse_cur_pos(&vis) else { return Vec::new() };
+        let lo = at.saturating_sub(BROWSE_KEEP);
+        let hi = (at + BROWSE_KEEP).min(vis.len() - 1);
+        (lo..=hi).map(|i| self.browse.files[vis[i]].0.clone()).collect()
+    }
+
+    /// Tell the loaders what to load next: the current photo first, then its
+    /// neighbours, then thumbnails outwards from it.
+    fn browse_request(&mut self) {
+        let b = &self.browse;
+        let key = (b.cur.clone(), b.files.len(), b.show, b.thumbs.len() + b.views.len() + b.failed.len());
+        if b.want_key.as_ref() == Some(&key) {
+            return;
+        }
+        let vis = self.browse_visible();
+        let near = self.browse_nearby();
+        let b = &mut self.browse;
+        b.views.retain(|p, _| near.contains(p));
+        let at = b.cur.as_ref().and_then(|c| vis.iter().position(|&i| b.files[i].0 == *c)).unwrap_or(0);
+        // nearby big pictures, closest first
+        let mut want: Vec<LoadReq> = Vec::new();
+        let mut near_sorted = near.clone();
+        let pos = |p: &PathBuf| vis.iter().position(|&i| b.files[i].0 == *p).unwrap_or(0);
+        near_sorted.sort_by_key(|p| pos(p).abs_diff(at));
+        for p in near_sorted {
+            if !b.views.contains_key(&p) && !b.failed.contains(&p) {
+                want.push((p, true));
+            }
+        }
+        // then thumbnails, spreading out from the current photo
+        let mut order: Vec<usize> = (0..vis.len()).collect();
+        order.sort_by_key(|&i| i.abs_diff(at));
+        for i in order {
+            let p = &b.files[vis[i]].0;
+            if !b.thumbs.contains_key(p) && !b.failed.contains(p) && !want.iter().any(|(w, _)| w == p) {
+                want.push((p.clone(), false));
+            }
+        }
+        let (m, cv) = &*b.queue;
+        let mut q = m.lock().unwrap_or_else(|e| e.into_inner());
+        q.want = want.into_iter().filter(|r| !q.busy.contains(r)).collect();
+        drop(q);
+        cv.notify_all();
+        b.want_key = Some(key);
+    }
+
+    /// Mark or unmark the current photo by renaming it (`A_` in front).
+    fn browse_toggle_mark(&mut self) {
+        let Some(p) = self.browse.cur.clone() else { return };
+        let vis = self.browse_visible();
+        let at = self.browse_cur_pos(&vis).unwrap_or(0);
+        let to = match browse::toggle_mark(&p) {
+            Ok(to) => to,
+            Err(e) => {
+                self.toast = Some((format!("Couldn't rename {}: {e}", name_of(&p)), None, Instant::now()));
+                return;
+            }
+        };
+        let b = &mut self.browse;
+        if let Some(f) = b.files.iter_mut().find(|(f, _)| *f == p) {
+            f.0 = to.clone();
+        }
+        for map in [&mut b.thumbs, &mut b.views] {
+            if let Some(t) = map.remove(&p) {
+                map.insert(to.clone(), t);
+            }
+        }
+        if b.failed.remove(&p) {
+            b.failed.insert(to.clone());
+        }
+        b.cur = Some(to.clone());
+        self.renamed(&p, &to);
+        self.browse_index();
+        // unmarking while showing only marked photos moves on to the next one
+        self.browse_settle(at);
+    }
+
+    /// Keep the editor and the Recent list pointing at a photo the browser renamed.
+    fn renamed(&mut self, from: &std::path::Path, to: &std::path::Path) {
+        if let Some(d) = &mut self.doc
+            && d.path == from
+        {
+            d.path = to.to_path_buf();
+            d.name = name_of(to);
+            self.detail_src = None;
+            self.detail_req = None;
+        }
+        let canon = |p: &std::path::Path| p.parent().and_then(|d| std::fs::canonicalize(d).ok()).map(|d| d.join(name_of(p)));
+        if let (Some(f), Some(t)) = (canon(from), canon(to)) {
+            for r in &mut self.recent {
+                if *r == f {
+                    *r = t.clone();
+                }
+            }
+            self.persist();
+        }
+    }
+
+    fn browse_trash(&mut self) {
+        let Some(p) = self.browse.cur.clone() else { return };
+        let vis = self.browse_visible();
+        let at = self.browse_cur_pos(&vis).unwrap_or(0);
+        match browse::trash(&p) {
+            Ok(()) => {
+                let b = &mut self.browse;
+                b.files.retain(|(f, _)| *f != p);
+                b.thumbs.remove(&p);
+                b.views.remove(&p);
+                b.failed.remove(&p);
+                b.cur = None;
+                self.browse_index();
+                self.browse_settle(at);
+                self.toast = Some((format!("Moved {} to the Trash", name_of(&p)), None, Instant::now()));
+            }
+            Err(e) => self.toast = Some((format!("Couldn't move {} to the Trash: {e}", name_of(&p)), None, Instant::now())),
+        }
+    }
+
+    /// Open the current photo in the editor (it stays as it is if it's already open).
+    fn browse_edit(&mut self, ctx: &egui::Context) {
+        let Some(p) = self.browse.cur.clone() else { return };
+        self.photos = false;
+        if self.doc.as_ref().map(|d| d.path != p).unwrap_or(true) {
+            self.open_path(p, ctx);
+        }
+    }
+
+    fn browse_keys(&mut self, ctx: &egui::Context) {
+        use egui::Key;
+        let pressed = |k: Key| ctx.input(|i| i.key_pressed(k) && !i.modifiers.command && !i.modifiers.alt);
+        if pressed(Key::ArrowRight) || pressed(Key::ArrowDown) {
+            self.browse_step(1);
+        }
+        if pressed(Key::ArrowLeft) || pressed(Key::ArrowUp) {
+            self.browse_step(-1);
+        }
+        if pressed(Key::Home) {
+            self.browse_step(isize::MIN / 2);
+        }
+        if pressed(Key::End) {
+            self.browse_step(isize::MAX / 2);
+        }
+        if pressed(Key::M) {
+            self.browse_toggle_mark();
+        }
+        // N sits next to M, so marking and binning stay under one hand
+        if pressed(Key::N) || pressed(Key::Delete) || pressed(Key::Backspace) {
+            self.browse_trash();
+        }
+        if pressed(Key::Enter) || pressed(Key::E) {
+            self.browse_edit(ctx);
+        }
+    }
+
+    fn browse_title(&self) -> (String, String) {
+        let b = &self.browse;
+        let Some(dir) = &b.dir else { return ("Photos".into(), String::new()) };
+        let folder = name_of(dir);
+        let vis = self.browse_visible();
+        let marked = b.files.iter().filter(|(p, _)| browse::is_marked(p)).count();
+        match (b.cur.as_ref(), self.browse_cur_pos(&vis)) {
+            (Some(c), Some(at)) => (name_of(c), format!("{folder} · {} of {} · {marked} marked", at + 1, vis.len())),
+            _ => (folder, format!("{} photos · {marked} marked", b.files.len())),
+        }
+    }
+
+    fn photos_view(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let rect = ui.max_rect();
+        self.browse_request();
+        let vis = self.browse_visible();
+        if self.browse.dir.is_none() || vis.is_empty() {
+            let msg = match &self.browse.dir {
+                None => "Choose a folder to go through its photos.".to_string(),
+                Some(d) if self.browse.files.is_empty() => format!("There are no photos in {}.", name_of(d)),
+                Some(_) => "No marked photos yet. Press M on a photo to mark it.".to_string(),
+            };
+            let c = rect.center();
+            ui.painter().text(c - vec2(0.0, 28.0), Align2::CENTER_CENTER, msg, k::font(14.0), k::LABEL2);
+            let br = Rect::from_center_size(c + vec2(0.0, 12.0), vec2(160.0, 28.0));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(br).layout(egui::Layout::top_down(egui::Align::Center)));
+            if k::button(&mut child, "Choose Folder…", Btn::Primary, true).clicked() {
+                self.pick_browse_dir(&ctx);
+            }
+            self.toast_view(ui, rect);
+            return;
+        }
+
+        let strip_h = 104.0;
+        let view_r = Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - strip_h));
+        let strip_r = Rect::from_min_max(pos2(rect.left(), rect.bottom() - strip_h), rect.max);
+        let painter = ui.painter_at(rect);
+        let at = self.browse_cur_pos(&vis).unwrap_or(0);
+        let cur = self.browse.files[vis[at]].0.clone();
+
+        // the big picture (the thumbnail stands in while it loads)
+        let resp = ui.interact(view_r, Id::unique("browse_view"), Sense::click());
+        if resp.double_clicked() {
+            self.browse_edit(&ctx);
+        }
+        let tex = self.browse.views.get(&cur).or_else(|| self.browse.thumbs.get(&cur));
+        let area = view_r.shrink2(vec2(64.0, 24.0));
+        if let Some(t) = tex {
+            let s = t.size_vec2();
+            let f = (area.width() / s.x).min(area.height() / s.y);
+            let r = Rect::from_center_size(area.center(), s * f);
+            painter.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            // badges along the top-left corner of the picture
+            let mut x = r.left() + 10.0;
+            let mut badge = |text: &str, bg: Color32, fg: Color32| {
+                let g = painter.layout_no_wrap(text.to_string(), k::font_semibold(12.0), fg);
+                let br = Rect::from_min_size(pos2(x, r.top() + 10.0), vec2(g.size().x + 20.0, 24.0));
+                painter.rect_filled(br, CornerRadius::same(12), bg);
+                painter.galley(br.center() - g.size() / 2.0, g, fg);
+                x = br.right() + 6.0;
+            };
+            if browse::is_marked(&cur) {
+                badge("Marked", MARK_COLOR, Color32::BLACK);
+            }
+            let suffix = &self.export.suffix;
+            if browse::is_edited_copy(&cur, suffix) {
+                badge("Edited Copy", Color32::from_black_alpha(170), k::LABEL);
+            } else if self.browse.edited.contains(&browse::plain_stem(&cur)) {
+                badge("Edited", Color32::from_black_alpha(170), k::LABEL);
+            }
+        } else {
+            let text = if self.browse.failed.contains(&cur) { "Can't show this photo" } else { "Loading…" };
+            painter.text(area.center(), Align2::CENTER_CENTER, text, k::font(13.0), k::LABEL3);
+        }
+
+        // previous / next arrows at the sides
+        for (d, x) in [(-1isize, view_r.left() + 32.0), (1, view_r.right() - 32.0)] {
+            let enabled = if d < 0 { at > 0 } else { at + 1 < vis.len() };
+            let r = Rect::from_center_size(pos2(x, view_r.center().y), vec2(40.0, 40.0));
+            let a = ui.interact(r, Id::unique(("browse_arrow", d)), if enabled { Sense::click() } else { Sense::hover() });
+            if !enabled {
+                continue;
+            }
+            let bg = if a.hovered() { Color32::from_white_alpha(40) } else { Color32::from_white_alpha(14) };
+            painter.circle_filled(r.center(), 20.0, bg);
+            let (c, s) = (r.center(), d as f32 * 4.0);
+            let st = Stroke::new(2.0, k::LABEL);
+            painter.line_segment([c + vec2(-s, -8.0), c + vec2(s, 0.0)], st);
+            painter.line_segment([c + vec2(s, 0.0), c + vec2(-s, 8.0)], st);
+            if a.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if a.clicked() {
+                self.browse_step(d);
+            }
+        }
+
+        self.filmstrip(ui, strip_r, &vis, at);
+        self.toast_view(ui, rect);
+    }
+
+    /// A row of thumbnails along the bottom; scrolls with the wheel or a trackpad.
+    fn filmstrip(&mut self, ui: &mut Ui, r: Rect, vis: &[usize], at: usize) {
+        let ctx = ui.ctx().clone();
+        let painter = ui.painter_at(r);
+        painter.rect_filled(r, CornerRadius::ZERO, k::WINDOW);
+        let (cell, gap, pad) = (vec2(112.0, 80.0), 6.0, 12.0);
+        let pitch = cell.x + gap;
+        let content = vis.len() as f32 * pitch - gap + pad * 2.0;
+        let max_x = (content - r.width()).max(0.0);
+        let bg = ui.interact(r, Id::unique("filmstrip"), Sense::hover());
+        if bg.hovered() || ui.rect_contains_pointer(r) {
+            let d = ui.input(|i| i.smooth_scroll_delta);
+            self.browse.strip_x -= if d.x.abs() > d.y.abs() { d.x } else { d.y };
+        }
+        if self.browse.reveal {
+            // keep the current photo in view with a photo's room either side
+            let left = pad + at as f32 * pitch;
+            let x = &mut self.browse.strip_x;
+            if left - pitch < *x {
+                *x = left - pitch;
+            } else if left + cell.x + pitch > *x + r.width() {
+                *x = left + cell.x + pitch - r.width();
+            }
+            self.browse.reveal = false;
+        }
+        self.browse.strip_x = self.browse.strip_x.clamp(0.0, max_x);
+        let off = self.browse.strip_x;
+        let top = r.center().y - cell.y / 2.0;
+        let first = ((off - pad) / pitch).floor().max(0.0) as usize;
+        let last = (((off + r.width()) / pitch).ceil() as usize + 1).min(vis.len());
+        let mut pick = None;
+        let mut edit = false;
+        for (n, &i) in vis.iter().enumerate().take(last).skip(first) {
+            let p = &self.browse.files[i].0;
+            let cr = Rect::from_min_size(pos2(r.left() + pad + n as f32 * pitch - off, top), cell);
+            let resp = ui.interact(cr, Id::unique(("film", p)), Sense::click());
+            painter.rect_filled(cr, CornerRadius::same(6), k::CARD);
+            if let Some(t) = self.browse.thumbs.get(p) {
+                let s = t.size_vec2();
+                let f = (cell.x / s.x).min(cell.y / s.y);
+                let ir = Rect::from_center_size(cr.center(), s * f);
+                painter.image(t.id(), ir, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            } else if self.browse.failed.contains(p) {
+                painter.text(cr.center(), Align2::CENTER_CENTER, "?", k::font(14.0), k::LABEL3);
+            }
+            if browse::is_marked(p) {
+                let c = cr.right_top() + vec2(-11.0, 11.0);
+                painter.circle_filled(c, 8.0, MARK_COLOR);
+                painter.text(c, Align2::CENTER_CENTER, "A", k::font_semibold(10.0), Color32::BLACK);
+            }
+            if n == at {
+                painter.rect_stroke(cr.expand(2.0), CornerRadius::same(8), Stroke::new(2.0, k::ACCENT), egui::StrokeKind::Outside);
+            } else if resp.hovered() {
+                painter.rect_stroke(cr, CornerRadius::same(6), Stroke::new(1.0, k::FILL_HI), egui::StrokeKind::Inside);
+            }
+            if resp.clicked() {
+                pick = Some(p.clone());
+            }
+            if resp.double_clicked() {
+                edit = true;
+            }
+            resp.on_hover_text(name_of(p));
+        }
+        if let Some(p) = pick {
+            self.browse.cur = Some(p);
+        }
+        if edit {
+            self.browse_edit(&ctx);
+        }
+    }
+
+    fn photos_sidebar(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            group(ui, "Folder");
+            match self.browse.dir.clone() {
+                Some(d) => {
+                    ui.label(egui::RichText::new(name_of(&d)).font(k::font_semibold(15.0)).color(k::LABEL));
+                    k::caption(ui, &d.to_string_lossy());
+                }
+                None => k::caption(ui, "Choose a folder to go through its photos."),
+            }
+            ui.add_space(8.0);
+            if k::button(ui, "Choose Folder…", Btn::Secondary, true).clicked() {
+                self.pick_browse_dir(&ctx);
+            }
+            if self.browse.dir.is_some() {
+                let marked = self.browse.files.iter().filter(|(p, _)| browse::is_marked(p)).count();
+                let n = self.browse.files.len();
+                ui.add_space(4.0);
+                k::caption(ui, &format!("{n} photo{} · {marked} marked", if n == 1 { "" } else { "s" }));
+            }
+            ui.add_space(18.0);
+
+            group(ui, "Show");
+            let mut show = self.browse.show;
+            if k::segmented(ui, "browse_show", &mut show, &["All", "Marked"]) {
+                let vis = self.browse_visible();
+                let at = self.browse_cur_pos(&vis).unwrap_or(0);
+                self.browse.show = show;
+                self.browse_settle(at);
+                self.browse.reveal = true;
+            }
+            ui.add_space(18.0);
+
+            if let Some(p) = self.browse.cur.clone() {
+                group(ui, "Photo");
+                ui.label(egui::RichText::new(name_of(&p)).font(k::font_semibold(13.0)).color(k::LABEL));
+                let marked = browse::is_marked(&p);
+                let suffix = self.export.suffix.clone();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let tip = if marked { "M: take the A_ off its name" } else { "M: put A_ in front of its name" };
+                    if k::button(ui, if marked { "Unmark" } else { "Mark" }, Btn::Secondary, true).on_hover_text(tip).clicked() {
+                        self.browse_toggle_mark();
+                    }
+                    if k::button(ui, "Move to Trash", Btn::Secondary, true).on_hover_text("N or Delete: you can restore it from the Trash").clicked() {
+                        self.browse_trash();
+                    }
+                });
+                ui.add_space(8.0);
+                if k::button(ui, "Edit Photo", Btn::Primary, true).on_hover_text("Enter").clicked() {
+                    self.browse_edit(&ctx);
+                }
+                // notes go under the buttons so the buttons never move between photos
+                ui.add_space(8.0);
+                if marked {
+                    k::caption(ui, &format!("Marked: its name starts with {}", browse::MARK));
+                }
+                if browse::is_edited_copy(&p, &suffix) {
+                    k::caption(ui, "An edited copy exported from Still.");
+                } else if self.browse.edited.contains(&browse::plain_stem(&p)) {
+                    k::caption(ui, &format!("Has an edited copy (…{suffix}) in this folder."));
+                }
+                ui.add_space(18.0);
+            }
+
+            group(ui, "Keys");
+            for (key, what) in [("← →", "Previous / next photo"), ("M", "Mark or unmark"), ("N / Delete", "Move to the Trash"), ("Enter", "Edit the photo")] {
+                ui.horizontal(|ui| {
+                    ui.add_sized([72.0, 18.0], egui::Label::new(egui::RichText::new(key).font(k::font_semibold(12.0)).color(k::LABEL2)));
+                    ui.label(egui::RichText::new(what).size(12.0).color(k::LABEL2));
+                });
+            }
+            ui.add_space(10.0);
+            k::caption(ui, &format!("Marks are part of the file name, so they stay after closing Still and sort together in any file manager. Exports are named …{}.", self.export.suffix));
+            ui.add_space(24.0);
+        });
     }
 }
 
@@ -5018,6 +5730,64 @@ mod tests {
         settle(&mut h, |a| !a.params.layers.is_empty());
         settle(&mut h, |a| a.tex_frame == Frame::Unbordered && rendered(a));
         h
+    }
+
+    #[test]
+    fn e2e_photos_browser_marks_steps_and_edits() {
+        let dir = temp_dir("browse");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, n) in ["IMG_1.png", "IMG_2.png", "IMG_10.png"].iter().enumerate() {
+            image::RgbImage::from_pixel(300, 200, image::Rgb([60 * i as u8, 90, 140])).save(dir.join(n)).unwrap();
+        }
+        std::fs::write(dir.join("IMG_1.png.xmp"), b"sidecar").unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_eframe(move |cc| App::new(cc, None));
+        h.step();
+        h.state_mut().photos = true;
+        h.state_mut().browse_open(dir.clone(), None);
+        settle(&mut h, |a| a.browse.thumbs.len() == 3 && !a.browse.views.is_empty());
+        assert_eq!(h.state().browse.cur.as_deref(), Some(dir.join("IMG_1.png").as_path()), "starts on the first photo");
+
+        // M marks it: the file (and its sidecar) get A_ in front
+        h.key_press(egui::Key::M);
+        h.step();
+        assert!(dir.join("A_IMG_1.png").exists() && !dir.join("IMG_1.png").exists());
+        assert!(dir.join("A_IMG_1.png.xmp").exists(), "the sidecar follows");
+        assert_eq!(h.state().browse.cur.as_deref(), Some(dir.join("A_IMG_1.png").as_path()));
+        assert!(h.state().browse.thumbs.contains_key(&dir.join("A_IMG_1.png")), "the thumbnail stays");
+
+        // → goes to the next photo in shooting order (2 before 10)
+        h.key_press(egui::Key::ArrowRight);
+        h.step();
+        assert_eq!(h.state().browse.cur.as_deref(), Some(dir.join("IMG_2.png").as_path()));
+
+        // N (next to M) bins it and moves on to the next photo
+        h.key_press(egui::Key::N);
+        h.step();
+        assert!(!dir.join("IMG_2.png").exists(), "N moves the photo to the Trash");
+        assert_eq!(h.state().browse.cur.as_deref(), Some(dir.join("IMG_10.png").as_path()));
+
+        // only marked photos: the selection moves to the marked one
+        h.state_mut().browse.show = 1;
+        h.state_mut().browse_settle(0);
+        h.step();
+        assert_eq!(h.state().browse_visible().len(), 1);
+        assert_eq!(h.state().browse.cur.as_deref(), Some(dir.join("A_IMG_1.png").as_path()));
+
+        // reopening the folder (as after restarting) still knows what's marked
+        h.state_mut().browse_open(dir.clone(), None);
+        assert_eq!(h.state().browse.files.iter().filter(|(p, _)| browse::is_marked(p)).count(), 1);
+
+        // Enter opens it in the editor
+        h.key_press(egui::Key::Enter);
+        h.step();
+        assert!(!h.state().photos, "back in the editor");
+        settle(&mut h, |a| a.doc.is_some());
+        assert_eq!(h.state().doc.as_ref().unwrap().path, dir.join("A_IMG_1.png"));
+
+        // exports are named after the photo with -edited
+        assert_eq!(h.state().export.suffix, "-edited");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

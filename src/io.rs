@@ -41,7 +41,7 @@ pub fn is_openable(path: &Path) -> bool {
     IMAGE_EXTS.contains(&ext.as_str()) || RAW_EXTS.contains(&ext.as_str())
 }
 
-fn is_raw(path: &Path) -> bool {
+pub(crate) fn is_raw(path: &Path) -> bool {
     path.extension()
         .map(|e| RAW_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
         .unwrap_or(false)
@@ -200,6 +200,9 @@ pub struct ExportSettings {
     pub suffix: String,
 }
 
+/// What an export adds to the photo's name, so edited copies are easy to find.
+pub const EDITED_SUFFIX: &str = "-edited";
+
 impl Default for ExportSettings {
     fn default() -> Self {
         Self {
@@ -212,7 +215,7 @@ impl Default for ExportSettings {
             sharpen: 0,
             keep_metadata: true,
             keep_icc: true,
-            suffix: "-still".into(),
+            suffix: EDITED_SUFFIX.into(),
         }
     }
 }
@@ -469,16 +472,24 @@ pub struct Saved {
     /// Recently opened photos and projects, newest first.
     #[serde(default)]
     pub recent: Vec<PathBuf>,
+    /// The folder the Photos browser showed last.
+    #[serde(default)]
+    pub photos_dir: Option<PathBuf>,
 }
 
 pub fn load_saved() -> Saved {
     if cfg!(test) {
         return Saved::default();
     }
-    std::fs::read_to_string(config_dir().join("settings.json"))
+    let mut s: Saved = std::fs::read_to_string(config_dir().join("settings.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // exports used to be named `-still`; the old default becomes `-edited`
+    if s.export.suffix == "-still" {
+        s.export.suffix = EDITED_SUFFIX.into();
+    }
+    s
 }
 
 pub fn store_saved(s: &Saved) {
@@ -722,13 +733,14 @@ pub fn read_project(path: &Path) -> Result<(PathBuf, Params), String> {
     }
     let dir = path.parent().unwrap_or(Path::new("."));
     // prefer the original location; fall back to the same place relative to the project
-    let resolve = |abs: &str, rel: Option<&String>| -> Option<PathBuf> {
-        let a = PathBuf::from(abs);
-        if a.exists() {
-            return Some(a);
+    // a photo marked (or unmarked) in the Photos browser since was renamed
+    let found = |p: PathBuf| -> Option<PathBuf> {
+        if p.exists() {
+            return Some(p);
         }
-        rel.map(|r| dir.join(r)).filter(|p| p.exists())
+        Some(crate::browse::toggled(&p)).filter(|t| t.exists())
     };
+    let resolve = |abs: &str, rel: Option<&String>| -> Option<PathBuf> { found(PathBuf::from(abs)).or_else(|| rel.and_then(|r| found(dir.join(r)))) };
     let photo = resolve(&file.photo, file.photo_relative.as_ref())
         .ok_or_else(|| format!("photo not found: {}", Path::new(&file.photo).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()))?;
     let mut params = file.params;
