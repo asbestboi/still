@@ -5,12 +5,14 @@
 
 mod app;
 mod browse;
+mod denoise;
 mod io;
 mod layers;
 mod magnet;
 mod masks;
 mod pipeline;
 mod retouch;
+mod search;
 mod text;
 mod ui_kit;
 mod update;

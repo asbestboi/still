@@ -276,11 +276,26 @@ pub fn slider(
     default: f32,
     fmt: Fmt,
 ) -> Response {
+    slider_ex(ui, label, value, range, default, fmt, None)
+}
+
+/// A slider with an eye next to its value once it's moved off its default:
+/// clicking the eye sets `hidden`, to see the picture without this change.
+pub fn slider_ex(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    default: f32,
+    fmt: Fmt,
+    hidden: Option<&mut bool>,
+) -> Response {
     let (lo, hi) = (*range.start(), *range.end());
     let width = ui.available_width();
     let (rect, mut resp) = ui.allocate_exact_size(vec2(width, 40.0), Sense::click_and_drag());
     let id = resp.id;
     let ctx = ui.ctx().clone();
+    found(ui, rect, label);
 
     // The number on the right: click it to type any value, also far beyond
     // the slider's range. Registered after the slider, so it takes the click.
@@ -289,6 +304,12 @@ pub fn slider(
     let val_rect = Rect::from_min_max(pos2(rect.right() - text_w.max(30.0) - 8.0, rect.top()), pos2(rect.right() + 2.0, rect.top() + 22.0));
     let edit_id = id.with("typed");
     let mut editing: Option<String> = ctx.data(|d| d.get_temp::<String>(edit_id));
+
+    // the eye sits just left of the value (not while typing one); presses on it don't move the knob
+    let is_hidden = hidden.as_deref().copied().unwrap_or(false);
+    let eye_rect = (hidden.is_some() && editing.is_none() && ((*value - default).abs() > 1e-4 || is_hidden))
+        .then(|| Rect::from_center_size(pos2(val_rect.left() - 12.0, rect.top() + 11.0), vec2(22.0, 18.0)));
+    let on_eye = eye_rect.is_some_and(|r| ui.input(|i| i.pointer.press_origin()).is_some_and(|p| r.contains(p)));
     let mut first = false;
     // it also takes drags, or egui would hand a press here to the slider underneath
     let val_resp = ui.interact(val_rect, id.with("value"), Sense::click_and_drag());
@@ -324,7 +345,9 @@ pub fn slider(
     let from_x = |x: f32| lo + ((x - track.left()) / track.width()).clamp(0.0, 1.0) * (hi - lo);
 
     let fine = ui.input(|i| i.modifiers.shift);
-    if resp.double_clicked() {
+    if on_eye {
+        // the eye handles this press
+    } else if resp.double_clicked() {
         *value = default;
         resp.mark_changed();
     } else if resp.is_pointer_button_down_on() {
@@ -345,7 +368,7 @@ pub fn slider(
         }
     }
 
-    let active = resp.is_pointer_button_down_on();
+    let active = resp.is_pointer_button_down_on() && !on_eye;
     let modified = (*value - default).abs() > 1e-4;
     let beyond = *value < lo - 1e-6 || *value > hi + 1e-6;
     let painter = ui.painter_at(rect.expand(6.0));
@@ -356,8 +379,28 @@ pub fn slider(
         Align2::LEFT_CENTER,
         label,
         font(13.0),
-        if modified || active { LABEL } else { LABEL2 },
+        if is_hidden { LABEL3 } else if modified || active { LABEL } else { LABEL2 },
     );
+    if let (Some(er), Some(h)) = (eye_rect, hidden) {
+        let e = ui.interact(er, id.with("eye"), Sense::click());
+        if e.clicked() {
+            *h = !*h;
+        }
+        let col = if *h {
+            ACCENT
+        } else if e.hovered() {
+            LABEL
+        } else {
+            LABEL3
+        };
+        paint_eye(&painter, er.center(), col, *h);
+        if e.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let name = format!("{} {label}", if *h { "Show" } else { "Hide" });
+        e.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &name));
+        e.on_hover_text(if *h { "Hidden in the preview. Click to show it again" } else { "Hide this change to see the photo without it" });
+    }
     if !editing {
         if val_resp.hovered() {
             painter.rect_filled(val_rect.shrink2(vec2(2.0, 2.0)), CornerRadius::same(5), FILL);
@@ -379,7 +422,7 @@ pub fn slider(
     let anchor = default.clamp(lo, hi);
     let (a, b) = (to_x(anchor), to_x(*value));
     let fill = Rect::from_min_max(pos2(a.min(b), track.top()), pos2(a.max(b), track.bottom()));
-    painter.rect_filled(fill, r, if active { LABEL } else { Color32::from_gray(200) });
+    painter.rect_filled(fill, r, if is_hidden { FILL_HI } else if active { LABEL } else { Color32::from_gray(200) });
     if anchor > lo && anchor < hi {
         let x = to_x(anchor);
         painter.line_segment([pos2(x, track.top() - 3.0), pos2(x, track.bottom() + 3.0)], Stroke::new(1.0, LABEL3));
@@ -391,12 +434,94 @@ pub fn slider(
     let radius = 6.5 + grow * 2.0 + hover * 0.5;
     let c = pos2(b, track.center().y);
     painter.circle_filled(c + vec2(0.0, 1.0), radius + 1.5, Color32::from_black_alpha(70));
-    painter.circle_filled(c, radius, Color32::WHITE);
+    painter.circle_filled(c, radius, if is_hidden { Color32::from_gray(150) } else { Color32::WHITE });
 
-    if resp.hovered() || active {
+    if (resp.hovered() || active) && !eye_rect.is_some_and(|r| resp.hover_pos().is_some_and(|p| r.contains(p))) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp.on_hover_text_at_pointer("Double-click to reset · Shift for fine control")
+}
+
+/// An eye; crossed out when what it stands for is hidden.
+fn paint_eye(painter: &egui::Painter, c: Pos2, col: Color32, crossed: bool) {
+    let n = 12;
+    let (w, h) = (7.0, 4.2);
+    let mut pts = Vec::with_capacity(2 * n);
+    for i in 0..=n {
+        let t = i as f32 / n as f32;
+        pts.push(c + vec2(-w + 2.0 * w * t, -h * (std::f32::consts::PI * t).sin()));
+    }
+    for i in 1..n {
+        let t = 1.0 - i as f32 / n as f32;
+        pts.push(c + vec2(-w + 2.0 * w * t, h * (std::f32::consts::PI * t).sin()));
+    }
+    painter.add(egui::Shape::closed_line(pts, Stroke::new(1.3, col)));
+    painter.circle_filled(c, 2.0, col);
+    if crossed {
+        painter.line_segment([c + vec2(-6.5, 5.5), c + vec2(6.5, -5.5)], Stroke::new(3.0, CARD));
+        painter.line_segment([c + vec2(-6.5, 5.5), c + vec2(6.5, -5.5)], Stroke::new(1.4, col));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Find: point out a control the search jumped to
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct FindTarget {
+    section: String,
+    label: String,
+    at: f64,
+}
+
+/// How long a found control stays highlighted, in seconds.
+const FIND_SECS: f64 = 2.6;
+
+fn find_id() -> Id {
+    Id::unique("k_find_target")
+}
+
+fn section_id() -> Id {
+    Id::unique("k_current_section")
+}
+
+/// Highlight the control called `label` (inside the section `section`, or
+/// outside any section when it's empty) the next time it's drawn.
+pub fn find(ctx: &egui::Context, section: &str, label: &str) {
+    let at = ctx.input(|i| i.time);
+    ctx.data_mut(|d| d.insert_temp(find_id(), FindTarget { section: section.into(), label: label.into(), at }));
+    ctx.request_repaint();
+}
+
+fn find_target(ctx: &egui::Context) -> Option<FindTarget> {
+    let t: FindTarget = ctx.data(|d| d.get_temp(find_id()))?;
+    (ctx.input(|i| i.time) - t.at < FIND_SECS).then_some(t)
+}
+
+fn current_section(ctx: &egui::Context) -> String {
+    ctx.data(|d| d.get_temp::<String>(section_id())).unwrap_or_default()
+}
+
+/// If the search is pointing at `label` here, scroll to `rect` and ring it.
+pub fn found(ui: &Ui, rect: Rect, label: &str) {
+    let ctx = ui.ctx();
+    let Some(t) = find_target(ctx) else { return };
+    if t.label != label || t.section != current_section(ctx) {
+        return;
+    }
+    let age = (ctx.input(|i| i.time) - t.at) as f32;
+    // keep scrolling while the tab fades in and the section opens
+    if age < 0.5 {
+        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+    }
+    let fade = 1.0 - ((age - 1.6) / 1.0).clamp(0.0, 1.0);
+    // two soft pulses, then it settles and fades
+    let pulse = 0.6 + 0.4 * (age * std::f32::consts::TAU * 1.2).cos().abs() * (1.0 - (age / 1.6).min(1.0));
+    let r = rect.expand2(vec2(5.0, 3.0));
+    let painter = ui.painter();
+    painter.rect_filled(r, CornerRadius::same(9), ACCENT.gamma_multiply(0.16 * fade));
+    painter.rect_stroke(r, CornerRadius::same(9), Stroke::new(1.6, ACCENT.gamma_multiply(fade * pulse)), StrokeKind::Outside);
+    ctx.request_repaint();
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +536,9 @@ pub fn segmented(ui: &mut Ui, id_salt: &str, selected: &mut usize, labels: &[&st
     let seg_w = (rect.width() - 4.0) / n as f32;
     let mut changed = false;
 
+    for l in labels {
+        found(ui, rect, l);
+    }
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, CornerRadius::same(8), FILL);
 
@@ -468,13 +596,14 @@ pub fn switch(ui: &mut Ui, on: &mut bool) -> Response {
 
 pub fn switch_row(ui: &mut Ui, label: &str, on: &mut bool) -> Response {
     let mut out = None;
-    ui.horizontal(|ui| {
+    let row = ui.horizontal(|ui| {
         ui.set_min_height(30.0);
         ui.label(egui::RichText::new(label).color(if *on { LABEL } else { LABEL2 }).size(13.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             out = Some(switch(ui, on));
         });
     });
+    found(ui, row.response.rect, label);
     out.unwrap()
 }
 
@@ -502,6 +631,7 @@ pub fn button(ui: &mut Ui, text: &str, kind: Btn, enabled: bool) -> Response {
     let size = vec2(galley.size().x + pad * 2.0, 28.0);
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(size, sense);
+    found(ui, rect, text);
     let pressed = enabled && resp.is_pointer_button_down_on();
     let hovered = enabled && resp.hovered();
     // pressed state appears instantly on pointer-down; release eases back
@@ -538,6 +668,10 @@ pub fn section(ui: &mut Ui, title: &str, modified: bool, add: impl FnOnce(&mut U
     let id = ui.make_persistent_id(("section", title));
     let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
     let mut reset = false;
+    // the search opens the section it points into
+    if find_target(ui.ctx()).is_some_and(|t| t.section == title || (t.label == title && t.section.is_empty())) && !state.is_open() {
+        state.set_open(true);
+    }
 
     egui::Frame::NONE
         .fill(CARD)
@@ -547,6 +681,7 @@ pub fn section(ui: &mut Ui, title: &str, modified: bool, add: impl FnOnce(&mut U
             ui.set_width(ui.available_width());
             // header
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
+            found(ui, rect, title);
             let open = state.is_open();
             let t = spring(ui.ctx(), id.with("chev"), if open { 1.0 } else { 0.0 }, 1.0, 0.3);
             paint_chevron(ui, pos2(rect.right() - 6.0, rect.center().y), t);
@@ -573,10 +708,13 @@ pub fn section(ui: &mut Ui, title: &str, modified: bool, add: impl FnOnce(&mut U
             } else if resp.clicked() {
                 state.toggle(ui);
             }
+            let outer = current_section(ui.ctx());
+            ui.ctx().data_mut(|d| d.insert_temp(section_id(), title.to_string()));
             state.show_body_unindented(ui, |ui| {
                 ui.add_space(2.0);
                 add(ui);
             });
+            ui.ctx().data_mut(|d| d.insert_temp(section_id(), outer));
         });
     ui.add_space(10.0);
     reset
@@ -609,6 +747,7 @@ pub fn stroke_rect(ui: &Ui, rect: Rect, r: u8, color: Color32) {
 /// A selectable rounded chip (aspect presets, mask types). Highlights on press.
 pub fn chip(ui: &mut Ui, size: egui::Vec2, label: &str, selected: bool) -> Response {
     let (r, resp) = ui.allocate_exact_size(size, Sense::click());
+    found(ui, r, label);
     let pressed = resp.is_pointer_button_down_on();
     let bg = if selected {
         Color32::from_rgb(99, 99, 104)

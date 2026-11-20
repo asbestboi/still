@@ -50,25 +50,81 @@ pub enum Refine {
     Color,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+/// A mask's own tone and colour adjustments, the same ones the Adjust tab
+/// has for the whole photo (plus a colour wash).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Local {
     pub exposure: f32,
     pub contrast: f32,
     pub highlights: f32,
     pub shadows: f32,
+    pub whites: f32,
+    pub blacks: f32,
+    pub fade: f32,
     pub temperature: f32,
     pub tint: f32,
     pub saturation: f32,
+    pub vibrance: f32,
+    pub mono: bool,
+    pub shadow_hue: f32,
+    pub shadow_tone: f32,
+    pub highlight_hue: f32,
+    pub highlight_tone: f32,
     pub sharpness: f32,
     pub tone: f32,
     pub tone_hue: f32,
 }
 
+impl Default for Local {
+    fn default() -> Self {
+        Local {
+            exposure: 0.0,
+            contrast: 0.0,
+            highlights: 0.0,
+            shadows: 0.0,
+            whites: 0.0,
+            blacks: 0.0,
+            fade: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
+            saturation: 0.0,
+            vibrance: 0.0,
+            mono: false,
+            shadow_hue: 200.0,
+            shadow_tone: 0.0,
+            highlight_hue: 35.0,
+            highlight_tone: 0.0,
+            sharpness: 0.0,
+            tone: 0.0,
+            tone_hue: 35.0,
+        }
+    }
+}
+
 impl Local {
+    /// No change to the picture (hues alone do nothing without their amounts).
     pub fn is_identity(&self) -> bool {
-        let d = Local { tone_hue: self.tone_hue, ..Local::default() };
+        let d = Local { tone_hue: self.tone_hue, shadow_hue: self.shadow_hue, highlight_hue: self.highlight_hue, ..Local::default() };
         *self == d
+    }
+
+    /// Put one slider back to its default (by field name).
+    /// Returns whether it changed anything.
+    pub fn reset_field(&mut self, name: &str) -> bool {
+        let d = Local::default();
+        macro_rules! fields {
+            ($($f:ident),*) => {
+                match name {
+                    $(stringify!($f) => std::mem::replace(&mut self.$f, d.$f) != d.$f,)*
+                    _ => false,
+                }
+            };
+        }
+        fields!(
+            exposure, contrast, highlights, shadows, whites, blacks, fade, temperature, tint, saturation, vibrance, mono, shadow_hue,
+            shadow_tone, highlight_hue, highlight_tone, sharpness, tone, tone_hue
+        )
     }
 }
 
@@ -90,9 +146,15 @@ pub struct Mask {
     pub hue_range: f32,
     pub hue_soft: f32,
     pub adj: Local,
-    /// The Effects tab only applies inside this mask.
+    /// This mask's own Effects and Glitch settings.
+    #[serde(skip_serializing_if = "crate::pipeline::MaskFx::is_default")]
+    pub fx: crate::pipeline::MaskFx,
+    /// Older projects: the whole Effects tab applied only inside this mask
+    /// (see `Params::migrate`).
+    #[serde(skip_serializing)]
     pub effects: bool,
-    /// The Glitch tab only applies inside this mask.
+    /// Older projects: the same for the Glitch tab.
+    #[serde(skip_serializing)]
     pub glitch: bool,
     /// Cut this area out: it becomes transparent.
     pub transparent: bool,
@@ -114,7 +176,8 @@ impl Default for Mask {
             hue: 210.0,
             hue_range: 30.0,
             hue_soft: 25.0,
-            adj: Local { tone_hue: 35.0, ..Local::default() },
+            adj: Local::default(),
+            fx: Default::default(),
             effects: false,
             glitch: false,
             transparent: false,
@@ -537,6 +600,8 @@ struct Prep {
     linear: bool,
     k: f32,
     tone_col: Px,
+    sh_col: Px,
+    hi_col: Px,
 }
 
 impl Prep {
@@ -551,15 +616,24 @@ impl Prep {
             linear: l.exposure != 0.0 || l.temperature != 0.0 || l.tint != 0.0,
             k: (l.contrast * 1.1).exp(),
             tone_col: hue_rgb(l.tone_hue),
+            sh_col: hue_rgb(l.shadow_hue),
+            hi_col: hue_rgb(l.highlight_hue),
         }
     }
 }
 
+/// The same steps, in the same order, as the whole photo's tone & colour stage.
 fn adjust(c: Px, l: &Local, pr: &Prep) -> Px {
     let mut c = c;
     if pr.linear {
         for i in 0..3 {
             c[i] = fast_srgb(fast_linear(c[i]) * pr.wb[i]);
+        }
+    }
+    if l.blacks != 0.0 || l.whites != 0.0 {
+        let (bp, wp) = (-l.blacks * 0.08, 1.0 - l.whites * 0.2);
+        for v in &mut c {
+            *v = (*v - bp) / (wp - bp);
         }
     }
     if l.shadows != 0.0 || l.highlights != 0.0 {
@@ -581,10 +655,27 @@ fn adjust(c: Px, l: &Local, pr: &Prep) -> Px {
             *v = if x < 0.5 { 0.5 * (2.0 * x).powf(k) } else { 1.0 - 0.5 * (2.0 * (1.0 - x)).powf(k) };
         }
     }
-    if l.saturation != 0.0 {
+    if l.saturation != 0.0 || l.vibrance != 0.0 {
         let y = luma(c);
+        let mx = c[0].max(c[1]).max(c[2]);
+        let mn = c[0].min(c[1]).min(c[2]);
+        let sat = (mx - mn).clamp(0.0, 1.0);
+        let f = (1.0 + l.saturation) * (1.0 + l.vibrance * (1.0 - sat).powi(2));
         for v in &mut c {
-            *v = y + (*v - y) * (1.0 + l.saturation).max(0.0);
+            *v = y + (*v - y) * f.max(0.0);
+        }
+    }
+    if l.mono {
+        let y = luma(c);
+        c = [y, y, y];
+    }
+    if l.shadow_tone > 0.0 || l.highlight_tone > 0.0 {
+        let y = luma(c).clamp(0.0, 1.0);
+        let ws = (1.0 - y).powi(2) * l.shadow_tone * 0.35;
+        let wh = y.powi(2) * l.highlight_tone * 0.35;
+        let (sl, hl) = (luma(pr.sh_col), luma(pr.hi_col));
+        for i in 0..3 {
+            c[i] += (pr.sh_col[i] - sl) * ws + (pr.hi_col[i] - hl) * wh;
         }
     }
     if l.tone > 0.0 {
@@ -599,6 +690,12 @@ fn adjust(c: Px, l: &Local, pr: &Prep) -> Px {
             for v in &mut c {
                 *v *= y / ny;
             }
+        }
+    }
+    if l.fade != 0.0 {
+        let (lo, hi) = (l.fade * 0.22, 1.0 - l.fade * 0.06);
+        for v in &mut c {
+            *v = lo + v.clamp(0.0, 1.0) * (hi - lo);
         }
     }
     c.map(|v| v.clamp(0.0, 1.0))
@@ -678,20 +775,6 @@ pub fn adjust_with(img: &mut Img, masks: &[Mask], applied: &Applied, u: f32) {
             adjust_area(img, &m.adj, a, u);
         }
     }
-}
-
-/// Combined area of the enabled masks that `pick` chooses (e.g. those that
-/// hold the Effects tab), or None when none is chosen.
-pub fn union_alpha(img: &Img, masks: &[Mask], sp: &Space, pick: fn(&Mask) -> bool) -> Option<Vec<f32>> {
-    let mut out: Option<Vec<f32>> = None;
-    for m in masks.iter().filter(|m| m.enabled && pick(m)) {
-        let a = alpha(img, m, sp);
-        match &mut out {
-            None => out = Some(a),
-            Some(o) => o.par_iter_mut().zip(a.par_iter()).for_each(|(o, &v)| *o = o.max(v)),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

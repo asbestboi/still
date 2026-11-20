@@ -3,8 +3,9 @@ use crate::layers::{Blend, Layer};
 use crate::masks::{self, BrushStroke, Local, Mask, Refine, Seed, Shape};
 use crate::pipeline::{self, Aspect, Histogram, Img, Params};
 use crate::retouch::CloneStroke;
+use crate::search::{self, Place};
 use crate::ui_kit::{self as k, Btn, Fmt};
-use egui::{Align2, Color32, CornerRadius, Id, Pos2, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
+use egui::{Align2, Color32, CornerRadius, Id, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use crate::browse;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -611,6 +612,14 @@ pub struct App {
     last_image: Option<Arc<egui::ColorImage>>,
     last_img_rect: Rect,
     mask_sel: Option<usize>,
+    /// "Apply To" in the Adjust, Effects and Glitch tabs: None edits the whole
+    /// photo, Some(i) mask i's own settings.
+    target: Option<usize>,
+    /// Sliders whose change is hidden from the preview (see [`Hider`]).
+    hidden: HashSet<String>,
+    /// The search in Settings, and whether its field should take the keyboard.
+    search: String,
+    search_focus: bool,
     mask_drag: Option<MaskDrag>,
     show_overlay: bool,
     /// Keep the red overlay up while a mask is being shaped; it goes away
@@ -739,6 +748,10 @@ impl App {
             last_image: None,
             last_img_rect: Rect::NOTHING,
             mask_sel: None,
+            target: None,
+            hidden: HashSet::new(),
+            search: String::new(),
+            search_focus: false,
             mask_drag: None,
             show_overlay: false,
             overlay_hold: false,
@@ -1243,6 +1256,8 @@ impl App {
                 Msg::Loaded(Ok(doc)) => {
                     self.loading = None;
                     self.photos = false;
+                    self.hidden.clear();
+                    self.target = None;
                     self.orig_true_px = doc.preview.w as u32 == doc.full.width();
                     self.orig_tex = Some(ctx.load_texture("original", to_color_image(&doc.preview), tex_options(self.orig_true_px, self.prefs.pixel_view)));
                     // an animation starts playing
@@ -1471,6 +1486,13 @@ impl App {
         if frame != Frame::Output {
             params.border = 0.0;
         }
+        // sliders whose eye is off are left out of the preview; forget any that are back at default
+        if !self.hidden.is_empty() {
+            let stale: Vec<String> = self.hidden.iter().filter(|key| !hide_in(&mut params, key)).cloned().collect();
+            for key in stale {
+                self.hidden.remove(&key);
+            }
+        }
         // names and label colours don't change the picture
         for m in &mut params.masks {
             m.name.clear();
@@ -1579,6 +1601,10 @@ impl App {
         if sc(Modifiers::COMMAND, Key::O) {
             self.pick_file(ctx);
         }
+        if sc(Modifiers::COMMAND, Key::F) {
+            self.settings_open = true;
+            self.search_focus = true;
+        }
         if self.photos {
             if sc(Modifiers::COMMAND, Key::Comma) {
                 self.settings_open = !self.settings_open;
@@ -1662,8 +1688,7 @@ impl App {
                 && let Some(i) = self.selected_mask()
             {
                 if ctx.input(|inp| inp.key_pressed(Key::Delete) || inp.key_pressed(Key::Backspace)) {
-                    self.params.masks.remove(i);
-                    self.mask_sel = None;
+                    self.remove_mask(i);
                 }
                 if ctx.input(|inp| inp.key_pressed(Key::OpenBracket)) {
                     self.brush_size = (self.brush_size - 0.05).max(0.0);
@@ -2816,6 +2841,7 @@ impl App {
         self.canvas_hud(ui, rect, fit, zoom);
         self.frame_bar(ui, rect);
         self.update_banner(ui, rect);
+        self.hidden_pill(ui, rect);
         self.toast_view(ui, rect);
         if hovering_files {
             self.drop_hint(ui, rect);
@@ -3511,6 +3537,36 @@ impl App {
         }
     }
 
+    /// While changes are hidden with their eye, say so above the HUD, with a
+    /// way to bring them all back.
+    fn hidden_pill(&mut self, ui: &mut Ui, rect: Rect) {
+        let n = self.hidden.len();
+        if n == 0 {
+            return;
+        }
+        let text = if n == 1 { "1 change hidden".to_string() } else { format!("{n} changes hidden") };
+        let g = ui.painter().layout_no_wrap(text, k::font(12.0), k::LABEL);
+        let link = ui.painter().layout_no_wrap("Show All".into(), k::font_semibold(12.0), k::ACCENT);
+        let w = g.size().x + link.size().x + 44.0;
+        // above the animation bar when there is one
+        let y = if self.doc.as_ref().is_some_and(|d| d.anim.is_some()) { 124.0 } else { 82.0 };
+        let pill = Rect::from_center_size(pos2(rect.center().x, rect.bottom() - y), vec2(w, 30.0));
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(pill, CornerRadius::same(15), Color32::from_rgba_unmultiplied(38, 38, 42, 225));
+        k::stroke_rect(ui, pill, 15, k::ACCENT.gamma_multiply(0.45));
+        painter.galley(pos2(pill.left() + 14.0, pill.center().y - g.size().y / 2.0), g, k::LABEL);
+        let lr = Rect::from_min_max(pos2(pill.right() - link.size().x - 18.0, pill.top()), pill.max);
+        let resp = ui.interact(lr, Id::unique("hidden_show_all"), Sense::click());
+        let col = if resp.is_pointer_button_down_on() { k::ACCENT.gamma_multiply(0.6) } else { k::ACCENT };
+        painter.galley(pos2(lr.left() + 4.0, pill.center().y - link.size().y / 2.0), link, col);
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.on_hover_text("Turn every eye back on").clicked() {
+            self.hidden.clear();
+        }
+    }
+
     fn empty_state(&mut self, ui: &mut Ui, rect: Rect, hovering: bool) {
         let ctx = ui.ctx().clone();
         let painter = ui.painter_at(rect);
@@ -3667,11 +3723,331 @@ impl App {
 // Sidebar
 // ---------------------------------------------------------------------------
 
+/// What a preset keeps of an edit: not its masks, layers or retouching, nor
+/// its noise reduction, which belongs to the photo (applying a preset keeps
+/// the photo's own).
+fn preset_of(p: &Params) -> Params {
+    let d = Params::default();
+    Params {
+        masks: Vec::new(),
+        layers: Vec::new(),
+        retouch: Vec::new(),
+        denoise_luma: d.denoise_luma,
+        denoise_detail: d.denoise_detail,
+        denoise_color: d.denoise_color,
+        ..p.clone()
+    }
+}
+
 macro_rules! modified {
     ($p:expr, $($f:ident),+) => {{ let d = Params::default(); false $( || $p.$f != d.$f )+ }};
 }
 macro_rules! reset {
     ($p:expr, $($f:ident),+) => {{ let d = Params::default(); $( $p.$f = d.$f; )+ }};
+}
+
+/// Leave the slider `key` (see [`Hider`]) out of `p`. False when there was
+/// nothing to leave out, so the key can go.
+fn hide_in(p: &mut Params, key: &str) -> bool {
+    let Some((mask, rest)) = key.strip_prefix('@').and_then(|r| r.split_once('.')) else {
+        return p.reset_field(key);
+    };
+    let Some(m) = mask.parse::<usize>().ok().and_then(|i| p.masks.get_mut(i)) else { return false };
+    match rest.split_once('.') {
+        Some(("adj", f)) => m.adj.reset_field(f),
+        Some(("fx", f)) => m.fx.reset_field(f),
+        _ => false,
+    }
+}
+
+/// Hands out the eye on each slider: a change whose eye is off is left out
+/// of the preview (never the export), to see the photo without it. Keys are
+/// field names, "@3.adj.contrast" for mask 3's adjustments and "@3.fx.grain"
+/// for its effects.
+struct Hider<'a> {
+    keys: &'a mut HashSet<String>,
+    prefix: String,
+}
+
+impl<'a> Hider<'a> {
+    /// `part` is "adj" or "fx": which of a mask's settings the sliders edit.
+    fn new(keys: &'a mut HashSet<String>, mask: Option<usize>, part: &str) -> Self {
+        let prefix = mask.map(|i| format!("@{i}.{part}.")).unwrap_or_default();
+        Hider { keys, prefix }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn slider(&mut self, ui: &mut Ui, field: &str, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, default: f32, fmt: Fmt) {
+        let key = format!("{}{field}", self.prefix);
+        let mut hidden = self.keys.contains(&key);
+        let r = k::slider_ex(ui, label, v, range, default, fmt, Some(&mut hidden));
+        // moving it again (or resetting it) brings it back
+        if r.changed() || (*v - default).abs() <= 1e-4 {
+            hidden = false;
+        }
+        if hidden {
+            self.keys.insert(key);
+        } else {
+            self.keys.remove(&key);
+        }
+    }
+}
+
+/// A slider with an eye, named after its field.
+macro_rules! eye {
+    ($h:expr, $ui:expr, $p:ident . $f:ident, $label:expr, $range:expr, $def:expr, $fmt:expr) => {
+        $h.slider($ui, stringify!($f), $label, &mut $p.$f, $range, $def, $fmt)
+    };
+}
+
+/// Run a tab's controls on the whole photo's settings, or on mask `target`'s own.
+fn with_target(
+    ui: &mut Ui,
+    params: &mut Params,
+    target: Option<usize>,
+    hidden: &mut HashSet<String>,
+    clip: &mut Option<u32>,
+    f: fn(&mut Ui, &mut Params, &mut Hider, &mut Option<u32>),
+) {
+    let h = &mut Hider::new(hidden, target, "fx");
+    match target {
+        Some(i) => {
+            let fx = &mut params.masks[i].fx;
+            let mut q = fx.params();
+            f(ui, &mut q, h, clip);
+            *fx = pipeline::MaskFx::read(&q);
+        }
+        None => f(ui, params, h, clip),
+    }
+}
+
+/// The Adjust tab for the whole photo.
+fn adjust_ui(ui: &mut Ui, p: &mut Params, h: &mut Hider) {
+    if k::section(ui, "Light", modified!(p, exposure, contrast, highlights, shadows, whites, blacks, fade), |ui| {
+        eye!(h, ui, p.exposure, "Exposure", -3.0..=3.0, 0.0, Fmt::Ev);
+        eye!(h, ui, p.contrast, "Contrast", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, p.highlights, "Highlights", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, p.shadows, "Shadows", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, p.whites, "Whites", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, p.blacks, "Blacks", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, p.fade, "Fade", 0.0..=1.0, 0.0, Fmt::Amount);
+    }) {
+        reset!(p, exposure, contrast, highlights, shadows, whites, blacks, fade);
+    }
+
+    if k::section(ui, "Color", modified!(p, temperature, tint, saturation, vibrance, mono), |ui| {
+        eye!(h, ui, p.temperature, "Temperature", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, p.tint, "Tint", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, p.saturation, "Saturation", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, p.vibrance, "Vibrance", -1.0..=1.0, 0.0, Fmt::Signed);
+        k::switch_row(ui, "Black & White", &mut p.mono);
+    }) {
+        reset!(p, temperature, tint, saturation, vibrance, mono);
+    }
+
+    if k::section(ui, "Split Tone", modified!(p, shadow_hue, shadow_tone, highlight_hue, highlight_tone), |ui| {
+        hue_strip(ui);
+        eye!(h, ui, p.shadow_hue, "Shadow Hue", 0.0..=360.0, 200.0, Fmt::Deg);
+        eye!(h, ui, p.shadow_tone, "Shadow Amount", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.highlight_hue, "Highlight Hue", 0.0..=360.0, 35.0, Fmt::Deg);
+        eye!(h, ui, p.highlight_tone, "Highlight Amount", 0.0..=1.0, 0.0, Fmt::Amount);
+    }) {
+        reset!(p, shadow_hue, shadow_tone, highlight_hue, highlight_tone);
+    }
+
+    if k::section(ui, "Detail", modified!(p, sharpen, softness), |ui| {
+        eye!(h, ui, p.sharpen, "Sharpen", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.softness, "Soften", 0.0..=1.0, 0.0, Fmt::Amount);
+    }) {
+        reset!(p, sharpen, softness);
+    }
+    if k::section(ui, "Noise Reduction", modified!(p, denoise_luma, denoise_detail, denoise_color), |ui| {
+        eye!(h, ui, p.denoise_luma, "Luminance", 0.0..=1.0, 0.0, Fmt::Amount);
+        // Detail tunes the luminance smoothing: nothing to tune without it
+        ui.add_enabled_ui(p.denoise_luma > 0.0, |ui| {
+            eye!(h, ui, p.denoise_detail, "Detail", 0.0..=1.0, 0.5, Fmt::Amount);
+        });
+        eye!(h, ui, p.denoise_color, "Color", 0.0..=1.0, 0.0, Fmt::Amount);
+        k::caption(ui, "Measures the photo's own noise. Best judged zoomed in.");
+    }) {
+        reset!(p, denoise_luma, denoise_detail, denoise_color);
+    }
+}
+
+/// The Adjust tab for one mask: the same sections, on the mask's own adjustments.
+fn local_ui(ui: &mut Ui, a: &mut Local, h: &mut Hider) {
+    let d = Local::default();
+    macro_rules! lmod {
+        ($($f:ident),+) => { false $( || a.$f != d.$f )+ };
+    }
+    macro_rules! lreset {
+        ($($f:ident),+) => { $( a.$f = d.$f; )+ };
+    }
+    if k::section(ui, "Light", lmod!(exposure, contrast, highlights, shadows, whites, blacks, fade), |ui| {
+        eye!(h, ui, a.exposure, "Exposure", -3.0..=3.0, 0.0, Fmt::Ev);
+        eye!(h, ui, a.contrast, "Contrast", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, a.highlights, "Highlights", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, a.shadows, "Shadows", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, a.whites, "Whites", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, a.blacks, "Blacks", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, a.fade, "Fade", 0.0..=1.0, 0.0, Fmt::Amount);
+    }) {
+        lreset!(exposure, contrast, highlights, shadows, whites, blacks, fade);
+    }
+
+    if k::section(ui, "Color", lmod!(temperature, tint, saturation, vibrance, mono), |ui| {
+        eye!(h, ui, a.temperature, "Temperature", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, a.tint, "Tint", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, a.saturation, "Saturation", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, a.vibrance, "Vibrance", -1.0..=1.0, 0.0, Fmt::Signed);
+        k::switch_row(ui, "Black & White", &mut a.mono);
+    }) {
+        lreset!(temperature, tint, saturation, vibrance, mono);
+    }
+
+    if k::section(ui, "Split Tone", lmod!(shadow_hue, shadow_tone, highlight_hue, highlight_tone), |ui| {
+        hue_strip(ui);
+        eye!(h, ui, a.shadow_hue, "Shadow Hue", 0.0..=360.0, d.shadow_hue, Fmt::Deg);
+        eye!(h, ui, a.shadow_tone, "Shadow Amount", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, a.highlight_hue, "Highlight Hue", 0.0..=360.0, d.highlight_hue, Fmt::Deg);
+        eye!(h, ui, a.highlight_tone, "Highlight Amount", 0.0..=1.0, 0.0, Fmt::Amount);
+    }) {
+        lreset!(shadow_hue, shadow_tone, highlight_hue, highlight_tone);
+    }
+
+    if k::section(ui, "Color Wash", lmod!(tone, tone_hue), |ui| {
+        eye!(h, ui, a.tone, "Color", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, a.tone_hue, "Color Hue", 0.0..=360.0, d.tone_hue, Fmt::Deg);
+        hue_strip(ui);
+    }) {
+        lreset!(tone, tone_hue);
+    }
+
+    if k::section(ui, "Detail", lmod!(sharpness), |ui| {
+        eye!(h, ui, a.sharpness, "Sharpness", -1.0..=1.0, 0.0, Fmt::Signed);
+        k::caption(ui, "Right sharpens, left softens.");
+    }) {
+        lreset!(sharpness);
+    }
+}
+
+fn effects_ui(ui: &mut Ui, p: &mut Params, h: &mut Hider, clip: &mut Option<u32>) {
+    if k::section(ui, "Optics", modified!(p, bloom, bloom_radius, bloom_threshold, halation, aberration, vignette, vignette_feather), |ui| {
+        eye!(h, ui, p.bloom, "Bloom", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.bloom_radius, "Bloom Radius", 0.0..=1.0, 0.4, Fmt::Amount);
+        eye!(h, ui, p.bloom_threshold, "Glow Threshold", 0.0..=1.0, 0.5, Fmt::Amount);
+        eye!(h, ui, p.halation, "Halation", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.aberration, "Chromatic Aberration", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.vignette, "Vignette", -1.0..=1.0, 0.0, Fmt::Signed);
+        eye!(h, ui, p.vignette_feather, "Vignette Feather", 0.0..=1.0, 0.6, Fmt::Amount);
+    }) {
+        reset!(p, bloom, bloom_radius, bloom_threshold, halation, aberration, vignette, vignette_feather);
+    }
+
+    if k::section(ui, "Astigmatism", modified!(p, astig, astig_length, astig_angle, astig_rays), |ui| {
+        k::caption(ui, "Bright lights smear into streaks, like night lights seen through an astigmatic eye.");
+        ui.add_space(2.0);
+        eye!(h, ui, p.astig, "Amount", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.astig_length, "Length", 0.0..=1.0, 0.4, Fmt::Amount);
+        eye!(h, ui, p.astig_angle, "Angle", 0.0..=180.0, 90.0, Fmt::Deg);
+        let mut r = (p.astig_rays.clamp(1, 3) - 1) as usize;
+        if k::segmented(ui, "astig_rays", &mut r, &["Streak", "Cross", "Star"]) {
+            p.astig_rays = r as u8 + 1;
+        }
+        ui.add_space(2.0);
+        k::caption(ui, "Uses the Glow Threshold above to decide which lights streak.");
+        ui.add_space(4.0);
+    }) {
+        reset!(p, astig, astig_length, astig_angle, astig_rays);
+    }
+
+    let main = p.seed;
+    if k::section(ui, "Grain", modified!(p, grain, grain_size, grain_color, seed_grain), |ui| {
+        eye!(h, ui, p.grain, "Amount", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.grain_size, "Size", 0.0..=1.0, 0.35, Fmt::Amount);
+        eye!(h, ui, p.grain_color, "Color", 0.0..=1.0, 0.0, Fmt::Amount);
+        seed_row(ui, "seed_grain", &mut p.seed_grain, Some(main), clip);
+        k::caption(ui, "The seed places the grain and the CCD noise.");
+        ui.add_space(4.0);
+    }) {
+        reset!(p, grain, grain_size, grain_color, seed_grain);
+    }
+
+    if k::section(ui, "Sensor", modified!(p, sensor_noise, scanlines, scanline_spacing), |ui| {
+        eye!(h, ui, p.sensor_noise, "CCD Noise", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.scanlines, "Scanlines", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.scanline_spacing, "Line Spacing", 0.0..=1.0, 0.3, Fmt::Amount);
+    }) {
+        reset!(p, sensor_noise, scanlines, scanline_spacing);
+    }
+
+    if k::section(ui, "Resolution", modified!(p, lowres, lowres_smooth), |ui| {
+        eye!(h, ui, p.lowres, "Downsample", 0.0..=1.0, 0.0, Fmt::Amount);
+        k::switch_row(ui, "Smooth Upscale", &mut p.lowres_smooth);
+    }) {
+        reset!(p, lowres, lowres_smooth);
+    }
+
+    if k::section(ui, "Posterize", modified!(p, posterize, dither), |ui| {
+        eye!(h, ui, p.posterize, "Amount", 0.0..=1.0, 0.0, Fmt::Amount);
+        k::switch_row(ui, "Ordered Dither", &mut p.dither);
+    }) {
+        reset!(p, posterize, dither);
+    }
+}
+
+fn glitch_ui(ui: &mut Ui, p: &mut Params, h: &mut Hider, clip: &mut Option<u32>) {
+    k::caption(ui, "Glitches and grain are placed by seeds. Every effect follows the main seed until you give it its own: type a number, roll a random one, or copy a seed from one effect and paste it into another.");
+    ui.add_space(4.0);
+    seed_row(ui, "seed_main", &mut p.seed, None, clip);
+    ui.add_space(10.0);
+    let main = p.seed;
+
+    if k::section(ui, "Pixel Sort", modified!(p, sort_amount, sort_low, sort_high, sort_vertical, sort_reverse, seed_sort), |ui| {
+        eye!(h, ui, p.sort_amount, "Amount", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.sort_low, "Threshold Low", 0.0..=1.0, 0.45, Fmt::Amount);
+        eye!(h, ui, p.sort_high, "Threshold High", 0.0..=1.0, 1.0, Fmt::Amount);
+        k::switch_row(ui, "Vertical", &mut p.sort_vertical);
+        k::switch_row(ui, "Reverse", &mut p.sort_reverse);
+        seed_row(ui, "seed_sort", &mut p.seed_sort, Some(main), clip);
+        ui.add_space(4.0);
+    }) {
+        reset!(p, sort_amount, sort_low, sort_high, sort_vertical, sort_reverse, seed_sort);
+    }
+
+    if k::section(ui, "Data Streaks", modified!(p, streaks, streak_width, seed_streaks), |ui| {
+        eye!(h, ui, p.streaks, "Amount", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.streak_width, "Width", 0.0..=1.0, 0.3, Fmt::Amount);
+        seed_row(ui, "seed_streaks", &mut p.seed_streaks, Some(main), clip);
+        ui.add_space(4.0);
+    }) {
+        reset!(p, streaks, streak_width, seed_streaks);
+    }
+
+    if k::section(ui, "Slice Shift", modified!(p, slices, slice_shift, seed_slices), |ui| {
+        eye!(h, ui, p.slices, "Amount", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.slice_shift, "Offset", 0.0..=1.0, 0.3, Fmt::Amount);
+        seed_row(ui, "seed_slices", &mut p.seed_slices, Some(main), clip);
+        ui.add_space(4.0);
+    }) {
+        reset!(p, slices, slice_shift, seed_slices);
+    }
+
+    if k::section(ui, "RGB Split", modified!(p, rgb_split, rgb_angle), |ui| {
+        eye!(h, ui, p.rgb_split, "Distance", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.rgb_angle, "Angle", 0.0..=360.0, 0.0, Fmt::Deg);
+    }) {
+        reset!(p, rgb_split, rgb_angle);
+    }
+
+    if k::section(ui, "Compression", modified!(p, blocks, block_size, seed_blocks), |ui| {
+        eye!(h, ui, p.blocks, "Amount", 0.0..=1.0, 0.0, Fmt::Amount);
+        eye!(h, ui, p.block_size, "Block Size", 0.0..=1.0, 0.3, Fmt::Amount);
+        seed_row(ui, "seed_blocks", &mut p.seed_blocks, Some(main), clip);
+        ui.add_space(4.0);
+    }) {
+        reset!(p, blocks, block_size, seed_blocks);
+    }
 }
 
 impl App {
@@ -3843,7 +4219,7 @@ impl App {
         }
         let mut changed = false;
         if let Some(i) = overwrite {
-            self.user_presets[i].1 = Params { masks: Vec::new(), layers: Vec::new(), retouch: Vec::new(), ..self.params.clone() };
+            self.user_presets[i].1 = preset_of(&self.params);
             changed = true;
         }
         if let Some(i) = delete {
@@ -3853,7 +4229,7 @@ impl App {
 
         ui.add_space(8.0);
         k::section(ui, "Save Preset", false, |ui| {
-            k::caption(ui, "Saves every adjustment except crop, border, masks and layers.");
+            k::caption(ui, "Saves every adjustment except crop, border, noise reduction, masks and layers.");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let te = egui::TextEdit::singleline(&mut self.new_preset)
@@ -3864,7 +4240,7 @@ impl App {
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let ok = !self.new_preset.trim().is_empty();
                 if (k::button(ui, "Save", Btn::Secondary, ok).clicked() || enter) && ok {
-                    self.user_presets.push((self.new_preset.trim().to_string(), Params { masks: Vec::new(), layers: Vec::new(), retouch: Vec::new(), ..self.params.clone() }));
+                    self.user_presets.push((self.new_preset.trim().to_string(), preset_of(&self.params)));
                     self.new_preset.clear();
                     changed = true;
                 }
@@ -3907,203 +4283,78 @@ impl App {
     }
 
     fn tab_adjust(&mut self, ui: &mut Ui) {
-        let p = &mut self.params;
-        if k::section(ui, "Light", modified!(p, exposure, contrast, highlights, shadows, whites, blacks, fade), |ui| {
-            k::slider(ui, "Exposure", &mut p.exposure, -3.0..=3.0, 0.0, Fmt::Ev);
-            k::slider(ui, "Contrast", &mut p.contrast, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Highlights", &mut p.highlights, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Shadows", &mut p.shadows, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Whites", &mut p.whites, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Blacks", &mut p.blacks, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Fade", &mut p.fade, 0.0..=1.0, 0.0, Fmt::Amount);
-        }) {
-            reset!(p, exposure, contrast, highlights, shadows, whites, blacks, fade);
-        }
-
-        if k::section(ui, "Color", modified!(p, temperature, tint, saturation, vibrance, mono), |ui| {
-            k::slider(ui, "Temperature", &mut p.temperature, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Tint", &mut p.tint, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Saturation", &mut p.saturation, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Vibrance", &mut p.vibrance, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::switch_row(ui, "Black & White", &mut p.mono);
-        }) {
-            reset!(p, temperature, tint, saturation, vibrance, mono);
-        }
-
-        if k::section(ui, "Split Tone", modified!(p, shadow_hue, shadow_tone, highlight_hue, highlight_tone), |ui| {
-            hue_strip(ui);
-            k::slider(ui, "Shadow Hue", &mut p.shadow_hue, 0.0..=360.0, 200.0, Fmt::Deg);
-            k::slider(ui, "Shadow Amount", &mut p.shadow_tone, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Highlight Hue", &mut p.highlight_hue, 0.0..=360.0, 35.0, Fmt::Deg);
-            k::slider(ui, "Highlight Amount", &mut p.highlight_tone, 0.0..=1.0, 0.0, Fmt::Amount);
-        }) {
-            reset!(p, shadow_hue, shadow_tone, highlight_hue, highlight_tone);
-        }
-
-        if k::section(ui, "Detail", modified!(p, sharpen, softness), |ui| {
-            k::slider(ui, "Sharpen", &mut p.sharpen, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Soften", &mut p.softness, 0.0..=1.0, 0.0, Fmt::Amount);
-        }) {
-            reset!(p, sharpen, softness);
+        let target = self.apply_to(ui, "adjust_to", "adjustments");
+        let h = &mut Hider::new(&mut self.hidden, target, "adj");
+        match target {
+            Some(i) => local_ui(ui, &mut self.params.masks[i].adj, h),
+            None => adjust_ui(ui, &mut self.params, h),
         }
     }
 
-    /// "Apply To": the whole photo, or only inside one mask. The choice is
-    /// stored on the mask (`pick` / `set`), so it survives reordering.
-    fn apply_to(&mut self, ui: &mut Ui, id: &str, what: &str, pick: fn(&Mask) -> bool, set: fn(&mut Mask, bool)) {
-        let masks = &mut self.params.masks;
-        let current = masks.iter().position(pick);
-        let mut choice = current;
-        let shown = current.map(|i| masks[i].name.clone()).unwrap_or_else(|| "Whole Photo".into());
-        ui.horizontal(|ui| {
+    /// "Apply To": edit the whole photo's settings, or one mask's own. The
+    /// choice is shared by the Adjust, Effects and Glitch tabs.
+    fn apply_to(&mut self, ui: &mut Ui, id: &str, what: &str) -> Option<usize> {
+        let masks = &self.params.masks;
+        self.target = self.target.filter(|i| *i < masks.len());
+        let mut choice = self.target;
+        let shown = choice.map(|i| masks[i].name.clone()).unwrap_or_else(|| "Whole Photo".into());
+        let row = ui.horizontal(|ui| {
             ui.set_min_height(30.0);
-            ui.label(egui::RichText::new("Apply To").color(k::LABEL2).size(13.0));
+            let label = ui.label(egui::RichText::new("Apply To").color(k::LABEL2).size(13.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                egui::ComboBox::from_id_salt(id).selected_text(shown).width(170.0).show_ui(ui, |ui| {
+                let combo = egui::ComboBox::from_id_salt(id).selected_text(shown).width(170.0).show_ui(ui, |ui| {
                     ui.selectable_value(&mut choice, None, "Whole Photo");
                     for (i, m) in masks.iter().enumerate() {
                         ui.selectable_value(&mut choice, Some(i), &m.name);
                     }
                 });
+                let _ = combo.response.labelled_by(label.id);
             });
         });
-        if choice != current {
-            for (i, m) in masks.iter_mut().enumerate() {
-                set(m, choice == Some(i));
+        k::found(ui, row.response.rect, "Apply To");
+        self.target = choice;
+        match choice {
+            None if masks.is_empty() => {
+                k::caption(ui, &format!("To give part of the photo its own {what}, add a mask in the Masks tab first."));
+            }
+            None => k::caption(ui, &format!("Choose a mask to give that part of the photo its own {what}.")),
+            Some(i) => {
+                // a tinted card, so it's clear these sliders aren't the whole photo's
+                let m = &masks[i];
+                let col = label_color(m.color).unwrap_or(k::ACCENT);
+                egui::Frame::NONE
+                    .fill(col.gamma_multiply(0.14))
+                    .stroke(Stroke::new(1.0, col.gamma_multiply(0.5)))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(vec2(10.0, 14.0), Sense::hover());
+                            ui.painter().circle_filled(r.center(), 4.0, col);
+                            ui.label(egui::RichText::new(format!("Editing {}", m.name)).font(k::font_semibold(13.0)));
+                        });
+                        let note = if m.enabled {
+                            format!("These {what} only show inside this mask, on top of the whole photo's. Set Apply To back to Whole Photo to edit the rest.")
+                        } else {
+                            format!("This mask is hidden, so its {what} don't show right now.")
+                        };
+                        k::caption(ui, &note);
+                    });
             }
         }
-        match choice {
-            None if masks.is_empty() => k::caption(ui, &format!("To use {what} on part of the photo, add a mask in the Masks tab first.")),
-            Some(i) if !masks[i].enabled => k::caption(ui, "That mask is hidden, so these apply to the whole photo."),
-            Some(_) => k::caption(ui, &format!("{what} only show inside the mask.")),
-            None => {}
-        }
         ui.add_space(8.0);
+        choice
     }
 
     fn tab_effects(&mut self, ui: &mut Ui) {
-        self.apply_to(ui, "fx_mask", "Effects", |m| m.effects, |m, on| m.effects = on);
-        let p = &mut self.params;
-        if k::section(ui, "Optics", modified!(p, bloom, bloom_radius, bloom_threshold, halation, aberration, vignette, vignette_feather), |ui| {
-            k::slider(ui, "Bloom", &mut p.bloom, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Bloom Radius", &mut p.bloom_radius, 0.0..=1.0, 0.4, Fmt::Amount);
-            k::slider(ui, "Glow Threshold", &mut p.bloom_threshold, 0.0..=1.0, 0.5, Fmt::Amount);
-            k::slider(ui, "Halation", &mut p.halation, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Chromatic Aberration", &mut p.aberration, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Vignette", &mut p.vignette, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Vignette Feather", &mut p.vignette_feather, 0.0..=1.0, 0.6, Fmt::Amount);
-        }) {
-            reset!(p, bloom, bloom_radius, bloom_threshold, halation, aberration, vignette, vignette_feather);
-        }
-
-        if k::section(ui, "Astigmatism", modified!(p, astig, astig_length, astig_angle, astig_rays), |ui| {
-            k::caption(ui, "Bright lights smear into streaks, like night lights seen through an astigmatic eye.");
-            ui.add_space(2.0);
-            k::slider(ui, "Amount", &mut p.astig, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Length", &mut p.astig_length, 0.0..=1.0, 0.4, Fmt::Amount);
-            k::slider(ui, "Angle", &mut p.astig_angle, 0.0..=180.0, 90.0, Fmt::Deg);
-            let mut r = (p.astig_rays.clamp(1, 3) - 1) as usize;
-            if k::segmented(ui, "astig_rays", &mut r, &["Streak", "Cross", "Star"]) {
-                p.astig_rays = r as u8 + 1;
-            }
-            ui.add_space(2.0);
-            k::caption(ui, "Uses the Glow Threshold above to decide which lights streak.");
-            ui.add_space(4.0);
-        }) {
-            reset!(p, astig, astig_length, astig_angle, astig_rays);
-        }
-
-        let clip = &mut self.seed_clip;
-        let main = p.seed;
-        if k::section(ui, "Grain", modified!(p, grain, grain_size, grain_color, seed_grain), |ui| {
-            k::slider(ui, "Amount", &mut p.grain, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Size", &mut p.grain_size, 0.0..=1.0, 0.35, Fmt::Amount);
-            k::slider(ui, "Color", &mut p.grain_color, 0.0..=1.0, 0.0, Fmt::Amount);
-            seed_row(ui, "seed_grain", &mut p.seed_grain, Some(main), clip);
-            k::caption(ui, "The seed places the grain and the CCD noise.");
-            ui.add_space(4.0);
-        }) {
-            reset!(p, grain, grain_size, grain_color, seed_grain);
-        }
-
-        if k::section(ui, "Sensor", modified!(p, sensor_noise, scanlines, scanline_spacing), |ui| {
-            k::slider(ui, "CCD Noise", &mut p.sensor_noise, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Scanlines", &mut p.scanlines, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Line Spacing", &mut p.scanline_spacing, 0.0..=1.0, 0.3, Fmt::Amount);
-        }) {
-            reset!(p, sensor_noise, scanlines, scanline_spacing);
-        }
-
-        if k::section(ui, "Resolution", modified!(p, lowres, lowres_smooth), |ui| {
-            k::slider(ui, "Downsample", &mut p.lowres, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::switch_row(ui, "Smooth Upscale", &mut p.lowres_smooth);
-        }) {
-            reset!(p, lowres, lowres_smooth);
-        }
-
-        if k::section(ui, "Posterize", modified!(p, posterize, dither), |ui| {
-            k::slider(ui, "Amount", &mut p.posterize, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::switch_row(ui, "Ordered Dither", &mut p.dither);
-        }) {
-            reset!(p, posterize, dither);
-        }
+        let target = self.apply_to(ui, "fx_to", "effects");
+        with_target(ui, &mut self.params, target, &mut self.hidden, &mut self.seed_clip, effects_ui);
     }
 
     fn tab_glitch(&mut self, ui: &mut Ui) {
-        self.apply_to(ui, "glitch_mask", "Glitches", |m| m.glitch, |m, on| m.glitch = on);
-        let p = &mut self.params;
-        let clip = &mut self.seed_clip;
-        k::caption(ui, "Glitches and grain are placed by seeds. Every effect follows the main seed until you give it its own: type a number, roll a random one, or copy a seed from one effect and paste it into another.");
-        ui.add_space(4.0);
-        seed_row(ui, "seed_main", &mut p.seed, None, clip);
-        ui.add_space(10.0);
-        let main = p.seed;
-
-        if k::section(ui, "Pixel Sort", modified!(p, sort_amount, sort_low, sort_high, sort_vertical, sort_reverse, seed_sort), |ui| {
-            k::slider(ui, "Amount", &mut p.sort_amount, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Threshold Low", &mut p.sort_low, 0.0..=1.0, 0.45, Fmt::Amount);
-            k::slider(ui, "Threshold High", &mut p.sort_high, 0.0..=1.0, 1.0, Fmt::Amount);
-            k::switch_row(ui, "Vertical", &mut p.sort_vertical);
-            k::switch_row(ui, "Reverse", &mut p.sort_reverse);
-            seed_row(ui, "seed_sort", &mut p.seed_sort, Some(main), clip);
-            ui.add_space(4.0);
-        }) {
-            reset!(p, sort_amount, sort_low, sort_high, sort_vertical, sort_reverse, seed_sort);
-        }
-
-        if k::section(ui, "Data Streaks", modified!(p, streaks, streak_width, seed_streaks), |ui| {
-            k::slider(ui, "Amount", &mut p.streaks, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Width", &mut p.streak_width, 0.0..=1.0, 0.3, Fmt::Amount);
-            seed_row(ui, "seed_streaks", &mut p.seed_streaks, Some(main), clip);
-            ui.add_space(4.0);
-        }) {
-            reset!(p, streaks, streak_width, seed_streaks);
-        }
-
-        if k::section(ui, "Slice Shift", modified!(p, slices, slice_shift, seed_slices), |ui| {
-            k::slider(ui, "Amount", &mut p.slices, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Offset", &mut p.slice_shift, 0.0..=1.0, 0.3, Fmt::Amount);
-            seed_row(ui, "seed_slices", &mut p.seed_slices, Some(main), clip);
-            ui.add_space(4.0);
-        }) {
-            reset!(p, slices, slice_shift, seed_slices);
-        }
-
-        if k::section(ui, "RGB Split", modified!(p, rgb_split, rgb_angle), |ui| {
-            k::slider(ui, "Distance", &mut p.rgb_split, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Angle", &mut p.rgb_angle, 0.0..=360.0, 0.0, Fmt::Deg);
-        }) {
-            reset!(p, rgb_split, rgb_angle);
-        }
-
-        if k::section(ui, "Compression", modified!(p, blocks, block_size, seed_blocks), |ui| {
-            k::slider(ui, "Amount", &mut p.blocks, 0.0..=1.0, 0.0, Fmt::Amount);
-            k::slider(ui, "Block Size", &mut p.block_size, 0.0..=1.0, 0.3, Fmt::Amount);
-            seed_row(ui, "seed_blocks", &mut p.seed_blocks, Some(main), clip);
-            ui.add_space(4.0);
-        }) {
-            reset!(p, blocks, block_size, seed_blocks);
-        }
+        let target = self.apply_to(ui, "glitch_to", "glitches");
+        with_target(ui, &mut self.params, target, &mut self.hidden, &mut self.seed_clip, glitch_ui);
     }
 
     // --- layers --------------------------------------------------------------
@@ -5335,6 +5586,15 @@ impl App {
         self.picking_hue = false;
     }
 
+    /// Delete mask `i`, keeping Apply To on the same mask (or the whole photo).
+    fn remove_mask(&mut self, i: usize) {
+        self.params.masks.remove(i);
+        self.mask_sel = None;
+        self.target = self.target.and_then(|t| if t == i { None } else if t > i { Some(t - 1) } else { Some(t) });
+        // hidden sliders of masks are keyed by position
+        self.hidden.retain(|k| !k.starts_with('@'));
+    }
+
     fn tab_masks(&mut self, ui: &mut Ui) {
         if self.doc.is_none() {
             k::caption(ui, "Open a photo to add masks.");
@@ -5427,10 +5687,10 @@ impl App {
                         if !m.adj.is_identity() {
                             uses.push("Edited");
                         }
-                        if m.effects {
+                        if m.fx.has_effects() || m.fx.has_glow() {
                             uses.push("Effects");
                         }
-                        if m.glitch {
+                        if m.fx.has_glitch() {
                             uses.push("Glitch");
                         }
                         let tag = if uses.is_empty() { "No edits".to_string() } else { uses.join(" · ") };
@@ -5477,6 +5737,10 @@ impl App {
                 });
             }
         });
+        // the list changes shape: hidden sliders of masks are keyed by position
+        if matches!(act, Some(Act::Duplicate(_) | Act::Up(_) | Act::Down(_) | Act::Delete(_))) {
+            self.hidden.retain(|k| !k.starts_with('@'));
+        }
         let masks = &mut self.params.masks;
         match act {
             Some(Act::Select(i)) => {
@@ -5490,25 +5754,22 @@ impl App {
             Some(Act::Duplicate(i)) => {
                 let mut m = masks[i].clone();
                 m.name = format!("{} copy", m.name);
-                // one mask holds the Effects / Glitch tabs; the copy starts plain
-                m.effects = false;
-                m.glitch = false;
                 masks.insert(i + 1, m);
                 self.mask_sel = Some(i + 1);
+                self.target = self.target.map(|t| if t > i { t + 1 } else { t });
             }
             Some(Act::Invert(i)) => masks[i].invert = !masks[i].invert,
             Some(Act::Up(i)) => {
                 masks.swap(i, i - 1);
                 self.mask_sel = Some(i - 1);
+                self.target = self.target.map(|t| if t == i { i - 1 } else if t == i - 1 { i } else { t });
             }
             Some(Act::Down(i)) => {
                 masks.swap(i, i + 1);
                 self.mask_sel = Some(i + 1);
+                self.target = self.target.map(|t| if t == i { i + 1 } else if t == i + 1 { i } else { t });
             }
-            Some(Act::Delete(i)) => {
-                masks.remove(i);
-                self.mask_sel = None;
-            }
+            Some(Act::Delete(i)) => self.remove_mask(i),
             Some(Act::Rename(i)) => self.renaming = Some((Rename::Mask(i), masks[i].name.clone(), true)),
             Some(Act::Color(i, c)) => masks[i].color = c,
             None => {}
@@ -5672,34 +5933,50 @@ impl App {
 
         let a = &mut m.adj;
         let adj_before = a.clone();
+        let h = &mut Hider::new(&mut self.hidden, Some(i), "adj");
+        let mut open_in = None;
         let reset_adj = k::section(ui, "Adjustments", !a.is_identity(), |ui| {
-            k::slider(ui, "Exposure", &mut a.exposure, -2.0..=2.0, 0.0, Fmt::Ev);
-            k::slider(ui, "Contrast", &mut a.contrast, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Highlights", &mut a.highlights, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Shadows", &mut a.shadows, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Temperature", &mut a.temperature, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Tint", &mut a.tint, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Saturation", &mut a.saturation, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Sharpness", &mut a.sharpness, -1.0..=1.0, 0.0, Fmt::Signed);
-            k::slider(ui, "Color", &mut a.tone, 0.0..=1.0, 0.0, Fmt::Amount);
+            eye!(h, ui, a.exposure, "Exposure", -2.0..=2.0, 0.0, Fmt::Ev);
+            eye!(h, ui, a.contrast, "Contrast", -1.0..=1.0, 0.0, Fmt::Signed);
+            eye!(h, ui, a.highlights, "Highlights", -1.0..=1.0, 0.0, Fmt::Signed);
+            eye!(h, ui, a.shadows, "Shadows", -1.0..=1.0, 0.0, Fmt::Signed);
+            eye!(h, ui, a.temperature, "Temperature", -1.0..=1.0, 0.0, Fmt::Signed);
+            eye!(h, ui, a.tint, "Tint", -1.0..=1.0, 0.0, Fmt::Signed);
+            eye!(h, ui, a.saturation, "Saturation", -1.0..=1.0, 0.0, Fmt::Signed);
+            eye!(h, ui, a.sharpness, "Sharpness", -1.0..=1.0, 0.0, Fmt::Signed);
+            eye!(h, ui, a.tone, "Color", 0.0..=1.0, 0.0, Fmt::Amount);
             if a.tone > 0.0 {
-                k::slider(ui, "Color Hue", &mut a.tone_hue, 0.0..=360.0, 35.0, Fmt::Deg);
+                eye!(h, ui, a.tone_hue, "Color Hue", 0.0..=360.0, 35.0, Fmt::Deg);
                 hue_strip(ui);
             }
+            ui.add_space(6.0);
+            k::caption(ui, "More for this mask (whites, blacks, fade, split tone, effects, glitches):");
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                for (label, tab) in [("Adjust", Tab::Adjust), ("Effects", Tab::Effects), ("Glitch", Tab::Glitch)] {
+                    if k::button(ui, label, Btn::Secondary, true).on_hover_text(format!("Open the {label} tab with Apply To set to this mask")).clicked() {
+                        open_in = Some(tab);
+                    }
+                }
+            });
             ui.add_space(4.0);
         });
         if reset_adj {
-            *a = Local { tone_hue: 35.0, ..Local::default() };
+            *a = Local::default();
         }
         // adjusting means the shape is done: let the picture show through
         if *a != adj_before {
             self.overlay_hold = false;
         }
+        if let Some(tab) = open_in {
+            self.target = Some(i);
+            self.tab = TABS.iter().position(|t| t.0 == tab).unwrap_or(self.tab);
+            self.overlay_hold = false;
+        }
 
         ui.add_space(4.0);
         if k::button(ui, "Delete Mask", Btn::Plain, true).clicked() {
-            self.params.masks.remove(i);
-            self.mask_sel = None;
+            self.remove_mask(i);
         }
     }
 
@@ -5936,6 +6213,7 @@ fn hue_strip(ui: &mut Ui) {
 
 impl App {
     fn export_sheet(&mut self, ctx: &egui::Context) {
+        let n_hidden = self.hidden.len();
         let t = k::spring(ctx, Id::unique("sheet"), if self.export_open { 1.0 } else { 0.0 }, 1.0, 0.32);
         if t < 0.005 {
             return;
@@ -6099,6 +6377,14 @@ impl App {
                                 .color(k::LABEL2),
                         );
                         ui.add_space(14.0);
+                        if n_hidden > 0 {
+                            k::caption(ui, &format!(
+                                "{} hidden in the preview (eye off). The export includes {}.",
+                                if n_hidden == 1 { "One change is".to_string() } else { format!("{n_hidden} changes are") },
+                                if n_hidden == 1 { "it" } else { "them" }
+                            ));
+                            ui.add_space(8.0);
+                        }
 
                         ui.horizontal(|ui| {
                             if self.exporting {
@@ -6128,6 +6414,122 @@ impl App {
 }
 
 impl App {
+    /// The search at the top of Settings: type what you're after, and it
+    /// lists where those controls are. Returns the one picked.
+    fn search_field(&mut self, ui: &mut Ui) -> Option<&'static Place> {
+        let label = ui.label(egui::RichText::new("Find a Control").size(12.0).color(k::LABEL2));
+        ui.add_space(2.0);
+        let field = egui::TextEdit::singleline(&mut self.search)
+            .hint_text("e.g. vignette, white balance, grain")
+            .desired_width(f32::INFINITY)
+            .margin(vec2(10.0, 6.0))
+            .show(ui);
+        let field = Response::clone(&field.response).labelled_by(label.id);
+        if self.search_focus {
+            field.request_focus();
+            self.search_focus = false;
+        }
+        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if self.search.trim().is_empty() {
+            k::caption(ui, "Ctrl+F opens this from anywhere.");
+            return None;
+        }
+        let hits = search::search(&self.search, cfg!(target_os = "linux"));
+        if hits.is_empty() {
+            ui.add_space(4.0);
+            k::caption(ui, "Nothing by that name. Try another word, like light, blur or noise.");
+            return None;
+        }
+        let mut picked = enter.then(|| hits[0]);
+        ui.add_space(4.0);
+        egui::Frame::NONE.fill(k::CARD).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for (n, place) in hits.iter().take(7).enumerate() {
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
+                let bg = if resp.is_pointer_button_down_on() {
+                    k::FILL_HI
+                } else if resp.hovered() || (n == 0 && field.has_focus()) {
+                    k::FILL
+                } else {
+                    Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(r, CornerRadius::same(8), bg);
+                let where_ = ui.painter().layout_no_wrap(place.path(), k::font(11.5), k::LABEL3);
+                let wx = r.right() - 10.0 - where_.size().x;
+                ui.painter().galley(pos2(wx, r.center().y - where_.size().y / 2.0), where_, k::LABEL3);
+                let name = elided(ui, place.label, k::font(13.0), k::LABEL, wx - r.left() - 20.0);
+                ui.painter().galley(pos2(r.left() + 10.0, r.center().y - name.size().y / 2.0), name, k::LABEL);
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    picked = Some(place);
+                }
+            }
+        });
+        if hits.len() > 7 {
+            k::caption(ui, &format!("and {} more: type a little more to narrow it down.", hits.len() - 7));
+        }
+        picked
+    }
+
+    /// Show where a control is: open its tab (and section) and ring it.
+    fn go_to(&mut self, place: &'static Place, ctx: &egui::Context) {
+        let mut msg = format!("{}: {}", place.label, place.path());
+        match place.at {
+            search::Where::Tab(name) => {
+                self.settings_open = false;
+                self.photos = false;
+                if let Some(i) = TABS.iter().position(|t| t.1 == name) {
+                    self.tab = i;
+                }
+                let tab = TABS[self.tab].0;
+                let blocked = if self.doc.is_none() && tab != Tab::Presets {
+                    "Open a photo first."
+                } else if !place.note.is_empty()
+                    && ((tab == Tab::Masks && self.selected_mask().is_none()) || (tab == Tab::Layers && self.selected_layer().is_none()))
+                {
+                    place.note
+                } else {
+                    ""
+                };
+                if !blocked.is_empty() {
+                    msg = format!("{msg}. {blocked}");
+                } else if tab == Tab::Adjust && self.target.is_some() && [place.label, place.section].contains(&"Noise Reduction") {
+                    // a mask's own Adjust has no noise reduction: it is the whole photo's
+                    self.target = None;
+                    msg = format!("{msg}. Apply To is now Whole Photo");
+                }
+                k::find(ctx, place.section, place.label);
+            }
+            search::Where::Settings => {
+                // already in Settings: ring it there
+                k::find(ctx, place.section, place.label);
+                return;
+            }
+            search::Where::Toolbar => {
+                self.settings_open = false;
+                k::find(ctx, "", place.label);
+            }
+            search::Where::Export => {
+                self.settings_open = false;
+                if self.doc.is_some() {
+                    self.export_open = true;
+                    k::find(ctx, "", place.label);
+                } else {
+                    msg = format!("{msg}. Open a photo first.");
+                }
+            }
+            search::Where::Canvas => {
+                self.settings_open = false;
+                if !place.note.is_empty() {
+                    msg = format!("{msg}. {}", place.note);
+                }
+            }
+        }
+        self.toast = Some((msg, None, Instant::now()));
+    }
+
     fn settings_sheet(&mut self, ctx: &egui::Context) {
         let t = k::spring(ctx, Id::unique("settings_t"), if self.settings_open { 1.0 } else { 0.0 }, 1.0, 0.32);
         if t < 0.005 {
@@ -6152,6 +6554,7 @@ impl App {
         let (mut import, mut export_all, mut reveal) = (false, false, false);
         let mut check_now = false;
         let mut show_update: Option<crate::update::Release> = None;
+        let mut goto = None;
         let max_h = (screen.height() - 90.0).max(300.0);
 
         egui::Area::new(Id::unique("settings_sheet"))
@@ -6175,6 +6578,8 @@ impl App {
                                 }
                             });
                         });
+                        ui.add_space(10.0);
+                        goto = self.search_field(ui);
                         ui.add_space(10.0);
                         egui::ScrollArea::vertical().max_height(max_h - 70.0).min_scrolled_height((max_h - 70.0).min(620.0)).auto_shrink([false, true]).show(ui, |ui| {
                             let p = &mut self.prefs;
@@ -6292,6 +6697,9 @@ impl App {
                 }
             }
             self.persist();
+        }
+        if let Some(place) = goto {
+            self.go_to(place, ctx);
         }
         if check_now {
             self.check_updates(ctx, true);
@@ -6545,7 +6953,9 @@ fn read_look_files(paths: &[PathBuf]) -> (Vec<(String, Params)>, Vec<String>) {
 }
 
 fn field_label(ui: &mut Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(12.0).color(k::LABEL2));
+    let r = ui.label(egui::RichText::new(text).size(12.0).color(k::LABEL2)).rect;
+    // the search rings the label with the control under it
+    k::found(ui, Rect::from_min_size(r.min, vec2(ui.available_width(), 50.0)), text);
     ui.add_space(2.0);
 }
 
@@ -6721,8 +7131,8 @@ mod tests {
         let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_eframe(move |cc| App::new(cc, Some(photo)));
         settle(&mut h, |a| a.doc.is_some());
         settle(&mut h, rendered);
-        // the Exposure readout sits at the right end of the first slider in Adjust
-        click(&mut h, pos2(1360.0, 301.0), egui::Modifiers::NONE);
+        // the Exposure readout sits at the right end of the first slider in Adjust (below Apply To)
+        click(&mut h, pos2(1360.0, 377.0), egui::Modifiers::NONE);
         h.event(egui::Event::Text("9,5".into()));
         h.step();
         h.key_press(egui::Key::Enter);
@@ -6730,7 +7140,7 @@ mod tests {
         h.step();
         assert_eq!(h.state().params.exposure, 9.5, "typed past the slider's +3 end");
         // Escape leaves the value alone
-        click(&mut h, pos2(1360.0, 301.0), egui::Modifiers::NONE);
+        click(&mut h, pos2(1360.0, 377.0), egui::Modifiers::NONE);
         h.event(egui::Event::Text("1".into()));
         h.step();
         h.key_press(egui::Key::Escape);
@@ -7183,6 +7593,116 @@ mod tests {
         let left = seeds(&h);
         assert_eq!(left.len(), 1);
         assert!(!left[0].add, "the + point was removed, the − point stays");
+    }
+
+    #[test]
+    fn e2e_eye_hides_a_change_from_the_preview_only() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = open_on("eye", Tab::Masks);
+        h.state_mut().tab = TABS.iter().position(|t| t.0 == Tab::Adjust).unwrap();
+        settle(&mut h, |a| a.tex_frame == Frame::Output && rendered(a));
+        h.state_mut().params.contrast = 0.6;
+        settle(&mut h, |a| a.last_sent.as_ref().is_some_and(|s| s.0.contrast == 0.6) && rendered(a));
+        // the eye only shows on a slider that's been moved
+        assert!(h.query_by_label("Hide Exposure").is_none());
+        h.get_by_label("Hide Contrast").click();
+        settle(&mut h, |a| a.last_sent.as_ref().is_some_and(|s| s.0.contrast == 0.0) && rendered(a));
+        assert_eq!(h.state().params.contrast, 0.6, "the edit itself is kept for the export");
+        assert!(h.state().hidden.contains("contrast"));
+        h.get_by_label("Show Contrast").click();
+        settle(&mut h, |a| a.last_sent.as_ref().is_some_and(|s| s.0.contrast == 0.6));
+        assert!(h.state().hidden.is_empty());
+    }
+
+    #[test]
+    fn e2e_apply_to_gives_a_mask_its_own_settings() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = open_on("applyto", Tab::Masks);
+        h.state_mut().tab = TABS.iter().position(|t| t.0 == Tab::Effects).unwrap();
+        settle(&mut h, |a| a.tex_frame == Frame::Output && rendered(a));
+        h.state_mut().add_mask(1);
+        h.state_mut().target = Some(0);
+        h.state_mut().params.masks[0].fx.vignette = 0.5;
+        h.step();
+        h.step();
+        // the sliders now edit the mask: its eye hides the mask's vignette, not the photo's
+        h.get_by_label("Hide Vignette").click();
+        h.step();
+        h.step();
+        assert!(h.state().hidden.contains("@0.fx.vignette"), "{:?}", h.state().hidden);
+        settle(&mut h, |a| a.last_sent.as_ref().is_some_and(|s| s.0.masks[0].fx.vignette == 0.0));
+        assert_eq!(h.state().params.vignette, 0.0);
+        assert_eq!(h.state().params.masks[0].fx.vignette, 0.5);
+        // Adjust shares the choice, and edits the mask's own adjustments
+        h.state_mut().tab = TABS.iter().position(|t| t.0 == Tab::Adjust).unwrap();
+        h.state_mut().params.masks[0].adj.fade = 0.4;
+        h.step();
+        h.step();
+        h.get_by_label("Hide Fade").click();
+        h.step();
+        h.step();
+        assert!(h.state().hidden.contains("@0.adj.fade"));
+        // deleting the mask puts Apply To back on the whole photo
+        h.state_mut().remove_mask(0);
+        h.step();
+        assert_eq!(h.state().target, None);
+        assert!(h.state().hidden.is_empty());
+    }
+
+    #[test]
+    fn e2e_search_jumps_to_the_control() {
+        let mut h = open_on("search", Tab::Masks);
+        h.state_mut().tab = TABS.iter().position(|t| t.0 == Tab::Adjust).unwrap();
+        settle(&mut h, |a| a.tex_frame == Frame::Output && rendered(a));
+        h.state_mut().settings_open = true;
+        h.state_mut().search = "vinette".into();
+        h.step();
+        let place = search::search(&h.state().search, true)[0];
+        assert_eq!(place.label, "Vignette");
+        let ctx = h.ctx.clone();
+        h.state_mut().go_to(place, &ctx);
+        h.step();
+        let a = h.state();
+        assert!(TABS[a.tab].0 == Tab::Effects);
+        assert!(!a.settings_open);
+        assert!(a.toast.as_ref().is_some_and(|t| t.0.contains("Effects › Optics")), "{:?}", a.toast);
+    }
+
+    #[test]
+    fn e2e_noise_reduction_previews_hides_and_is_found() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = open_on("denoise", Tab::Masks);
+        h.state_mut().tab = TABS.iter().position(|t| t.0 == Tab::Adjust).unwrap();
+        settle(&mut h, |a| a.tex_frame == Frame::Output && rendered(a));
+        h.state_mut().params.denoise_luma = 0.7;
+        h.state_mut().params.denoise_color = 0.5;
+        settle(&mut h, |a| a.last_sent.as_ref().is_some_and(|s| s.0.denoise_luma == 0.7) && rendered(a));
+        // its eye (below the fold here, so set as a click would) leaves
+        // luminance out of the preview only, colour staying on
+        assert!(h.query_by_label("Hide Luminance").is_some());
+        h.state_mut().hidden.insert("denoise_luma".into());
+        settle(&mut h, |a| a.last_sent.as_ref().is_some_and(|s| s.0.denoise_luma == 0.0 && s.0.denoise_color == 0.5) && rendered(a));
+        assert_eq!(h.state().params.denoise_luma, 0.7, "the export keeps it");
+        // a preset leaves the photo's noise reduction alone
+        let look = h.state().builtin[0].1.clone();
+        let p = h.state().params.with_look_from(&look);
+        assert_eq!((p.denoise_luma, p.denoise_color), (0.7, 0.5));
+        assert_eq!(preset_of(&h.state().params).denoise_luma, 0.0);
+        // and the search finds it, even from a mask's own Adjust, which lacks it
+        h.state_mut().add_mask(1);
+        h.state_mut().target = Some(0);
+        h.step();
+        // (Luminance is still hidden from above, so its eye offers to show it)
+        assert!(h.query_by_label("Show Luminance").is_none());
+        let place = search::search("denoise", true)[0];
+        assert_eq!(place.label, "Noise Reduction");
+        let ctx = h.ctx.clone();
+        h.state_mut().go_to(place, &ctx);
+        h.step();
+        assert!(TABS[h.state().tab].0 == Tab::Adjust);
+        assert_eq!(h.state().target, None);
+        assert!(h.state().toast.as_ref().is_some_and(|t| t.0.contains("Whole Photo")), "{:?}", h.state().toast);
+        assert!(h.query_by_label("Show Luminance").is_some());
     }
 
     #[test]

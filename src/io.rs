@@ -787,6 +787,7 @@ mod tests {
         p.rotate = 1;
         p.crop = [0.1, 0.1, 0.9, 0.9];
         p.masks.push(crate::masks::Mask::default());
+        p.denoise_luma = 0.6;
         write_looks(&path, &[("Field / Night".into(), p.clone())]).unwrap();
         let back = read_looks(&path).unwrap();
         assert_eq!(back.len(), 1);
@@ -797,6 +798,7 @@ mod tests {
         assert_eq!(q.rotate, 0);
         assert_eq!(q.crop, pipeline::FULL_CROP);
         assert!(q.masks.is_empty());
+        assert_eq!(q.denoise_luma, 0.0, "noise reduction belongs to the photo");
         std::fs::write(&path, "{\"hello\": 1}").unwrap();
         assert!(read_looks(&path).is_err());
         assert_eq!(look_file_name("Field / Night"), "Field - Night.stillpreset");
@@ -998,6 +1000,7 @@ pub fn read_project(path: &Path) -> Result<(PathBuf, Params), String> {
     let photo = resolve(&file.photo, file.photo_relative.as_ref())
         .ok_or_else(|| format!("photo not found: {}", Path::new(&file.photo).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()))?;
     let mut params = file.params;
+    params.migrate();
     for (i, l) in params.layers.iter_mut().enumerate() {
         if let Some(p) = resolve(&l.path, file.layers_relative.get(i).and_then(|r| r.as_ref())) {
             l.path = p.to_string_lossy().to_string();
