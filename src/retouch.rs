@@ -57,7 +57,7 @@ mod tests {
         // left half black, right half white; clone white over a spot on the left
         let (w, h) = (100usize, 50usize);
         let px = (0..w * h).map(|i| if i % w < 50 { [0.0; 3] } else { [1.0; 3] }).collect();
-        let mut img = Img { w, h, px };
+        let mut img = Img { w, h, px, alpha: None };
         let st = CloneStroke { pts: vec![[0.2, 0.5]], radius: 0.05, feather: 0.0, opacity: 1.0, offset: [0.5, 0.0] };
         apply(&mut img, &[st]);
         assert!(img.px[25 * w + 20][0] > 0.99, "painted spot copies white");

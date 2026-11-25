@@ -14,17 +14,45 @@ pub struct Img {
     pub w: usize,
     pub h: usize,
     pub px: Vec<Px>,
+    /// The opacity of a source picture that has transparency (a PNG with a
+    /// transparent background), 1 = opaque. Only a source carries it: the
+    /// render turns it into its own alpha, like a cut-out.
+    pub alpha: Option<Arc<Vec<f32>>>,
 }
 
 impl Img {
     pub fn new(w: usize, h: usize) -> Self {
-        Self { w, h, px: vec![[0.0; 3]; w * h] }
+        Self { w, h, px: vec![[0.0; 3]; w * h], alpha: None }
     }
 
     pub fn from_rgb32f(img: &image::Rgb32FImage) -> Self {
         let (w, h) = (img.width() as usize, img.height() as usize);
         let px = img.as_raw().chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
-        Self { w, h, px }
+        Self { w, h, px, alpha: None }
+    }
+
+    /// A decoded picture, keeping its transparency when it has any.
+    pub fn from_dynamic(img: &image::DynamicImage) -> Self {
+        if !img.color().has_alpha() {
+            return Self::from_rgb32f(&img.to_rgb32f());
+        }
+        let rgba = img.to_rgba32f();
+        let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+        let (mut px, mut alpha) = (Vec::with_capacity(w * h), Vec::with_capacity(w * h));
+        for c in rgba.as_raw().chunks_exact(4) {
+            px.push([c[0], c[1], c[2]]);
+            alpha.push(c[3].clamp(0.0, 1.0));
+        }
+        // a fully opaque picture saved with an alpha channel is just opaque
+        let alpha = alpha.iter().any(|&a| a < 1.0).then(|| Arc::new(alpha));
+        Self { w, h, px, alpha }
+    }
+
+    /// The source's opacity as a grey picture, so it can go through the same
+    /// geometry as the colours.
+    fn alpha_img(&self) -> Option<Img> {
+        let a = self.alpha.as_ref()?;
+        Some(Img { w: self.w, h: self.h, px: a.iter().map(|&v| [v; 3]).collect(), alpha: None })
     }
 
     fn unit(&self) -> f32 {
@@ -719,6 +747,9 @@ fn downscale(img: &Img, f: usize) -> Img {
             *p = [acc[0] / n, acc[1] / n, acc[2] / n];
         }
     });
+    if let Some(a) = img.alpha_img() {
+        out.alpha = Some(Arc::new(downscale(&a, f).px.iter().map(|p| p[0]).collect()));
+    }
     out
 }
 
@@ -1103,6 +1134,9 @@ struct Stage {
     /// When layers are in the picture, masks are judged on the photo alone
     /// and already applied here; otherwise they still run on `img`.
     judged: Option<Judged>,
+    /// The photo's own opacity (and any layers that fill it), when the
+    /// source is transparent and masks are still to run.
+    alpha: Option<Vec<f32>>,
 }
 
 #[derive(Clone)]
@@ -1152,8 +1186,22 @@ fn judged_first(p: &Params) -> bool {
     !p.masks.is_empty() && p.shown_layers().iter().any(|l| l.visible && l.opacity > 0.001)
 }
 
+/// Two opacities over each other: what's left is where both are.
+fn both(a: Option<Vec<f32>>, b: Option<Vec<f32>>) -> Option<Vec<f32>> {
+    match (a, b) {
+        (Some(mut a), Some(b)) => {
+            a.par_iter_mut().zip(b.par_iter()).for_each(|(a, b)| *a *= b);
+            Some(a)
+        }
+        (a, b) => a.or(b),
+    }
+}
+
 fn base(src: &Img, p: &Params, overlay: Option<usize>) -> Stage {
     let (photo, space) = geometry(src, p);
+    // a transparent source stays transparent: its opacity is turned, cropped
+    // and retouched along with the photo, and then acts like a cut-out
+    let photo_alpha = src.alpha_img().map(|a| geometry(&a, p).0.px.iter().map(|p| p[0].clamp(0.0, 1.0)).collect::<Vec<f32>>());
     let u = photo.unit();
     let layers = p.shown_layers();
     // the glow is added before the tone stage, so masks' own glow is judged on the photo as it comes in
@@ -1169,7 +1217,7 @@ fn base(src: &Img, p: &Params, overlay: Option<usize>) -> Stage {
         let fx = mask_effects(&judge, p, &space, late_fx);
         drop(judge);
         let mut img = photo;
-        let mut cut = areas.cutout.clone();
+        let mut cut = both(areas.cutout.clone(), photo_alpha);
         if let Some(a) = &mut cut {
             // layers placed behind the photo show through what was cut out
             crate::layers::composite_behind(&mut img, a, &layers, true, &space);
@@ -1177,27 +1225,31 @@ fn base(src: &Img, p: &Params, overlay: Option<usize>) -> Stage {
         crate::layers::composite(&mut img, &layers, true, &space, cut.as_deref_mut());
         look(&mut img, p, u, &glow_a);
         crate::masks::adjust_with(&mut img, &p.masks, &areas, u);
-        return Stage { img, space, judged: Some(Judged { fx, overlay: areas.overlay, cut }) };
+        return Stage { img, space, judged: Some(Judged { fx, overlay: areas.overlay, cut }), alpha: None };
     }
     // no layers (or no masks): everything is judged on the picture itself
     let mut img = photo;
+    let mut alpha = photo_alpha;
     if !layers.is_empty() {
-        crate::layers::composite(&mut img, &layers, true, &space, None);
+        if let Some(a) = &mut alpha {
+            crate::layers::composite_behind(&mut img, a, &layers, true, &space);
+        }
+        crate::layers::composite(&mut img, &layers, true, &space, alpha.as_deref_mut());
     }
     let glow_a = glows(&img);
     look(&mut img, p, u, &glow_a);
-    Stage { img, space, judged: None }
+    Stage { img, space, judged: None, alpha }
 }
 
 /// Masks (unless already judged) and everything after them.
-fn from_stage(mut img: Img, space: &crate::masks::Space, judged: Option<Judged>, p: &Params, overlay: Option<usize>) -> Rendered {
+fn from_stage(mut img: Img, space: &crate::masks::Space, judged: Option<Judged>, alpha: Option<Vec<f32>>, p: &Params, overlay: Option<usize>) -> Rendered {
     let u = img.unit();
     match judged {
         Some(j) => finish(img, p, u, space, &j.fx, j.overlay, j.cut),
         None => {
             let areas = if p.masks.is_empty() { Default::default() } else { crate::masks::apply(&mut img, &p.masks, space, u, overlay) };
             let fx = mask_effects(&img, p, space, late_fx);
-            finish(img, p, u, space, &fx, areas.overlay, areas.cutout)
+            finish(img, p, u, space, &fx, areas.overlay, both(areas.cutout, alpha))
         }
     }
 }
@@ -1206,9 +1258,9 @@ fn from_stage(mut img: Img, space: &crate::masks::Space, judged: Option<Judged>,
 pub fn process_ext(src: &Img, p: &Params, overlay: Option<usize>) -> Rendered {
     // Noise reduction comes first, on the photo as it was shot: before
     // straightening resamples the noise and the tone curves reshape it.
-    let clean = p.denoise().map(|a| crate::denoise::denoise(src, a));
+    let clean = p.denoise().map(|a| Img { alpha: src.alpha.clone(), ..crate::denoise::denoise(src, a) });
     let s = base(clean.as_ref().unwrap_or(src), p, overlay);
-    from_stage(s.img, &s.space, s.judged, p, overlay)
+    from_stage(s.img, &s.space, s.judged, s.alpha, p, overlay)
 }
 
 /// Remembers the first stage of the last renders, so edits that only touch
@@ -1229,7 +1281,7 @@ fn cleaned(src: &Arc<Img>, p: &Params, cache: &mut StageCache) -> Arc<Img> {
     if let Some((_, _, img)) = cache.clean.iter().find(|(s, k, _)| Arc::ptr_eq(s, src) && *k == a) {
         return img.clone();
     }
-    let img = Arc::new(crate::denoise::denoise(src, a));
+    let img = Arc::new(Img { alpha: src.alpha.clone(), ..crate::denoise::denoise(src, a) });
     cache.clean.push((src.clone(), a, img.clone()));
     if cache.clean.len() > 3 {
         cache.clean.remove(0);
@@ -1304,7 +1356,7 @@ pub fn process_cached(src: &Arc<Img>, p: &Params, overlay: Option<usize>, cache:
         }
     };
     let judged = stage.judged.clone();
-    from_stage(stage.img.clone(), &stage.space, judged, p, overlay)
+    from_stage(stage.img.clone(), &stage.space, judged, stage.alpha.clone(), p, overlay)
 }
 
 /// Half-size copy of a preview, for fast drafts while a slider is dragged.
@@ -1694,7 +1746,7 @@ fn border(img: &Img, p: &Params) -> Img {
     let b = (p.border_amount() * 0.12 * img.w.min(img.h) as f32).round() as usize;
     let col = if p.border_white { [0.96, 0.96, 0.95] } else { [0.02, 0.02, 0.02] };
     let (w, h) = (img.w + 2 * b, img.h + 2 * b);
-    let mut out = Img { w, h, px: vec![col; w * h] };
+    let mut out = Img { w, h, px: vec![col; w * h], alpha: None };
     out.px.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         if y >= b && y < b + img.h {
             let sy = y - b;
@@ -1993,7 +2045,7 @@ mod tests {
     use crate::masks::{Mask, Shape};
 
     fn grey(w: usize, h: usize) -> Img {
-        Img { w, h, px: vec![[0.5; 3]; w * h] }
+        Img { w, h, px: vec![[0.5; 3]; w * h], alpha: None }
     }
 
     /// A radial mask over the left part of the frame.
@@ -2136,7 +2188,7 @@ mod tests {
                 if (y - ly).abs() < 2.0 { [1.0; 3] } else { [0.0; 3] }
             })
             .collect();
-        let src = Img { w, h, px };
+        let src = Img { w, h, px, alpha: None };
         // what the Level Photo button does: straighten by minus the tilt
         let out = process(&src, &Params { straighten: -8.0, ..Params::default() });
         let row_of_line = |x: usize| (0..out.h).max_by(|&a, &b| out.px[a * out.w + x][0].total_cmp(&out.px[b * out.w + x][0])).unwrap();
@@ -2158,7 +2210,7 @@ mod tests {
         let seeds = vec![crate::masks::Seed { p: [0.2, 0.5], add: true }];
         let shape = Shape::Object { seeds, threshold: 0.25, connected: true, smooth: 0.0, feather: 0.0 };
         let p = Params { masks: vec![Mask { shape, transparent: true, ..Mask::default() }], ..Params::default() };
-        (Img { w, h, px }, p)
+        (Img { w, h, px, alpha: None }, p)
     }
 
     #[test]

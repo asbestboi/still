@@ -1230,7 +1230,7 @@ mod tests {
     #[test]
     fn measures_white_noise() {
         // a flat grey picture, so all there is to measure is the noise
-        let flat = Img { w: 512, h: 384, px: vec![[0.4, 0.45, 0.5]; 512 * 384] };
+        let flat = Img { w: 512, h: 384, px: vec![[0.4, 0.45, 0.5]; 512 * 384], alpha: None };
         for sigma in [0.01, 0.04] {
             let img = noisy(&flat, sigma, 7);
             let p = split(&img);
@@ -1252,7 +1252,7 @@ mod tests {
         // a dim channel, so the noise is cut off at 0 here and there (about 3%
         // of its pixels), as in the shadows of a raw file: still measured at
         // every scale, where needing whole blocks free of clipping finds none
-        let mut img = noisy(&Img { w: 1024, h: 768, px: vec![[0.3, 0.25, 0.06]; 1024 * 768] }, 0.03, 3);
+        let mut img = noisy(&Img { w: 1024, h: 768, px: vec![[0.3, 0.25, 0.06]; 1024 * 768], alpha: None }, 0.03, 3);
         for p in &mut img.px {
             *p = p.map(|v| v.clamp(0.0, 1.0));
         }
@@ -1267,7 +1267,7 @@ mod tests {
             p = half(&p);
         }
         // nothing measurable at all
-        let black = Img { w: 256, h: 256, px: vec![[0.0; 3]; 256 * 256] };
+        let black = Img { w: 256, h: 256, px: vec![[0.0; 3]; 256 * 256], alpha: None };
         assert!(measure(&split(&black), &clipped(&black)).is_none());
     }
 

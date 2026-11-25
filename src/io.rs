@@ -239,11 +239,11 @@ pub fn downsized(img: &DynamicImage, edge: u32) -> Img {
     let (w, h) = (img.width(), img.height());
     let s = edge as f32 / w.max(h) as f32;
     if s >= 1.0 {
-        return Img::from_rgb32f(&img.to_rgb32f());
+        return Img::from_dynamic(img);
     }
     let (nw, nh) = (((w as f32 * s).round() as u32).max(1), ((h as f32 * s).round() as u32).max(1));
     let small = img.resize_exact(nw, nh, image::imageops::FilterType::Triangle);
-    Img::from_rgb32f(&small.to_rgb32f())
+    Img::from_dynamic(&small)
 }
 
 // ---------------------------------------------------------------------------
@@ -363,11 +363,11 @@ fn render_for_export(full: &DynamicImage, params: &Params, s: &ExportSettings) -
     let src = if (scale - 1.0).abs() > 1e-3 {
         let nw = ((full.width() as f32 * scale).round() as u32).max(1);
         let nh = ((full.height() as f32 * scale).round() as u32).max(1);
-        full.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3).to_rgb32f()
+        Img::from_dynamic(&full.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3))
     } else {
-        full.to_rgb32f()
+        Img::from_dynamic(full)
     };
-    let mut r = pipeline::process_ext(&Img::from_rgb32f(&src), params, None);
+    let mut r = pipeline::process_ext(&src, params, None);
     pipeline::output_sharpen(&mut r.img, [0.0, 0.25, 0.5, 0.9][s.sharpen.min(3)]);
     r
 }
@@ -828,6 +828,43 @@ mod tests {
         let jpg = dir.join("out.jpg");
         export(&doc, &params, &ExportSettings { format: Format::Jpeg, keep_metadata: false, ..Default::default() }, &jpg).unwrap();
         assert!(image::open(&jpg).unwrap().to_rgb8().get_pixel(16, 16)[0] > 240);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A PNG with a transparent background stays transparent: it isn't
+    /// filled with black on opening, and exports with its transparency.
+    #[test]
+    fn transparent_pictures_keep_their_transparency() {
+        let dir = std::env::temp_dir().join(format!("still-transparent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("logo.png");
+        // a red square on the left half, nothing on the right
+        image::RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([220, 30, 30, 255]) } else { image::Rgba([0, 0, 0, 0]) }).save(&photo).unwrap();
+        let doc = load(&photo, 64).unwrap();
+        let a = doc.preview.alpha.as_ref().expect("the preview knows it's transparent");
+        assert!(a[16 * 64 + 8] > 0.99 && a[16 * 64 + 56] < 0.01);
+        // an opaque picture with an alpha channel needs none
+        let opaque = dir.join("opaque.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255])).save(&opaque).unwrap();
+        assert!(load(&opaque, 8).unwrap().preview.alpha.is_none());
+
+        let settings = ExportSettings { format: Format::Png, depth16: false, keep_metadata: false, ..Default::default() };
+        let png = dir.join("out.png");
+        export(&doc, &Params::default(), &settings, &png).unwrap();
+        let back = image::open(&png).unwrap().to_rgba8();
+        assert_eq!(back.get_pixel(56, 16)[3], 0, "the empty half stays transparent");
+        assert_eq!(back.get_pixel(8, 16).0, [220, 30, 30, 255], "the square is untouched");
+        // turned a quarter: the transparency turns with it
+        let turned = Params { rotate: 1, ..Params::default() };
+        export(&doc, &turned, &settings, &png).unwrap();
+        let back = image::open(&png).unwrap().to_rgba8();
+        assert_eq!((back.width(), back.height()), (32, 64));
+        assert_eq!(back.get_pixel(16, 8)[3], 255);
+        assert_eq!(back.get_pixel(16, 56)[3], 0);
+        // JPEG has no transparency: the empty half becomes white, not black
+        let jpg = dir.join("out.jpg");
+        export(&doc, &Params::default(), &ExportSettings { format: Format::Jpeg, keep_metadata: false, ..Default::default() }, &jpg).unwrap();
+        assert!(image::open(&jpg).unwrap().to_rgb8().get_pixel(56, 16).0.iter().all(|&c| c > 240));
         let _ = std::fs::remove_dir_all(dir);
     }
 

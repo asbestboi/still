@@ -283,7 +283,7 @@ fn de(a: [f32; 3], b: [f32; 3]) -> f32 {
 
 /// Area-average resample to `w × h`.
 fn shrink(img: &Img, w: usize, h: usize) -> Img {
-    let mut out = Img { w, h, px: vec![[0.0; 3]; w * h] };
+    let mut out = Img { w, h, px: vec![[0.0; 3]; w * h], alpha: None };
     out.px.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         let y0 = y * img.h / h;
         let y1 = ((y + 1) * img.h / h).max(y0 + 1);
@@ -423,7 +423,7 @@ fn object_alpha(img: &Img, seeds: &[Seed], threshold: f32, connected: bool, smoo
     };
 
     // smooth: fill pinholes and round off jaggies; feather: soften the edge
-    let mut m = Img { w: ww, h: wh, px: acc.iter().map(|&v| [v; 3]).collect() };
+    let mut m = Img { w: ww, h: wh, px: acc.iter().map(|&v| [v; 3]).collect(), alpha: None };
     if smooth > 0.001 {
         m = blur(&m, 0.5 + smooth * 5.0);
         m.px.par_iter_mut().for_each(|p| {
@@ -782,7 +782,7 @@ mod tests {
     use super::*;
 
     fn img(w: usize, h: usize, v: f32) -> Img {
-        Img { w, h, px: vec![[v, v, v]; w * h] }
+        Img { w, h, px: vec![[v, v, v]; w * h], alpha: None }
     }
     fn sp(w: usize, h: usize) -> Space {
         Space { fw: w as f32, fh: h as f32, ox: 0.0, oy: 0.0 }
@@ -840,7 +840,7 @@ mod more_tests {
     #[test]
     fn brush_on_wide_frame() {
         let (w, h) = (1800usize, 1350usize);
-        let im = Img { w, h, px: vec![[0.5; 3]; w * h] };
+        let im = Img { w, h, px: vec![[0.5; 3]; w * h], alpha: None };
         let st = BrushStroke { pts: vec![[0.1, 0.8], [0.3, 0.7], [0.5, 0.85], [0.8, 0.75]], radius: 0.04, feather: 0.6, flow: 1.0, erase: false };
         let m = Mask { shape: Shape::Brush { strokes: vec![st] }, ..Mask::default() };
         let a = alpha(&im, &m, &Space { fw: w as f32, fh: h as f32, ox: 0.0, oy: 0.0 });
@@ -860,7 +860,7 @@ mod more_tests {
                 if x < 100 { [0.5 + g, 0.1, 0.1] } else { [0.5, 0.7 + g, 0.95] }
             })
             .collect();
-        let im = Img { w, h, px };
+        let im = Img { w, h, px, alpha: None };
         let shape = Shape::Object { seeds: vec![Seed { p: [0.25, 0.5], add: true }], threshold: 0.25, connected: true, smooth: 0.3, feather: 0.0 };
         let a = alpha(&im, &Mask { shape, ..Mask::default() }, &Space { fw: w as f32, fh: h as f32, ox: 0.0, oy: 0.0 });
         assert!(a[50 * w + 20] > 0.95 && a[5 * w + 90] > 0.9);
