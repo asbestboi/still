@@ -94,6 +94,10 @@ const OVERLAY_COLORS: [u32; 3] = [0xFF2D28, 0x30D158, 0x0A84FF];
 const CANVAS_COLORS: [Color32; 3] = [k::CANVAS, Color32::from_rgb(28, 28, 30), Color32::from_rgb(72, 72, 76)];
 
 fn to_color_image(img: &Img) -> egui::ColorImage {
+    // a transparent source (the unedited original) over the checkerboard too
+    if let Some(a) = &img.alpha {
+        return to_color_image_cutout(img, a);
+    }
     let mut rgb = Vec::with_capacity(img.w * img.h * 3);
     for p in &img.px {
         for c in p {
@@ -103,7 +107,8 @@ fn to_color_image(img: &Img) -> egui::ColorImage {
     egui::ColorImage::from_rgb([img.w, img.h], &rgb)
 }
 
-/// The picture over a grey checkerboard where masks have cut it out.
+/// The picture over a grey checkerboard where it's transparent: a
+/// transparent source, or where masks have cut it out.
 fn to_color_image_cutout(img: &Img, alpha: &[f32]) -> egui::ColorImage {
     let cell = (img.w.max(img.h) / 90).max(4);
     let mut rgb = Vec::with_capacity(img.w * img.h * 3);
@@ -175,7 +180,16 @@ fn spawn_worker(ctx: egui::Context, jobs: Receiver<Job>, out: Sender<Msg>) {
             }
             if let Some(Job::Thumbs { src, looks, ver }) = thumbs {
                 use rayon::prelude::*;
-                let images = looks.par_iter().map(|p| to_color_image(&pipeline::process(&src, p))).collect();
+                let images = looks
+                    .par_iter()
+                    .map(|p| {
+                        let r = pipeline::process_ext(&src, p, None);
+                        match &r.alpha {
+                            Some(a) => to_color_image_cutout(&r.img, a),
+                            None => to_color_image(&r.img),
+                        }
+                    })
+                    .collect();
                 let _ = out.send(Msg::Thumbs { ver, images });
                 ctx.request_repaint();
             }

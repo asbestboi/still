@@ -774,7 +774,7 @@ mod tests {
     fn places_scales_and_blends() {
         register("test://red", &solid(40, 20, [255, 0, 0, 255]));
         let sp = Space { fw: 200.0, fh: 100.0, ox: 0.0, oy: 0.0 };
-        let mut img = Img { w: 200, h: 100, px: vec![[0.5; 3]; 200 * 100] };
+        let mut img = Img { w: 200, h: 100, px: vec![[0.5; 3]; 200 * 100], alpha: None };
         // 0.25 of the long edge = 50 px wide, 25 px tall, centred at (60, 50)
         let l = Layer { path: "test://red".into(), aspect: 2.0, x: 0.3, y: 0.5, scale: 0.25, ..Layer::default() };
         composite(&mut img, std::slice::from_ref(&l), true, &sp, None);
@@ -782,13 +782,13 @@ mod tests {
         assert_eq!(img.px[50 * 200 + 100], [0.5, 0.5, 0.5]);
         assert_eq!(img.px[30 * 200 + 60], [0.5, 0.5, 0.5]);
         // multiply at half opacity
-        let mut img2 = Img { w: 200, h: 100, px: vec![[0.5; 3]; 200 * 100] };
+        let mut img2 = Img { w: 200, h: 100, px: vec![[0.5; 3]; 200 * 100], alpha: None };
         let m = Layer { blend: Blend::Multiply, opacity: 0.5, ..l.clone() };
         composite(&mut img2, &[m], true, &sp, None);
         let p = img2.px[50 * 200 + 60];
         assert!((p[0] - 0.5).abs() < 1e-3 && (p[1] - 0.25).abs() < 1e-3);
         // the other stage leaves it alone
-        let mut img3 = Img { w: 200, h: 100, px: vec![[0.5; 3]; 200 * 100] };
+        let mut img3 = Img { w: 200, h: 100, px: vec![[0.5; 3]; 200 * 100], alpha: None };
         composite(&mut img3, &[l], false, &sp, None);
         assert_eq!(img3.px[50 * 200 + 60], [0.5, 0.5, 0.5]);
     }
@@ -797,7 +797,7 @@ mod tests {
     fn transparent_pixels_stay_transparent() {
         register("test://clear", &solid(10, 10, [255, 255, 255, 0]));
         let sp = Space { fw: 100.0, fh: 100.0, ox: 0.0, oy: 0.0 };
-        let mut img = Img { w: 100, h: 100, px: vec![[0.2; 3]; 100 * 100] };
+        let mut img = Img { w: 100, h: 100, px: vec![[0.2; 3]; 100 * 100], alpha: None };
         let l = Layer { path: "test://clear".into(), aspect: 1.0, scale: 0.8, ..Layer::default() };
         composite(&mut img, &[l], true, &sp, None);
         assert!(img.px.iter().all(|p| *p == [0.2; 3]));
@@ -808,13 +808,13 @@ mod tests {
         register("test://grad", &image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(32, 16, |x, y| image::Rgba([(x * 8) as u8, (y * 16) as u8, 90, 255]))));
         let sp = Space { fw: 120.0, fh: 80.0, ox: 0.0, oy: 0.0 };
         let l = Layer { path: "test://grad".into(), aspect: 2.0, x: 0.5, y: 0.5, scale: 0.6, rotation: 20.0, ..Layer::default() };
-        let mut plain = Img { w: 120, h: 80, px: vec![[0.2; 3]; 120 * 80] };
+        let mut plain = Img { w: 120, h: 80, px: vec![[0.2; 3]; 120 * 80], alpha: None };
         composite(&mut plain, std::slice::from_ref(&l), true, &sp, None);
         // a mesh at rest plus a perspective that only moves a corner by nothing
         let mut bent = l.clone();
         bent.warp.set_grid(3, 2);
         bent.warp.corners[1] = [1e-7, 0.0];
-        let mut warped = Img { w: 120, h: 80, px: vec![[0.2; 3]; 120 * 80] };
+        let mut warped = Img { w: 120, h: 80, px: vec![[0.2; 3]; 120 * 80], alpha: None };
         composite(&mut warped, &[bent], true, &sp, None);
         let diff: f32 = plain.px.iter().zip(&warped.px).map(|(a, b)| (0..3).map(|c| (a[c] - b[c]).abs()).sum::<f32>()).sum::<f32>() / plain.px.len() as f32;
         assert!(diff < 0.01, "mean difference {diff}");
@@ -828,7 +828,7 @@ mod tests {
         // pull the top corners together: a trapezoid, narrow at the top
         l.warp.corners[0] = [0.4, 0.0];
         l.warp.corners[1] = [-0.4, 0.0];
-        let mut img = Img { w: 100, h: 100, px: vec![[0.0; 3]; 100 * 100] };
+        let mut img = Img { w: 100, h: 100, px: vec![[0.0; 3]; 100 * 100], alpha: None };
         composite(&mut img, &[l.clone()], true, &sp, None);
         assert!(img.px[27 * 100 + 30][0] < 0.05, "top-left corner pulled in");
         assert!(img.px[27 * 100 + 50][0] > 0.95, "top middle still covered");
@@ -838,7 +838,7 @@ mod tests {
         l.warp.set_grid(2, 2);
         l.warp.mesh[4] = [0.0, 0.0];
         l.warp.mesh[3] = [0.3, 0.0];
-        let mut img = Img { w: 100, h: 100, px: vec![[0.0; 3]; 100 * 100] };
+        let mut img = Img { w: 100, h: 100, px: vec![[0.0; 3]; 100 * 100], alpha: None };
         composite(&mut img, &[l], true, &sp, None);
         assert!(img.px[50 * 100 + 27][0] < 0.05, "left edge pulled in at the middle");
         assert!(img.px[26 * 100 + 27][0] > 0.95, "top-left corner untouched");
