@@ -938,6 +938,8 @@ fn low_res(img: &Img, p: &Params) -> Img {
 // The full pipeline
 // ---------------------------------------------------------------------------
 
+/// The render alone, for tests that only look at the colours.
+#[cfg(test)]
 pub fn process(src: &Img, p: &Params) -> Img {
     process_ext(src, p, None).img
 }
